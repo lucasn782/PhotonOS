@@ -1,0 +1,25 @@
+# ==========================================
+# Ficheiro .gitignore para o PhotonOS
+# ==========================================
+
+# Diretório de compilação e artefatos intermediários
+build/
+
+# Logs de telemetria e depuração massiva do QEMU
+logs/
+*.log
+
+# Ferramentas locais de análise de código e extensões
+.qodo/
+.vscode/
+
+# Imagens de disco virtuais e mídias de armazenamento locais
+*.img
+*.vdi
+*.bin
+*.elf
+*.o
+
+# Arquivos temporários do sistema operacional hospedeiro
+.DS_Store
+Thumbs.db
