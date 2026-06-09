@@ -15,9 +15,13 @@ void *malloc(size_t size);
 void free(void *ptr);
 size_t strlen(const char *str);
 void *memcpy(void *dest, const void *src, size_t size);
+int printf(const char *format, ...);
+void exit(int status);
+void yield(void);
 sighandler_t signal(int signum, sighandler_t handler);
 int kill(int pid, int signum);
 void sigreturn(void);
 int getprocs(proc_info_t *buffer, size_t max_size);
+uint64_t get_ticks(void);
 
 #endif

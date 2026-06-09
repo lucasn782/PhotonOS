@@ -41,6 +41,7 @@
 #define E1000_RX_STATUS_DD (1U << 0)
 
 int e1000_init(uint32_t bar0_address);
+void e1000_reset(void);
 void e1000_write_reg(uint32_t reg, uint32_t val);
 uint32_t e1000_read_reg(uint32_t reg);
 int e1000_send_packet(const void *packet, size_t length);

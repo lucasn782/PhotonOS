@@ -11,6 +11,7 @@ extern kmain
 extern keyboard_irq_handler
 extern scheduler_tick
 extern syscall_handler
+extern syscall_kernel_rsp0
 
 KERNEL_BASE equ 0x00008000
 
@@ -279,7 +280,11 @@ tss_install:
 syscall_entry:
     mov [syscall_saved_user_rsp], rsp
     mov [syscall_saved_number], rax
+    mov rsp, [syscall_kernel_rsp0]
+    test rsp, rsp
+    jnz .stack_ready
     mov rsp, syscall_stack_top
+.stack_ready:
     and rsp, -16
 
     push qword [syscall_saved_user_rsp]
@@ -306,13 +311,16 @@ syscall_entry:
     mov rdi, rax
 
     mov rax, rsp
-    sub rsp, 8
+    sub rsp, 16
     mov [rsp], rax
+    mov rax, [syscall_saved_number]
+    mov [rsp + 8], rax
     cld
     call syscall_handler
-    add rsp, 8
+    mov r10, [rsp + 8]
+    add rsp, 16
 
-    cmp qword [syscall_saved_number], SYS_SIGRETURN
+    cmp r10, SYS_SIGRETURN
     jne .normal_return
     test rax, rax
     jz .normal_return

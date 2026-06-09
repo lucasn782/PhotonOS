@@ -23,6 +23,8 @@ extern const uint8_t _binary_hang_elf_start[];
 extern const uint8_t _binary_hang_elf_end[];
 extern const uint8_t _binary_spin_elf_start[];
 extern const uint8_t _binary_spin_elf_end[];
+extern const uint8_t _binary_ping_elf_start[];
+extern const uint8_t _binary_ping_elf_end[];
 
 static const uint8_t readme_txt[] =
     "PhotonOS initrd: kmalloc, VFS e sys_read ativos.\n";
@@ -35,6 +37,7 @@ static const struct initrd_file initrd_files[] = {
     { "bin/rev", _binary_rev_elf_start, 0 },
     { "bin/hang", _binary_hang_elf_start, 0 },
     { "bin/spin", _binary_spin_elf_start, 0 },
+    { "bin/ping", _binary_ping_elf_start, 0 },
 };
 
 static size_t initrd_read(vfs_node_t *node, size_t offset, size_t size,
@@ -103,6 +106,10 @@ void initrd_init(void)
             initrd_files[i].data == _binary_spin_elf_start) {
             node->size = (size_t)(_binary_spin_elf_end -
                 _binary_spin_elf_start);
+        } else if (node->size == 0 &&
+            initrd_files[i].data == _binary_ping_elf_start) {
+            node->size = (size_t)(_binary_ping_elf_end -
+                _binary_ping_elf_start);
         }
         node->read = initrd_read;
     }

@@ -32,6 +32,7 @@ enum task_wait_reason {
     TASK_WAIT_PIPE_READ,
     TASK_WAIT_PIPE_WRITE,
     TASK_WAIT_MUTEX,
+    TASK_WAIT_SOCKET_RECV,
 };
 
 struct task_registers {

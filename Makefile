@@ -19,13 +19,15 @@ USER_HANG_ELF := build/user/hang.elf
 USER_HANG_OBJ := build/user/hang_blob.o
 USER_SPIN_ELF := build/user/spin.elf
 USER_SPIN_OBJ := build/user/spin_blob.o
+USER_PING_ELF := build/user/ping.elf
+USER_PING_OBJ := build/user/ping_blob.o
 IMG := build/photon.img
 DISK_IMG := build/disk.img
 FLOPPY_BYTES := 1474560
-KERNEL_SECTORS := 256
+KERNEL_SECTORS := 288
 KERNEL_MAX_BYTES := $(shell expr $(KERNEL_SECTORS) \* 512)
 KERNEL_OBJS := build/boot/kernel_asm.o build/user/shell_blob.o build/user/hello_blob.o build/user/upper_blob.o \
-               build/user/rev_blob.o build/user/hang_blob.o build/user/spin_blob.o \
+               build/user/rev_blob.o build/user/hang_blob.o build/user/spin_blob.o build/user/ping_blob.o \
                build/kernel/kernel.o build/kernel/memory.o build/kernel/vmm.o \
                build/drivers/serial.o build/kernel/scheduler.o build/kernel/mutex.o build/kernel/heap.o \
                build/kernel/vfs.o build/kernel/initrd.o build/kernel/elf.o build/kernel/net.o build/drivers/fat16.o \
@@ -82,7 +84,7 @@ build/kernel/initrd.o: src/kernel/initrd.c include/initrd.h include/vfs.h
 build/kernel/elf.o: src/kernel/elf.c include/elf.h include/memory.h include/scheduler.h include/task.h include/vfs.h include/vmm.h
 	@mkdir -p $(dir $@) && $(CC) $(CFLAGS) -c $< -o $@
 
-build/kernel/net.o: src/kernel/net.c include/net.h include/e1000.h include/scheduler.h include/serial.h
+build/kernel/net.o: src/kernel/net.c include/net.h include/e1000.h include/scheduler.h include/serial.h include/mutex.h include/vmm.h
 	@mkdir -p $(dir $@) && $(CC) $(CFLAGS) -c $< -o $@
 
 build/drivers/fat16.o: src/drivers/fat16.c include/fat16.h include/ata.h include/heap.h include/serial.h include/vfs.h
@@ -124,7 +126,7 @@ $(USER_UPPER_ELF): build/user/upper.o
 $(USER_UPPER_OBJ): $(USER_UPPER_ELF)
 	cd build/user && $(LD) -r -b binary $(notdir $(USER_UPPER_ELF)) -o $(notdir $(USER_UPPER_OBJ))
 
-build/user/ulibc.o: src/user/ulibc.c include/ulibc.h include/proc.h
+build/user/ulibc.o: src/user/ulibc.c include/ulibc.h include/proc.h include/sys/socket.h
 	@mkdir -p $(dir $@) && $(CC) $(USER_CFLAGS) -c $< -o $@
 
 build/user/rev.o: src/user/rev.c include/ulibc.h
@@ -154,6 +156,15 @@ $(USER_SPIN_ELF): build/user/spin.o
 $(USER_SPIN_OBJ): $(USER_SPIN_ELF)
 	cd build/user && $(LD) -r -b binary $(notdir $(USER_SPIN_ELF)) -o $(notdir $(USER_SPIN_OBJ))
 
+build/user/ping.o: src/user/ping.c include/ulibc.h include/sys/socket.h
+	@mkdir -p $(dir $@) && $(CC) $(USER_CFLAGS) -c $< -o $@
+
+$(USER_PING_ELF): build/user/ping.o build/user/ulibc.o
+	@mkdir -p $(dir $@) && $(LD) $(USER_LDFLAGS) $^ -o $@
+
+$(USER_PING_OBJ): $(USER_PING_ELF)
+	cd build/user && $(LD) -r -b binary $(notdir $(USER_PING_ELF)) -o $(notdir $(USER_PING_OBJ))
+
 $(KERNEL_ELF): $(KERNEL_OBJS) linker.ld
 	$(LD) $(LDFLAGS) $(KERNEL_OBJS) -o $@
 
@@ -168,7 +179,7 @@ $(IMG): $(BOOT_BIN) $(KERNEL_BIN)
 run: $(IMG)
 	qemu-system-x86_64 -serial stdio -drive format=raw,file=$(IMG)
 
-fat16-disk: $(USER_SHELL_ELF) $(USER_HELLO_ELF) $(USER_UPPER_ELF) $(USER_REV_ELF) $(USER_HANG_ELF) $(USER_SPIN_ELF)
+fat16-disk: $(USER_SHELL_ELF) $(USER_HELLO_ELF) $(USER_UPPER_ELF) $(USER_REV_ELF) $(USER_HANG_ELF) $(USER_SPIN_ELF) $(USER_PING_ELF)
 	DISK_IMG=$(DISK_IMG) USER_DIR=build/user bash scripts/create_fat16_disk.sh
 
 run-fat16: $(IMG) fat16-disk

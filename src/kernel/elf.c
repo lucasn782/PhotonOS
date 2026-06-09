@@ -151,10 +151,11 @@ static int map_segment(vfs_node_t *node, uint64_t *pml4, const Elf64_Phdr *phdr,
     return 1;
 }
 
-static int map_user_stack(uint64_t *pml4, task_t *tracking_task)
+static int map_user_stack(uint64_t *pml4, task_t *tracking_task, const char *arg_str)
 {
     uint64_t stack_bottom =
         ELF_USER_STACK_TOP - (ELF_USER_STACK_PAGES * PMM_PAGE_SIZE);
+    void *top_stack_page_phys = NULL;
 
     for (uint64_t page = stack_bottom; page < ELF_USER_STACK_TOP;
         page += PMM_PAGE_SIZE) {
@@ -171,6 +172,18 @@ static int map_user_stack(uint64_t *pml4, task_t *tracking_task)
         memory_zero(physical, PMM_PAGE_SIZE);
         vmm_map_in_space(pml4, page, (uintptr_t)physical,
             PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER);
+
+        top_stack_page_phys = physical;
+    }
+
+    if (arg_str != 0 && top_stack_page_phys != NULL) {
+        char *dest = (char *)top_stack_page_phys + PMM_PAGE_SIZE - 256;
+        size_t idx = 0;
+        while (arg_str[idx] != '\0' && idx < 255) {
+            dest[idx] = arg_str[idx];
+            idx++;
+        }
+        dest[idx] = '\0';
     }
 
     return 1;
@@ -200,7 +213,33 @@ static int map_signal_trampoline(uint64_t *pml4, task_t *tracking_task)
 
 int elf_load_process(const char *path, task_t *out_task)
 {
-    vfs_node_t *node = vfs_find(path);
+    char file_path[256];
+    char arg_str[256];
+    int has_arg = 0;
+
+    // Parse path to separate filename and arguments
+    size_t i = 0;
+    while (path[i] != '\0' && path[i] != ' ' && i < sizeof(file_path) - 1) {
+        file_path[i] = path[i];
+        i++;
+    }
+    file_path[i] = '\0';
+
+    // Skip spaces
+    while (path[i] == ' ') {
+        i++;
+    }
+
+    if (path[i] != '\0') {
+        has_arg = 1;
+        size_t j = 0;
+        while (path[i] != '\0' && j < sizeof(arg_str) - 1) {
+            arg_str[j++] = path[i++];
+        }
+        arg_str[j] = '\0';
+    }
+
+    vfs_node_t *node = vfs_find(file_path);
     if (node == 0 || node->type != VFS_NODE_FILE) {
         return -1;
     }
@@ -246,7 +285,7 @@ int elf_load_process(const char *path, task_t *out_task)
 
     heap_start = align_up(heap_start);
 
-    if (!map_user_stack(pml4, &tracking_task)) {
+    if (!map_user_stack(pml4, &tracking_task, has_arg ? arg_str : 0)) {
         return -1;
     }
 
@@ -260,15 +299,16 @@ int elf_load_process(const char *path, task_t *out_task)
         return -1;
     }
 
+    uint64_t arg_rdi = has_arg ? (ELF_USER_STACK_TOP - 256) : 0;
     int pid = scheduler_add_user_process(ehdr.e_entry, ELF_USER_STACK_TOP,
-        pml4, out_task);
+        pml4, out_task, arg_rdi, 0);
     if (pid < 0) {
         return -1;
     }
 
     task_t *task = scheduler_find_task((uint32_t)pid);
     if (task != 0) {
-        copy_process_name(task, path);
+        copy_process_name(task, file_path);
         task->user_page_count = tracking_task.user_page_count;
         for (uint32_t i = 0; i < tracking_task.user_page_count; i++) {
             task->user_physical_pages[i] = tracking_task.user_physical_pages[i];

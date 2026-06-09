@@ -51,6 +51,10 @@
 #define SYS_DUP2 14ULL
 #define SYS_CLOSE 15ULL
 #define SYS_LIST 16ULL
+#define SYS_SOCKET_SEND 17ULL
+#define SYS_SOCKET_RECV 18ULL
+#define SYS_YIELD 19ULL
+#define SYS_GET_TICKS 20ULL
 
 #define PIC1_COMMAND 0x20
 #define PIC1_DATA 0x21
@@ -110,6 +114,7 @@ static size_t cursor_row;
 static size_t cursor_col;
 static struct idt_entry idt[IDT_ENTRIES];
 static struct tss64 kernel_tss;
+uint64_t syscall_kernel_rsp0;
 static vfs_node_t console_stdin;
 static vfs_node_t console_stdout;
 static vfs_node_t console_stderr;
@@ -121,6 +126,7 @@ static int keyboard_ctrl;
 static int keyboard_extended;
 static int keyboard_altgr;
 static uint32_t foreground_pid;
+volatile uint64_t kernel_ticks;
 
 struct pipe_buffer {
     uint8_t data[PIPE_BUFFER_SIZE];
@@ -379,6 +385,7 @@ static void vga_puts(const char *str)
 void tss_set_rsp0(uint64_t rsp0)
 {
     kernel_tss.rsp0 = rsp0;
+    syscall_kernel_rsp0 = rsp0;
 }
 
 static void tss_init(void)
@@ -1079,6 +1086,21 @@ uint64_t syscall_handler(uint64_t number, uint64_t arg1, uint64_t arg2,
         ret = (uint64_t)sys_list((const char *)arg1, (uint8_t *)arg2,
             (size_t)arg3);
     }
+    else if (number == SYS_SOCKET_SEND) {
+        ret = (uint64_t)sys_socket_send((uint32_t)arg1, (uint8_t)arg2,
+            (const void *)arg3, (size_t)arg4);
+    }
+    else if (number == SYS_SOCKET_RECV) {
+        ret = (uint64_t)sys_socket_recv((uint8_t)arg1, (void *)arg2,
+            (size_t)arg3);
+    }
+    else if (number == SYS_YIELD) {
+        scheduler_yield();
+        ret = 0;
+    }
+    else if (number == SYS_GET_TICKS) {
+        ret = kernel_ticks;
+    }
 
     scheduler_handle_syscall_signals(arg6, ret);
 
@@ -1386,6 +1408,10 @@ void kmain(void)
     int shell_pid = elf_load_process("/bin/shell", 0);
     if (shell_pid >= 0) {
         foreground_pid = (uint32_t)shell_pid;
+        task_t *shell_task = scheduler_find_task(shell_pid);
+        if (shell_task != 0) {
+            shell_task->state = TASK_READY;
+        }
         klog("ELF: /bin/shell carregado em Ring 3.\n");
     } else {
         klog("ELF: falha ao carregar /bin/shell.\n");

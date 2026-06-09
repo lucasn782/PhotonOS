@@ -6,8 +6,11 @@
 #include "mutex.h"
 #include "vfs.h"
 #include "vmm.h"
+#include "heap.h"
 
-#define MAX_TASKS 8
+extern volatile uint64_t kernel_ticks;
+
+#define MAX_TASKS 16
 #define TASK_STACK_SIZE 4096
 #define USER_STACK_SIZE 4096
 #define KERNEL_CODE_SELECTOR 0x08ULL
@@ -24,11 +27,13 @@
 #define PIC1_COMMAND 0x20
 #define PIC_EOI 0x20
 
-static struct task_control_block tasks[MAX_TASKS];
-static uint8_t task_stacks[MAX_TASKS][TASK_STACK_SIZE] __attribute__((aligned(16)));
-static uint8_t user_stacks[MAX_TASKS][USER_STACK_SIZE] __attribute__((aligned(4096)));
+static struct task_control_block *tasks;
+static uint8_t (*task_stacks)[TASK_STACK_SIZE];
+static uint8_t (*user_stacks)[USER_STACK_SIZE];
+static uint8_t *user_stacks_raw;
 static uint32_t task_count;
 static int current_task_index;
+static int idle_task_index;
 static struct task_control_block *current_task;
 static mutex_t task_table_mutex;
 
@@ -60,6 +65,8 @@ extern vfs_node_t *kernel_stdin_node(void);
 extern vfs_node_t *kernel_stdout_node(void);
 extern vfs_node_t *kernel_stderr_node(void);
 
+static int scheduler_create_task_with_mode(task_entry_t entry, int user_mode);
+
 static void outb(uint16_t port, uint8_t value)
 {
     __asm__ volatile ("outb %0, %1" : : "a"(value), "Nd"(port));
@@ -82,7 +89,8 @@ static uint64_t *push_u64(uint64_t *stack, uint64_t value)
 }
 
 static uint64_t build_initial_stack(uint8_t *stack, uint64_t user_rsp,
-    task_entry_t entry, uint64_t code_selector, uint64_t data_selector)
+    task_entry_t entry, uint64_t code_selector, uint64_t data_selector,
+    uint64_t arg_rdi, uint64_t arg_rsi)
 {
     uintptr_t top = ((uintptr_t)stack + TASK_STACK_SIZE) & ~0xFULL;
     uintptr_t entry_rsp = top - sizeof(uint64_t);
@@ -100,21 +108,21 @@ static uint64_t build_initial_stack(uint8_t *stack, uint64_t user_rsp,
     sp = push_u64(sp, code_selector);
     sp = push_u64(sp, (uint64_t)entry);
 
-    sp = push_u64(sp, 0);
-    sp = push_u64(sp, 0);
-    sp = push_u64(sp, 0);
-    sp = push_u64(sp, 0);
-    sp = push_u64(sp, 0);
-    sp = push_u64(sp, 0);
-    sp = push_u64(sp, 0);
-    sp = push_u64(sp, 0);
-    sp = push_u64(sp, 0);
-    sp = push_u64(sp, 0);
-    sp = push_u64(sp, 0);
-    sp = push_u64(sp, 0);
-    sp = push_u64(sp, 0);
-    sp = push_u64(sp, 0);
-    sp = push_u64(sp, 0);
+    sp = push_u64(sp, 0); // rax
+    sp = push_u64(sp, 0); // rbx
+    sp = push_u64(sp, 0); // rcx
+    sp = push_u64(sp, 0); // rdx
+    sp = push_u64(sp, arg_rsi); // rsi
+    sp = push_u64(sp, arg_rdi); // rdi
+    sp = push_u64(sp, 0); // rbp
+    sp = push_u64(sp, 0); // r8
+    sp = push_u64(sp, 0); // r9
+    sp = push_u64(sp, 0); // r10
+    sp = push_u64(sp, 0); // r11
+    sp = push_u64(sp, 0); // r12
+    sp = push_u64(sp, 0); // r13
+    sp = push_u64(sp, 0); // r14
+    sp = push_u64(sp, 0); // r15
 
     return (uint64_t)sp;
 }
@@ -162,13 +170,25 @@ static void reset_signal_state(task_t *task)
 static void map_user_page(uint64_t address)
 {
     uint64_t page = address & ~(USER_STACK_SIZE - 1ULL);
+    uint64_t phys = vmm_virt_to_phys(page);
+    if (phys == 0) {
+        phys = page;
+    }
 
-    vmm_map(page, page, PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER);
+    vmm_map(page, phys, PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER);
 }
 
 static void pic_send_eoi(void)
 {
     outb(PIC1_COMMAND, PIC_EOI);
+}
+
+static void scheduler_idle_thread(void)
+{
+    for (;;) {
+        __asm__ volatile ("sti" ::: "memory");
+        __asm__ volatile ("hlt" ::: "memory");
+    }
 }
 
 static void init_standard_fds(task_t *task)
@@ -224,11 +244,27 @@ static int allocate_task_slot(void)
 
 void scheduler_init(void)
 {
+    tasks = kmalloc(MAX_TASKS * sizeof(struct task_control_block));
+    task_stacks = kmalloc(MAX_TASKS * TASK_STACK_SIZE);
+    user_stacks_raw = kmalloc((MAX_TASKS + 1) * USER_STACK_SIZE);
+    user_stacks = (uint8_t (*)[USER_STACK_SIZE])(((uintptr_t)user_stacks_raw + USER_STACK_SIZE - 1) & ~(USER_STACK_SIZE - 1));
+
+    for (uint32_t i = 0; i < MAX_TASKS; i++) {
+        tasks[i].state = TASK_ZOMBIE;
+    }
+
     task_count = 0;
     current_task_index = -1;
+    idle_task_index = -1;
     current_task = NULL;
     mutex_init(&task_table_mutex);
     pit_init();
+
+    int idle_pid = scheduler_create_task(scheduler_idle_thread);
+    if (idle_pid >= 0) {
+        idle_task_index = idle_pid - 1;
+        set_task_name(&tasks[idle_task_index], "idle");
+    }
 }
 
 static int scheduler_create_task_with_mode(task_entry_t entry, int user_mode)
@@ -258,7 +294,7 @@ static int scheduler_create_task_with_mode(task_entry_t entry, int user_mode)
     task->kernel_stack_top = stack_top(task_stacks[slot]);
     task->cr3 = (uint64_t)vmm_kernel_pml4();
     task->rsp = build_initial_stack(task_stacks[slot], user_rsp, entry,
-        code_selector, data_selector);
+        code_selector, data_selector, 0, 0);
     task->registers.rip = (uint64_t)entry;
     task->registers.rflags = INITIAL_RFLAGS;
     task->pid = (uint32_t)slot + 1;
@@ -291,7 +327,7 @@ int scheduler_create_user_task(task_entry_t entry)
 }
 
 int scheduler_add_user_process(uint64_t entry, uint64_t user_rsp,
-    uint64_t *pml4, task_t *out_task)
+    uint64_t *pml4, task_t *out_task, uint64_t arg_rdi, uint64_t arg_rsi)
 {
     if (pml4 == 0 || user_rsp == 0) {
         return -1;
@@ -309,7 +345,7 @@ int scheduler_add_user_process(uint64_t entry, uint64_t user_rsp,
     task->kernel_stack_top = stack_top(task_stacks[slot]);
     task->cr3 = (uint64_t)pml4;
     task->rsp = build_initial_stack(task_stacks[slot], user_rsp,
-        (task_entry_t)entry, USER_CODE_SELECTOR, USER_DATA_SELECTOR);
+        (task_entry_t)entry, USER_CODE_SELECTOR, USER_DATA_SELECTOR, arg_rdi, arg_rsi);
     task->registers.rip = entry;
     task->registers.rflags = INITIAL_RFLAGS;
     task->pid = (uint32_t)slot + 1;
@@ -378,7 +414,7 @@ task_t *scheduler_task_at(uint32_t index)
 
 void scheduler_yield(void)
 {
-    __asm__ volatile ("pause");
+    __asm__ volatile ("int $0x20" ::: "memory");
 }
 
 int scheduler_send_signal(uint32_t pid, int signum)
@@ -412,8 +448,13 @@ void scheduler_sleep_current(enum task_wait_reason reason, uint64_t target)
         return;
     }
 
-    current_task->state = reason == TASK_WAIT_CHILD ? TASK_WAITING :
-        TASK_SLEEPING;
+    if (reason == TASK_WAIT_CHILD) {
+        current_task->state = TASK_WAITING;
+    } else if (reason == TASK_WAIT_SOCKET_RECV) {
+        current_task->state = TASK_BLOCKED;
+    } else {
+        current_task->state = TASK_SLEEPING;
+    }
     current_task->wait_reason = reason;
     current_task->wait_target = target;
 }
@@ -449,6 +490,19 @@ void scheduler_wake_pipe_writers(void *pipe)
         if (tasks[i].state == TASK_SLEEPING &&
             tasks[i].wait_reason == TASK_WAIT_PIPE_WRITE &&
             tasks[i].wait_target == (uint64_t)pipe) {
+            tasks[i].state = TASK_READY;
+            tasks[i].wait_reason = TASK_WAIT_NONE;
+            tasks[i].wait_target = 0;
+        }
+    }
+}
+
+void scheduler_wake_socket_receivers(uint8_t protocol)
+{
+    for (uint32_t i = 0; i < task_count; i++) {
+        if (tasks[i].state == TASK_BLOCKED &&
+            tasks[i].wait_reason == TASK_WAIT_SOCKET_RECV &&
+            tasks[i].wait_target == (uint64_t)protocol) {
             tasks[i].state = TASK_READY;
             tasks[i].wait_reason = TASK_WAIT_NONE;
             tasks[i].wait_target = 0;
@@ -661,8 +715,11 @@ static int deliver_pending_signal(task_t *task)
     return 1;
 }
 
+__attribute__((force_align_arg_pointer))
 uint64_t scheduler_tick(uint64_t current_rsp)
 {
+    kernel_ticks++;
+
     if (task_count == 0) {
         pic_send_eoi();
         return current_rsp;
@@ -676,21 +733,63 @@ uint64_t scheduler_tick(uint64_t current_rsp)
     }
 
     uint32_t attempts = 0;
-    uint32_t max_attempts = task_count * 2U;
+    int index = current_task_index;
 
-    while (attempts < max_attempts) {
-        current_task_index = (current_task_index + 1) % (int)task_count;
+    while (attempts < task_count) {
+        index = (index + 1) % (int)task_count;
         attempts++;
-        struct task_control_block *candidate = &tasks[current_task_index];
+
+        if (index == idle_task_index) {
+            continue;
+        }
+
+        struct task_control_block *candidate = &tasks[index];
         if (candidate->state == TASK_READY || candidate->state == TASK_RUNNING) {
+            
+            /* Validação defensiva de sinais: Threads nativas de Kernel (Ring 0) 
+             * não possuem pilha de usuário ou trampolines de sinal. */
+            if (candidate->cr3 != (uint64_t)vmm_kernel_pml4()) {
+                if (candidate->pending_signals != 0 && candidate->active_signal == 0) {
+                    
+                    // Salva o CR3 atual antes de testar o sinal da tarefa
+                    uint64_t previous_cr3 = (uint64_t)vmm_kernel_pml4(); // Default seguro
+                    if (current_task != NULL) {
+                        previous_cr3 = current_task->cr3;
+                    }
+
+                    vmm_switch_address_space((uint64_t *)candidate->cr3);
+                    
+                    if (!deliver_pending_signal(candidate)) {
+                        /* Se a tarefa foi abortada/destruída pelo sinal, precisamos
+                         * restaurar o espaço de endereçamento seguro imediatamente 
+                         * antes de continuar varrendo a tabela! */
+                        vmm_switch_address_space((uint64_t *)previous_cr3);
+                        continue;
+                    }
+                }
+            }
+
+            /* Transição de Contexto e Compromisso de Estado (Atômico) */
+            current_task_index = index;
             current_task = candidate;
             current_task->state = TASK_RUNNING;
             tss_set_rsp0(current_task->kernel_stack_top);
             vmm_switch_address_space((uint64_t *)current_task->cr3);
-            if (!deliver_pending_signal(current_task)) {
-                attempts = 0;
-                continue;
-            }
+            
+            pic_send_eoi();
+            return current_task->rsp;
+        }
+    }
+
+    /* Fallback de Segurança Robusto: Nenhuma tarefa pronta -> Vai para a Idle */
+    if (idle_task_index >= 0 && idle_task_index < (int)task_count) {
+        struct task_control_block *idle = &tasks[idle_task_index];
+        if (idle->state != TASK_ZOMBIE) {
+            current_task_index = idle_task_index;
+            current_task = idle;
+            current_task->state = TASK_RUNNING;
+            tss_set_rsp0(current_task->kernel_stack_top);
+            vmm_switch_address_space((uint64_t *)current_task->cr3);
             pic_send_eoi();
             return current_task->rsp;
         }

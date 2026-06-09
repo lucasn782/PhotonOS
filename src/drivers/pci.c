@@ -124,6 +124,7 @@ static void pci_scan_bus(uint8_t bus)
 
 int pci_init(void)
 {
+    e1000_reset();
     pci_device_found = 0;
 
     for (uint16_t bus = 0; bus < 256; bus++) {

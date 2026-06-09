@@ -1010,11 +1010,20 @@ static int mount_superfloppy_or_partition(uint32_t requested_lba)
     struct mbr_partition_entry *parts =
         (struct mbr_partition_entry *)(sector_buffer + 446);
     for (uint32_t i = 0; i < 4; i++) {
-        if (!is_fat16_partition_type(parts[i].type)) {
-            continue;
+        if (parts[i].bootable == 0x80) {
+            if (is_fat16_partition_type(parts[i].type)) {
+                if (load_bpb_at(parts[i].start_lba)) {
+                    return 1;
+                }
+            }
         }
-        if (load_bpb_at(parts[i].start_lba)) {
-            return 1;
+    }
+
+    for (uint32_t i = 0; i < 4; i++) {
+        if (is_fat16_partition_type(parts[i].type)) {
+            if (load_bpb_at(parts[i].start_lba)) {
+                return 1;
+            }
         }
     }
 

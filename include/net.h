@@ -87,4 +87,7 @@ void net_handle_arp(uint8_t *frame, size_t frame_length);
 void net_handle_icmp(uint8_t *frame, size_t frame_length);
 void net_kernel_thread(void);
 
+int sys_socket_send(uint32_t dest_ip, uint8_t protocol, const void *payload, size_t len);
+int sys_socket_recv(uint8_t protocol, void *buffer, size_t max_len);
+
 #endif

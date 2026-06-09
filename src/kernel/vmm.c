@@ -216,7 +216,17 @@ uint64_t *vmm_create_address_space(void)
     clear_page(pml4);
 
     uint64_t *kernel = vmm_kernel_pml4();
+
+    /* Clone the low identity mapping (covers e1000 MMIO at 0xF0000000 and
+     * other lower-half kernel structures used during early boot). */
     pml4[0] = kernel[0];
+
+    /* Clone the entire upper half (entries 256-511) so that kernel heap,
+     * MMIO windows, APIC, and all higher-half kernel mappings remain
+     * accessible while the CPU is running with a user-process CR3. */
+    for (int i = 256; i < 512; i++) {
+        pml4[i] = kernel[i];
+    }
 
     return pml4;
 }

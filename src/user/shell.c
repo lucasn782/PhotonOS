@@ -482,6 +482,27 @@ static void command_program(const char *path, int is_background)
     }
 }
 
+static void command_ping(char *arg, int is_background)
+{
+    char command[96];
+    size_t offset = 0;
+
+    arg = skip_spaces(arg);
+    trim_right(arg);
+    if (arg[0] == '\0') {
+        write_str("uso: ping <endereco_ip>\n");
+        return;
+    }
+
+    offset = append_text(command, offset, "/bin/ping ");
+    while (*arg != '\0' && offset < sizeof(command) - 1) {
+        command[offset++] = *arg++;
+    }
+    command[offset] = '\0';
+
+    command_program(command, is_background);
+}
+
 static void execute_simple(char *line, int is_background)
 {
     line = skip_spaces(line);
@@ -492,7 +513,7 @@ static void execute_simple(char *line, int is_background)
     }
 
     if (streq(line, "help")) {
-        write_str("help ls ps cat <arquivo> touch <arquivo> echo <texto> > <arquivo> hello upper rev hang spin\n");
+        write_str("help ls ps cat <arquivo> touch <arquivo> echo <texto> > <arquivo> hello upper rev hang spin ping <ip>\n");
     } else if (streq(line, "ls")) {
         command_ls();
     } else if (streq(line, "ps") || streq(line, "jobs")) {
@@ -507,6 +528,10 @@ static void execute_simple(char *line, int is_background)
         command_program("/bin/hang", is_background);
     } else if (streq(line, "spin")) {
         command_program("/bin/spin", is_background);
+    } else if (streq(line, "ping")) {
+        write_str("uso: ping <endereco_ip>\n");
+    } else if (starts_with(line, "ping ")) {
+        command_ping(line + 5, is_background);
     } else if (starts_with(line, "cat ")) {
         command_cat(line + 4);
     } else if (starts_with(line, "touch ")) {

@@ -93,6 +93,21 @@ uint32_t e1000_read_reg(uint32_t reg)
     return *(volatile uint32_t *)(e1000.mmio + reg);
 }
 
+static uint64_t save_and_disable_interrupts(void)
+{
+    uint64_t rflags;
+    __asm__ volatile ("pushfq; popq %0" : "=r"(rflags));
+    __asm__ volatile ("cli" ::: "memory");
+    return rflags;
+}
+
+static void restore_interrupts(uint64_t rflags)
+{
+    if ((rflags & 0x200ULL) != 0) {
+        __asm__ volatile ("sti" ::: "memory");
+    }
+}
+
 static void e1000_map_mmio(uint32_t bar0_address)
 {
     uintptr_t bar0 = (uintptr_t)bar0_address;
@@ -245,6 +260,13 @@ int e1000_init(uint32_t bar0_address)
     return 0;
 }
 
+void e1000_reset(void)
+{
+    e1000_memset(&e1000, 0, sizeof(e1000));
+    mutex_init(&e1000.rx_lock);
+    mutex_init(&e1000.tx_lock);
+}
+
 int e1000_send_packet(const void *packet, size_t length)
 {
     if (!e1000.initialized || packet == 0 ||
@@ -252,12 +274,14 @@ int e1000_send_packet(const void *packet, size_t length)
         return -1;
     }
 
+    uint64_t rflags = save_and_disable_interrupts();
     mutex_lock(&e1000.tx_lock);
 
     uint32_t tail = e1000_read_reg(E1000_REG_TDT) % E1000_TX_DESC_COUNT;
     volatile struct e1000_tx_desc *desc = &e1000.tx_descs[tail];
     if ((desc->status & E1000_TX_STATUS_DD) == 0) {
         mutex_unlock(&e1000.tx_lock);
+        restore_interrupts(rflags);
         return 0;
     }
 
@@ -273,17 +297,9 @@ int e1000_send_packet(const void *packet, size_t length)
     e1000.tx_tail = tail;
     e1000_write_reg(E1000_REG_TDT, tail);
 
-    for (uint32_t spin = 0; spin < E1000_TX_POLL_LIMIT; spin++) {
-        if ((desc->status & E1000_TX_STATUS_DD) != 0) {
-            mutex_unlock(&e1000.tx_lock);
-            return (int)length;
-        }
-
-        __asm__ volatile ("pause");
-    }
-
     mutex_unlock(&e1000.tx_lock);
-    return -1;
+    restore_interrupts(rflags);
+    return (int)length;
 }
 
 int e1000_receive_packet(void *buffer_out, size_t max_length)
@@ -292,12 +308,14 @@ int e1000_receive_packet(void *buffer_out, size_t max_length)
         return -1;
     }
 
+    uint64_t rflags = save_and_disable_interrupts();
     mutex_lock(&e1000.rx_lock);
 
     uint32_t index = e1000.rx_read;
     volatile struct e1000_rx_desc *desc = &e1000.rx_descs[index];
     if ((desc->status & E1000_RX_STATUS_DD) == 0) {
         mutex_unlock(&e1000.rx_lock);
+        restore_interrupts(rflags);
         return 0;
     }
 
@@ -313,5 +331,6 @@ int e1000_receive_packet(void *buffer_out, size_t max_length)
     e1000.rx_read = (index + 1U) % E1000_RX_DESC_COUNT;
 
     mutex_unlock(&e1000.rx_lock);
+    restore_interrupts(rflags);
     return result;
 }
