@@ -1,83 +1,201 @@
 # PhotonOS 🌌
 
-O **PhotonOS** é um sistema operacional monolítico freestanding desenvolvido do zero para a arquitetura **x86_64**, operando em **64-bit Long Mode**. O projeto adota uma abordagem de **Arquitetura Limpa (Clean Architecture)**, implementando isolamento estrito de privilégios (Ring 0 vs Ring 3), gerenciamento avançado de memória, persistência nativa em sistemas de arquivos e um driver de rede emulado via barramento PCI.
+O **PhotonOS** é um sistema operacional monolítico freestanding desenvolvido do zero para a arquitetura **x86_64**, executando em **64-bit Long Mode**. O projeto tem como objetivo explorar os principais conceitos de engenharia de sistemas operacionais modernos, incluindo gerenciamento de memória, multitarefa preemptiva, isolamento de privilégios, sistemas de arquivos persistentes e comunicação em rede.
+
+Atualmente o sistema possui suporte a execução em Ring 3, carregamento de binários ELF, escalonamento multitarefa, armazenamento FAT16, driver PCI Intel e1000 e uma interface Shell própria executando em espaço de usuário.
 
 ---
 
-## 🛠️ Arquitetura do Repositório
-
-O projeto está estruturado de forma modular para garantir a separação de conceitos e builds estáveis:
+## 🛠️ Estrutura do Projeto
 
 ```text
 PhotonOS/
-├── build/             # Todos os objetos (.o), binários (.elf) e mapa de memória
-├── docs/              # Especificações de design, documentação e diagramas
-├── include/           # Arquivos de cabeçalho (.h) do Kernel e drivers
-├── logs/              # Telemetria de execução e relatórios do QEMU
-├── scripts/           # Scripts automatizados de testes e montagem de disco
-└── src/               # Código-fonte do sistema
-    ├── boot/          # Código Assembly de baixo nível (Bootloader & Kernel Setup)
-    ├── kernel/        # O núcleo do sistema (Memória, Escalonador, VFS, Syscalls)
-    ├── drivers/       # Drivers de controle de hardware (Teclado V2, ATA, PCI, e1000)
-    └── user/          # Biblioteca padrão (ulibc) e aplicações de espaço de usuário
+├── build/             # Binários gerados durante o processo de build
+├── docs/              # Documentação técnica e diagramas
+├── include/           # Headers do Kernel e drivers
+├── logs/              # Logs de execução e depuração
+├── references/        # Materiais de referência do projeto
+├── scripts/           # Scripts auxiliares
+├── src/
+│   ├── boot/          # Bootloader e entrada do Kernel
+│   ├── drivers/       # Drivers ATA, PCI, FAT16, e1000 e Serial
+│   ├── kernel/        # Núcleo do sistema
+│   └── user/          # Biblioteca de usuário e aplicações
+├── Makefile
+└── README.md
 ```
+
+---
 
 ## 🚀 Funcionalidades Consolidadas
 
-- **Modo de Operação:** Transição de Modo Real de 16-bit para Modo Protegido de 32-bit, consolidando-se em 64-bit Long Mode com paginação em 4 níveis (PML4).
-- **Gerenciamento de Memória:** Alocador de frames físicos (PMM) via Bitmap e alocador de Heap dinâmico (kmalloc/kfree) integrado.
-- **Escalonamento Multitarefa:** Escalonador Round-Robin preemptivo baseado em interrupções periódicas do temporizador PIT (INT 0x20), com suporte a processos em segundo plano (`&`) e controle de jobs.
-- **Espaço de Usuário (Ring 3):** Transição de privilégio protegida via TSS e chamadas de sistema eficientes via instruções nativas `syscall`/`sysret`.
-- **Módulo de Entrada Modular V2.0:** Driver de teclado isolado com máquina de estados para suporte total ao layout ISO/Mac Português, rastreando o modificador AltGr para digitação estável do caractere Pipe (`|`).
-- **Sistema de Arquivos FAT16 Persistente:** Driver ATA em modo PIO integrado ao Virtual File System (VFS), permitindo leitura e escrita dinâmica de blocos e metadados no disco secundário, com suporte a operadores de redirecionamento de fluxo (`>`).
-- **Sinais Assíncronos:** Infraestrutura estável de tratamento de sinais baseada em Signal Trampoline para captura de interrupções via teclado (`Ctrl+C` -> `SIGINT`).
-- **Rede Intel e1000:** Inicialização PCI/MMIO e rotinas TX/RX baseadas em ring buffers de descritores Ethernet no Ring 0.
+### Inicialização e Arquitetura
 
-## 📊 Status de Desenvolvimento do Núcleo
+* Bootloader próprio em Assembly x86.
+* Transição de Modo Real (16-bit) para Modo Protegido (32-bit).
+* Entrada em **64-bit Long Mode**.
+* Kernel executando em arquitetura x86_64 freestanding.
+* Paginação baseada em tabelas PML4.
 
-- **Conclusão de Engenharia Granular:** 95,4%
-- **Macro-Etapas Concluídas:** 11 / 12
+### Gerenciamento de Memória
 
-Atualmente, o sistema está na fase final de homologação do subsistema de rede, possuindo o mapeamento de barramento PCI e inicialização MMIO do controlador Intel e1000 totalmente funcionais em Ring 0.
+* Gerenciador de memória física (PMM).
+* Gerenciamento de memória virtual (VMM).
+* Kernel Heap dinâmico.
+* Interface de alocação dinâmica via `kmalloc()` e `kfree()`.
+* Mapeamento de memória para processos em espaço de usuário.
 
-## 🔧 Como Compilar e Executar
+### Escalonamento e Concorrência
 
-### Pré-requisitos (Ambiente WSL / Linux)
+* Escalonador Round-Robin preemptivo.
+* Troca de contexto baseada em interrupções do PIT.
+* Controle de tarefas do Kernel.
+* Estruturas de escalonamento separadas do subsistema de memória.
+* Mecanismos de sincronização via Mutex.
 
-Certifique-se de ter instalado o toolchain de compilação cruzada (`gcc`, `ld`, `make`, `nasm`, `qemu`).
+### Espaço de Usuário (Ring 3)
 
-### 1. Compilar o Sistema
+* Isolamento entre Ring 0 e Ring 3.
+* Troca de privilégio utilizando TSS.
+* Syscalls implementadas através de `syscall/sysret`.
+* Carregamento de executáveis ELF de 64 bits.
+* Execução de aplicações independentes em espaço de usuário.
 
-O processo de build utiliza compilação incremental isolada na pasta `build/` e gera automaticamente o mapa de símbolos hexadecimais `photon.map`:
+### Sistema de Arquivos
+
+* Driver ATA PIO.
+* Sistema de Arquivos FAT16.
+* Integração com Virtual File System (VFS).
+* Montagem de volumes FAT16.
+* Persistência de dados em disco virtual.
+* Infraestrutura preparada para expansão de operações de leitura e escrita.
+
+### Rede
+
+* Detecção de dispositivos PCI.
+* Driver Intel e1000.
+* Inicialização MMIO.
+* Transmissão e recepção de quadros Ethernet.
+* Infraestrutura de rede acessível por aplicações de usuário.
+* Aplicativo `ping` executando em Ring 3.
+
+### Console e Utilitários
+
+* Shell interativo.
+* Biblioteca padrão de usuário (`ulibc`).
+* Programas de teste e demonstração:
+
+  * hello
+  * upper
+  * rev
+  * spin
+  * hang
+  * ping
+
+---
+
+## 📊 Estado Atual do Desenvolvimento
+
+| Subsistema       | Status         |
+| ---------------- | -------------- |
+| Bootloader       | ✅ Estável      |
+| Long Mode x86_64 | ✅ Estável      |
+| PMM              | ✅ Concluído    |
+| VMM              | ✅ Concluído    |
+| Heap do Kernel   | ✅ Concluído    |
+| Scheduler        | ✅ Estável      |
+| Ring 3           | ✅ Operacional  |
+| Syscalls         | ✅ Operacional  |
+| Loader ELF       | ✅ Operacional  |
+| ATA PIO          | ✅ Operacional  |
+| FAT16            | ✅ Operacional  |
+| VFS              | 🟡 Em expansão |
+| PCI              | ✅ Operacional  |
+| Intel e1000      | ✅ Operacional  |
+| Shell            | ✅ Operacional  |
+| Rede de Usuário  | 🟡 Evoluindo   |
+
+---
+
+## 🔧 Compilação
+
+### Dependências
+
+* GCC Cross Compiler
+* Binutils
+* NASM
+* Make
+* QEMU
+
+### Build Completo
 
 ```bash
-make clean && make
+make clean
+make
 ```
 
-### 2. Executar no QEMU (Via Linha de Comando)
-
-Para inicializar o sistema com os dois discos rígidos virtuais (`photon.img` para boot e `disk.img` para armazenamento FAT16), interface e1000 e saída serial acoplada:
+### Geração do Disco FAT16
 
 ```bash
-qemu-system-x86_64 -drive file=build/photon.img,format=raw,index=0,media=disk -drive file=build/disk.img,format=raw,index=1,media=disk -net nic,model=e1000 -serial stdio
+make fat16-disk
 ```
 
-Para conectar a interface e1000 ao NAT user-mode do QEMU, adicione `-net user` ao comando:
+---
+
+## ▶️ Execução no QEMU
+
+### Modo Gráfico
 
 ```bash
-qemu-system-x86_64 -drive file=build/photon.img,format=raw,index=0,media=disk -drive file=build/disk.img,format=raw,index=1,media=disk -net nic,model=e1000 -net user -serial stdio
+qemu-system-x86_64 ^
+-drive format=raw,file=build/photon.img,if=floppy ^
+-drive format=raw,file=disk.img,if=ide,index=0,media=disk ^
+-netdev user,id=net0 ^
+-device e1000,netdev=net0
 ```
 
-### 3. Executar no VirtualBox
-
-Converta o disco rígido estruturado pelo Makefile para o formato nativo VDI:
+### Modo Headless
 
 ```bash
-qemu-img convert -f raw -O vdi build/disk.img build/disk.vdi
+qemu-system-x86_64 ^
+-drive format=raw,file=build/photon.img,if=floppy ^
+-drive format=raw,file=disk.img,if=ide,index=0,media=disk ^
+-netdev user,id=net0 ^
+-device e1000,netdev=net0 ^
+-nographic
 ```
 
-Crie uma VM configurada como `Other/Unknown (64-bit)`.
+---
 
-Remova a controladora SATA padrão e adicione uma Controladora IDE, conectando o `build/disk.vdi` como Master Primário, e uma Controladora Floppy, conectando o `build/photon.img`.
+## 📈 Próximos Objetivos
 
-Ative o adaptador de rede em modo NAT sob o modelo Intel PRO/1000 MT Desktop (82540EM).
+### Sistema de Arquivos
+
+* Navegação por subdiretórios FAT16.
+* Expansão do VFS.
+* Operações avançadas de escrita.
+* Criação dinâmica de arquivos.
+
+### Espaço de Usuário
+
+* Expansão da interface de syscalls.
+* Execução dinâmica de programas.
+* Gerenciamento avançado de processos.
+
+### Rede
+
+* Abstração de sockets.
+* Camada IP completa.
+* Suporte ampliado a protocolos.
+
+### Kernel
+
+* Aprimoramento da proteção de memória.
+* Ferramentas de depuração do scheduler.
+* Otimização da troca de contexto.
+
+---
+
+## 🎯 Objetivo do Projeto
+
+O PhotonOS é um projeto educacional e experimental voltado ao estudo aprofundado de sistemas operacionais modernos, explorando desde a inicialização em Assembly até a execução de aplicações em espaço de usuário, passando por gerenciamento de memória, armazenamento persistente e comunicação em rede.
