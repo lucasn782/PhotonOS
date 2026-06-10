@@ -65,23 +65,29 @@ PhotonOS/
 
 * Driver ATA PIO.
 * Sistema de Arquivos FAT16.
-* Integração com Virtual File System (VFS).
-* Montagem de volumes FAT16.
-* Persistência de dados em disco virtual.
-* Infraestrutura preparada para expansão de operações de leitura e escrita.
+* Integração com Virtual File System (VFS) com suporte completo a subdiretórios recursivos e navegação de caminhos.
+* Operações de leitura (`sys_read`) e escrita (`sys_write`) persistentes através de cadeias de clusters (cluster chains).
+* Alocação dinâmica de novos clusters na tabela FAT quando arquivos são expandidos.
+* Sincronização automática de metadados (tamanho e cluster inicial) nas entradas de diretórios de 32 bytes no disco virtual.
 
-### Rede
+### Segurança e Robustez (Ring 0 / Ring 3)
 
-* Detecção de dispositivos PCI.
-* Driver Intel e1000.
-* Inicialização MMIO.
-* Transmissão e recepção de quadros Ethernet.
-* Infraestrutura de rede acessível por aplicações de usuário.
-* Aplicativo `ping` executando em Ring 3.
+* Isolamento entre Ring 0 e Ring 3 com TSS.
+* Syscalls implementadas através de `syscall/sysret`.
+* Hardening de chamadas de sistema de I/O (`sys_read`, `sys_write`, `sys_execve`):
+  * Validação rigorosa dos buffers do espaço de usuário (Ring 3) usando `vmm_is_mapped` antes do acesso em Ring 0.
+  * Cópia de segurança de caminhos e dados via buffers temporários no Kernel Heap (`kmalloc`) para evitar page faults e vulnerabilidades de concorrência.
+  * Limites rígidos de tamanho por bloco de escrita para resguardar a integridade do heap.
+* Restrição absoluta de formatação: proibição do uso de especificadores de formato (`%s`, `%d`, `%x`) no logger interno (`klog`) do Ring 0.
+
+### Compilação e Otimização do Linker
+
+* Otimização de empacotamento com a flag `-N` (`--nmagic`) no Makefile para os executáveis do initrd.
+* Fusão de seções text/data e desativação de padding de 4KB por página nos ELFs integrados, reduzindo o tamanho de `photon.bin` de **149KB** para **96KB** (respeitando o limite físico estrito de 144KB do boot loader).
 
 ### Console e Utilitários
 
-* Shell interativo.
+* Shell interativo no espaço de usuário (/bin/shell) com comandos como `ls`, `ps`, `cat`, `touch`, `write` (escrita direta em arquivos), redirecionamentos (`>`) e suporte a pipes básicos.
 * Biblioteca padrão de usuário (`ulibc`).
 * Programas de teste e demonstração:
 
@@ -108,8 +114,8 @@ PhotonOS/
 | Syscalls         | ✅ Operacional  |
 | Loader ELF       | ✅ Operacional  |
 | ATA PIO          | ✅ Operacional  |
-| FAT16            | ✅ Operacional  |
-| VFS              | 🟡 Em expansão |
+| FAT16            | ✅ Estável      |
+| VFS              | ✅ Estável      |
 | PCI              | ✅ Operacional  |
 | Intel e1000      | ✅ Operacional  |
 | Shell            | ✅ Operacional  |
@@ -149,7 +155,7 @@ make fat16-disk
 ```bash
 qemu-system-x86_64 ^
 -drive format=raw,file=build/photon.img,if=floppy ^
--drive format=raw,file=disk.img,if=ide,index=0,media=disk ^
+-drive format=raw,file=build/disk.img,if=ide,index=0,media=disk ^
 -netdev user,id=net0 ^
 -device e1000,netdev=net0
 ```
@@ -159,7 +165,7 @@ qemu-system-x86_64 ^
 ```bash
 qemu-system-x86_64 ^
 -drive format=raw,file=build/photon.img,if=floppy ^
--drive format=raw,file=disk.img,if=ide,index=0,media=disk ^
+-drive format=raw,file=build/disk.img,if=ide,index=0,media=disk ^
 -netdev user,id=net0 ^
 -device e1000,netdev=net0 ^
 -nographic
@@ -169,30 +175,21 @@ qemu-system-x86_64 ^
 
 ## 📈 Próximos Objetivos
 
-### Sistema de Arquivos
+### Sistema de Arquivos & VFS
 
-* Navegação por subdiretórios FAT16.
-* Expansão do VFS.
-* Operações avançadas de escrita.
-* Criação dinâmica de arquivos.
+* Implementação de permissões básicas de arquivos no VFS.
+* Mapeamento de links simbólicos e montagem dinâmica de múltiplos volumes.
 
-### Espaço de Usuário
+### Espaço de Usuário & Rede
 
-* Expansão da interface de syscalls.
-* Execução dinâmica de programas.
-* Gerenciamento avançado de processos.
+* Abstração completa de sockets POSIX-like.
+* Implementação do protocolo TCP no espaço de usuário.
+* Desenvolvimento de um servidor HTTP simples rodando em Ring 3.
 
-### Rede
+### Kernel & Sincronização
 
-* Abstração de sockets.
-* Camada IP completa.
-* Suporte ampliado a protocolos.
-
-### Kernel
-
-* Aprimoramento da proteção de memória.
-* Ferramentas de depuração do scheduler.
-* Otimização da troca de contexto.
+* Aprimoramento da proteção de memória ativa (flags WP, W^X) e isolamento avançado de páginas de kernel.
+* Adição de semáforos e variáveis de condição ao scheduler.
 
 ---
 
