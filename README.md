@@ -88,7 +88,7 @@ PhotonOS/
 ### Console e Utilitários
 
 * Shell interativo no espaço de usuário (/bin/shell) com comandos como `ls`, `ps`, `cat`, `touch`, `write` (escrita direta em arquivos), redirecionamentos (`>`) e suporte a pipes básicos.
-* Biblioteca padrão de usuário (`ulibc`).
+* Biblioteca padrão de usuário (`pulibc`).
 * Programas de teste e demonstração:
 
   * hello
