@@ -38,7 +38,7 @@ CFLAGS := -ffreestanding -m64 -nostdlib -mno-red-zone -fno-pic -fno-pie \
 USER_CFLAGS := $(CFLAGS) -fno-builtin -fno-asynchronous-unwind-tables \
                -mcmodel=large
 LDFLAGS := -nostdlib -z max-page-size=0x1000 -T linker.ld -Map=build/photon.map
-USER_LDFLAGS := -nostdlib -s -z max-page-size=0x1000 \
+USER_LDFLAGS := -nostdlib -s -N -z max-page-size=0x1000 \
                 -Ttext=0x8000001000 -e _start
 
 .PHONY: all clean run run-fat16 fat16-disk background-test test-net release

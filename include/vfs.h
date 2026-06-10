@@ -15,12 +15,19 @@ typedef enum vfs_node_type {
 
 typedef struct vfs_node vfs_node_t;
 
-typedef size_t (*vfs_read_t)(vfs_node_t *node, size_t offset, size_t size,
+typedef struct vfs_dir_entry {
+    char name[VFS_NAME_MAX];
+    uint32_t type;
+    uint32_t size;
+} vfs_dir_entry_t;
+
+typedef int (*vfs_read_t)(vfs_node_t *node, uint64_t offset, uint32_t size,
     uint8_t *buffer);
 typedef size_t (*vfs_write_t)(vfs_node_t *node, size_t offset, size_t size,
     const uint8_t *buffer);
 typedef int (*vfs_open_t)(vfs_node_t *node);
 typedef void (*vfs_close_t)(vfs_node_t *node);
+typedef int (*vfs_readdir_t)(vfs_node_t *node, uint32_t index, vfs_dir_entry_t *entry);
 
 struct vfs_node {
     char name[VFS_NAME_MAX];
@@ -31,6 +38,7 @@ struct vfs_node {
     vfs_write_t write;
     vfs_open_t open;
     vfs_close_t close;
+    vfs_readdir_t readdir;
     vfs_node_t *parent;
     vfs_node_t *child;
     vfs_node_t *sibling;
@@ -41,8 +49,9 @@ vfs_node_t *vfs_root(void);
 vfs_node_t *vfs_create_node(vfs_node_t *parent, const char *name,
     vfs_node_type_t type);
 vfs_node_t *vfs_find(const char *path);
-size_t vfs_read(vfs_node_t *node, size_t offset, size_t size, uint8_t *buffer);
+int vfs_read(vfs_node_t *node, uint64_t offset, uint32_t size, uint8_t *buffer);
 size_t vfs_write(vfs_node_t *node, size_t offset, size_t size,
     const uint8_t *buffer);
+int vfs_readdir(vfs_node_t *node, uint32_t index, vfs_dir_entry_t *entry);
 
 #endif

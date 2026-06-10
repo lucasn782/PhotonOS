@@ -55,6 +55,8 @@
 #define SYS_SOCKET_RECV 18ULL
 #define SYS_YIELD 19ULL
 #define SYS_GET_TICKS 20ULL
+#define SYS_READDIR 21ULL
+#define SYS_EXECVE 22ULL
 
 #define PIC1_COMMAND 0x20
 #define PIC1_DATA 0x21
@@ -421,21 +423,32 @@ vfs_node_t *kernel_stderr_node(void)
 }
 
 static int keyboard_queue_pop(char *ch);
+static int copy_user_path(char *dest, const char *src, size_t capacity);
 
-static size_t console_read(vfs_node_t *node, size_t offset, size_t size,
+static void memory_copy(void *dest, const void *src, size_t size)
+{
+    uint8_t *out = dest;
+    const uint8_t *in = src;
+
+    for (size_t i = 0; i < size; i++) {
+        out[i] = in[i];
+    }
+}
+
+static int console_read(vfs_node_t *node, uint64_t offset, uint32_t size,
     uint8_t *buffer)
 {
     (void)node;
     (void)offset;
 
-    size_t read_count = 0;
+    uint32_t read_count = 0;
 
     while (read_count < size &&
         keyboard_queue_pop((char *)&buffer[read_count])) {
         read_count++;
     }
 
-    return read_count;
+    return (int)read_count;
 }
 
 static size_t console_write(vfs_node_t *node, size_t offset, size_t size,
@@ -452,7 +465,7 @@ static size_t console_write(vfs_node_t *node, size_t offset, size_t size,
     return size;
 }
 
-static size_t pipe_read(vfs_node_t *node, size_t offset, size_t size,
+static int pipe_read(vfs_node_t *node, uint64_t offset, uint32_t size,
     uint8_t *buffer)
 {
     (void)offset;
@@ -463,7 +476,7 @@ static size_t pipe_read(vfs_node_t *node, size_t offset, size_t size,
     }
 
     struct pipe_buffer *pipe = end->pipe;
-    size_t read_count = 0;
+    uint32_t read_count = 0;
 
     mutex_lock(&pipe->lock);
     while (read_count < size && pipe->count > 0) {
@@ -480,7 +493,7 @@ static size_t pipe_read(vfs_node_t *node, size_t offset, size_t size,
         mutex_unlock(&pipe->lock);
     }
 
-    return read_count;
+    return (int)read_count;
 }
 
 static size_t pipe_write(vfs_node_t *node, size_t offset, size_t size,
@@ -552,12 +565,18 @@ static int keyboard_queue_pop(char *ch)
     return 1;
 }
 
-static int sys_open(const char *path)
+static int sys_open(const char *path, int flags)
 {
+    (void)flags;
     task_t *task = scheduler_current_task();
-    vfs_node_t *node = vfs_find(path);
+    char kernel_path[128];
 
-    if (task == 0 || node == 0 || node->type != VFS_NODE_FILE) {
+    if (task == 0 || copy_user_path(kernel_path, path, sizeof(kernel_path)) != 0) {
+        return -1;
+    }
+
+    vfs_node_t *node = vfs_find(kernel_path);
+    if (node == 0 || node->type != VFS_NODE_FILE) {
         return -1;
     }
 
@@ -605,15 +624,20 @@ static int task_owns_stdin(task_t *task)
 static int sys_create(const char *path)
 {
     task_t *task = scheduler_current_task();
+    char kernel_path[128];
 
-    if (task == 0 || path == 0 || ata_vfs_create(path) != 0) {
+    if (task == 0 || copy_user_path(kernel_path, path, sizeof(kernel_path)) != 0) {
         return -1;
     }
 
-    return sys_open(path);
+    if (ata_vfs_create(kernel_path) != 0) {
+        return -1;
+    }
+
+    return sys_open(kernel_path, 0);
 }
 
-static int sys_read(int fd, uint8_t *buffer, size_t size)
+static int sys_read(int fd, void *buffer, uint32_t size)
 {
     task_t *task = scheduler_current_task();
 
@@ -627,15 +651,39 @@ static int sys_read(int fd, uint8_t *buffer, size_t size)
         return 0;
     }
 
-    size_t bytes = vfs_read(node, task->fd_offsets[fd], size, buffer);
+    uint8_t *kbuf = kmalloc(size);
+    if (kbuf == 0 && size > 0) {
+        return -1;
+    }
+
+    int bytes = vfs_read(node, task->fd_offsets[fd], size, kbuf);
 
     if (bytes == 0 && node == &console_stdin) {
         scheduler_sleep_current(TASK_WAIT_STDIN, 0);
     }
 
-    task->fd_offsets[fd] += bytes;
+    if (bytes > 0) {
+        // Validate user pages before writing
+        for (uint32_t i = 0; i < (uint32_t)bytes; i += 4096) {
+            if (!vmm_is_mapped((uint64_t *)task->cr3, (uintptr_t)buffer + i)) {
+                if (kbuf != 0) kfree(kbuf);
+                return -1;
+            }
+        }
+        if (!vmm_is_mapped((uint64_t *)task->cr3, (uintptr_t)buffer + bytes - 1)) {
+            if (kbuf != 0) kfree(kbuf);
+            return -1;
+        }
 
-    return (int)bytes;
+        memory_copy(buffer, kbuf, bytes);
+        task->fd_offsets[fd] += bytes;
+    }
+
+    if (kbuf != 0) {
+        kfree(kbuf);
+    }
+
+    return bytes;
 }
 
 static int sys_write(int fd, const uint8_t *buffer, size_t size)
@@ -648,9 +696,46 @@ static int sys_write(int fd, const uint8_t *buffer, size_t size)
         return -1;
     }
 
+    /* Limita o tamanho por chamada para conter uso de heap. */
+    if (size > 4096) {
+        size = 4096;
+    }
+
+    /*
+     * Validação de segurança: verifica a primeira e a ultima pagina do
+     * buffer de usuario estao mapeadas no espaco de endereçamento do processo.
+     */
+    if (!vmm_is_mapped((uint64_t *)task->cr3, (uintptr_t)buffer)) {
+        return -1;
+    }
+    if (size > 1 &&
+        !vmm_is_mapped((uint64_t *)task->cr3, (uintptr_t)buffer + size - 1)) {
+        return -1;
+    }
+
+    /*
+     * Buffer de bounce no Heap do Kernel: isola dados de usuario de Ring 0.
+     * O driver FAT16 escreve a partir deste buffer seguro via ATA PIO.
+     */
+    uint8_t *kbuf = kmalloc(size);
+    if (kbuf == 0 && size > 0) {
+        return -1;
+    }
+
+    if (size > 0) {
+        memory_copy(kbuf, buffer, size);
+    }
+
     size_t bytes = vfs_write(task->file_descriptors[fd],
-        task->fd_offsets[fd], size, buffer);
-    task->fd_offsets[fd] += bytes;
+        task->fd_offsets[fd], size, kbuf);
+
+    if (kbuf != 0) {
+        kfree(kbuf);
+    }
+
+    if (bytes > 0) {
+        task->fd_offsets[fd] += bytes;
+    }
 
     return (int)bytes;
 }
@@ -683,6 +768,87 @@ static int sys_spawn(const char *path)
 
     vmm_switch_address_space(vmm_kernel_pml4());
     int pid = elf_load_process(kernel_path, 0);
+    vmm_switch_address_space((uint64_t *)task->cr3);
+
+    return pid;
+}
+
+/*
+ * sys_execve - Carrega e executa um binario ELF a partir do VFS.
+ *
+ * path   : caminho absoluto do executavel (ex: "/bin/hello").
+ * argv   : vetor de argumentos terminado em NULL (Ring 3). argv[1] e
+ *          concatenado ao path para que elf_load_process possa receber
+ *          "path arg" na forma que ja espera.
+ * envp   : ignorado nesta versao (reservado para compatibilidade POSIX).
+ *
+ * Retorna o PID do novo processo ou -1 em caso de falha.
+ */
+static int sys_execve(const char *path, const char *const *argv,
+    const char *const *envp)
+{
+    (void)envp;
+
+    task_t *task = scheduler_current_task();
+    if (task == 0) {
+        return -1;
+    }
+
+    /* Copia o caminho do executavel do espaco de usuario. */
+    char exec_path[128];
+    if (copy_user_path(exec_path, path, sizeof(exec_path)) != 0) {
+        return -1;
+    }
+
+    /*
+     * Monta a string de comando: "exec_path" ou "exec_path arg1 arg2..."
+     * elf_load_process ja sabe separar o path dos argumentos pelo primeiro
+     * espaco, portanto esta representacao flat e suficiente.
+     */
+    char command[256];
+    size_t cmd_len = 0;
+
+    /* Copia o caminho para o buffer de comando. */
+    for (size_t i = 0; exec_path[i] != '\0' && cmd_len < sizeof(command) - 2U; i++) {
+        command[cmd_len++] = exec_path[i];
+    }
+
+    /* Concatena argumentos adicionais (argv[1..]) se existirem e estiverem mapeados. */
+    if (argv != 0) {
+        /* Percorre a partir de argv[1] (argv[0] e o proprio path). */
+        for (size_t argi = 1; cmd_len < sizeof(command) - 2U; argi++) {
+            /* Valida que o ponteiro argv[argi] esta mapeado no espaco do processo. */
+            if (!vmm_is_mapped((uint64_t *)task->cr3, (uintptr_t)&argv[argi])) {
+                break;
+            }
+
+            const char *arg = argv[argi];
+            if (arg == 0) {
+                break; /* Sentinela NULL - fim do vetor. */
+            }
+
+            /* Valida que o conteudo do argumento esta mapeado. */
+            if (!vmm_is_mapped((uint64_t *)task->cr3, (uintptr_t)arg)) {
+                break;
+            }
+
+            command[cmd_len++] = ' ';
+
+            char arg_buf[64];
+            if (copy_user_path(arg_buf, arg, sizeof(arg_buf)) != 0) {
+                break;
+            }
+
+            for (size_t j = 0; arg_buf[j] != '\0' && cmd_len < sizeof(command) - 1U; j++) {
+                command[cmd_len++] = arg_buf[j];
+            }
+        }
+    }
+
+    command[cmd_len] = '\0';
+
+    vmm_switch_address_space(vmm_kernel_pml4());
+    int pid = elf_load_process(command, 0);
     vmm_switch_address_space((uint64_t *)task->cr3);
 
     return pid;
@@ -1029,6 +1195,41 @@ static int sys_list(const char *path, uint8_t *buffer, size_t size)
     return (int)written;
 }
 
+static int sys_readdir(int fd, vfs_dir_entry_t *buf, uint32_t count)
+{
+    task_t *task = scheduler_current_task();
+
+    if (task == 0 || fd < 0 || fd >= TASK_MAX_FDS || buf == 0 ||
+        task->file_descriptors[fd] == 0) {
+        return -1;
+    }
+
+    vfs_node_t *node = task->file_descriptors[fd];
+    if (node->type != VFS_NODE_DIRECTORY) {
+        return -1;
+    }
+
+    uint32_t read_count = 0;
+    uint32_t index = (uint32_t)task->fd_offsets[fd];
+
+    while (read_count < count) {
+        vfs_dir_entry_t entry;
+        int ret = vfs_readdir(node, index, &entry);
+        if (ret < 0) {
+            return -1;
+        }
+        if (ret == 0) {
+            break;
+        }
+        buf[read_count] = entry;
+        read_count++;
+        index++;
+    }
+
+    task->fd_offsets[fd] = index;
+    return (int)read_count;
+}
+
 uint64_t syscall_handler(uint64_t number, uint64_t arg1, uint64_t arg2,
     uint64_t arg3, uint64_t arg4, uint64_t arg5, uint64_t arg6)
 {
@@ -1037,10 +1238,10 @@ uint64_t syscall_handler(uint64_t number, uint64_t arg1, uint64_t arg2,
     uint64_t ret = (uint64_t)-1;
 
     if (number == SYS_OPEN) {
-        ret = (uint64_t)sys_open((const char *)arg1);
+        ret = (uint64_t)sys_open((const char *)arg1, (int)arg2);
     }
     else if (number == SYS_READ) {
-        ret = (uint64_t)sys_read((int)arg1, (uint8_t *)arg2, (size_t)arg3);
+        ret = (uint64_t)sys_read((int)arg1, (void *)arg2, (uint32_t)arg3);
     }
     else if (number == SYS_SPAWN) {
         ret = (uint64_t)sys_spawn((const char *)arg1);
@@ -1100,6 +1301,13 @@ uint64_t syscall_handler(uint64_t number, uint64_t arg1, uint64_t arg2,
     }
     else if (number == SYS_GET_TICKS) {
         ret = kernel_ticks;
+    }
+    else if (number == SYS_READDIR) {
+        ret = (uint64_t)sys_readdir((int)arg1, (vfs_dir_entry_t *)arg2, (uint32_t)arg3);
+    }
+    else if (number == SYS_EXECVE) {
+        ret = (uint64_t)sys_execve((const char *)arg1, (const char *const *)arg2,
+            (const char *const *)arg3);
     }
 
     scheduler_handle_syscall_signals(arg6, ret);

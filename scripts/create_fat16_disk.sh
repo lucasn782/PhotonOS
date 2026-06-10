@@ -71,6 +71,8 @@ for spec in sys.argv[2:]:
     with open(src, "rb") as handle:
         files.append((dst, handle.read()))
 
+files.append(("info.txt", b"FAT16 driver test: file read is working perfectly!\n"))
+
 sector_size = 512
 total_sectors = 16 * 1024 * 1024 // sector_size
 sectors_per_cluster = 2

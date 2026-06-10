@@ -18,6 +18,7 @@
 #define SYS_DUP2 14
 #define SYS_CLOSE 15
 #define SYS_LIST 16
+#define SYS_EXECVE 22
 #define SIGINT 2
 
 #define FD_STDIN_SAVE 29
@@ -58,6 +59,23 @@ static long syscall3(long number, long arg1, long arg2, long arg3)
         "syscall"
         : "=a"(ret)
         : "a"(number), "D"(arg1), "S"(arg2), "d"(arg3)
+        : "rcx", "r11", "memory");
+    return ret;
+}
+
+/*
+ * syscall_execve - Chama sys_execve(path, argv, envp) via syscall de 3 args.
+ * argv deve ser um vetor de ponteiros terminado em NULL (Ring 3).
+ */
+static long syscall_execve(const char *path, const char *const *argv,
+    const char *const *envp)
+{
+    long ret;
+    __asm__ volatile (
+        "syscall"
+        : "=a"(ret)
+        : "a"((long)SYS_EXECVE), "D"((long)path), "S"((long)argv),
+          "d"((long)envp)
         : "rcx", "r11", "memory");
     return ret;
 }
@@ -305,7 +323,26 @@ static void command_ps(void)
 static void command_cat(const char *path)
 {
     char buffer[128];
-    long fd = syscall1(SYS_OPEN, (long)path);
+    char local_path[128];
+    size_t i = 0;
+
+    // Skip leading spaces
+    while (*path == ' ') {
+        path++;
+    }
+
+    while (*path != '\0' && i < sizeof(local_path) - 1) {
+        local_path[i++] = *path++;
+    }
+    local_path[i] = '\0';
+
+    // Trim trailing spaces
+    while (i > 0 && local_path[i - 1] == ' ') {
+        local_path[i - 1] = '\0';
+        i--;
+    }
+
+    long fd = syscall2(SYS_OPEN, (long)local_path, 0);
 
     if (fd < 0) {
         write_str("cat: arquivo nao encontrado\n");
@@ -330,7 +367,7 @@ static void command_cat_raw(char *path)
 
     path = skip_spaces(path);
     trim_right(path);
-    fd = syscall1(SYS_OPEN, (long)path);
+    fd = syscall2(SYS_OPEN, (long)path, 0);
 
     if (fd < 0) {
         write_str("cat: arquivo nao encontrado\n");
@@ -365,6 +402,66 @@ static void command_touch(char *path)
 
     if (syscall1(SYS_CREATE, (long)path) < 0) {
         write_str("touch: falha ao criar arquivo\n");
+    }
+}
+
+/*
+ * command_write - Grava texto em um arquivo no disco FAT16.
+ * Formato: write <arquivo> <texto>
+ */
+static void command_write(char *args)
+{
+    char path[48];
+    char text_buf[128];
+    size_t path_len = 0;
+    long fd;
+    long bytes;
+
+    args = skip_spaces(args);
+    if (args[0] == '\0') {
+        write_str("uso: write <arquivo> <texto>\n");
+        return;
+    }
+
+    while (args[path_len] != '\0' && args[path_len] != ' ' &&
+           path_len < sizeof(path) - 1U) {
+        path[path_len] = args[path_len];
+        path_len++;
+    }
+    path[path_len] = '\0';
+
+    if (path[0] == '\0') {
+        write_str("write: nome ausente\n");
+        return;
+    }
+
+    char *text = skip_spaces(args + path_len);
+    trim_right(text);
+
+    size_t text_len = 0;
+    while (text[text_len] != '\0' && text_len < sizeof(text_buf) - 2U) {
+        text_buf[text_len] = text[text_len];
+        text_len++;
+    }
+    text_buf[text_len++] = '\n';
+    text_buf[text_len]   = '\0';
+
+    fd = syscall1(SYS_CREATE, (long)path);
+    if (fd < 0) {
+        fd = syscall2(SYS_OPEN, (long)path, 0);
+    }
+    if (fd < 0) {
+        write_str("write: falha ao abrir arquivo\n");
+        return;
+    }
+
+    bytes = syscall3(SYS_WRITE, fd, (long)text_buf, (long)text_len);
+    syscall1(SYS_CLOSE, fd);
+
+    if (bytes < 0) {
+        write_str("write: falha na escrita\n");
+    } else {
+        write_str("write: gravado\n");
     }
 }
 
@@ -482,6 +579,56 @@ static void command_program(const char *path, int is_background)
     }
 }
 
+/*
+ * command_execve - Executa um binario pelo caminho absoluto usando sys_execve.
+ *
+ * Aceita uma linha no formato: "/caminho/binario [arg1 arg2 ...]"
+ * O primeiro token e o path; os demais sao passados como argv[1..].
+ * Apenas argv[1] e suportado nesta versao (argumento unico concatenado).
+ */
+static void command_execve(char *line, int is_background)
+{
+    /*
+     * O kernel em sys_execve concatena argv ao path internamente.
+     * Para manter a interface simples, passamos apenas path + argv[1]
+     * usando o mecanismo ja existente de spawn com espaco.
+     * argv[0] = path, argv[1] = resto da linha apos o espaco.
+     */
+    char *path = line;
+    char *args = 0;
+
+    /* Separa path e argumentos pelo primeiro espaco. */
+    for (size_t i = 0; line[i] != '\0'; i++) {
+        if (line[i] == ' ') {
+            line[i] = '\0';
+            args = line + i + 1;
+            break;
+        }
+    }
+
+    /* Monta argv[] no stack: argv[0]=path, argv[1]=args (opcional), NULL. */
+    const char *argv[3];
+    int argc = 0;
+    argv[argc++] = path;
+    if (args != 0 && args[0] != '\0') {
+        argv[argc++] = args;
+    }
+    argv[argc] = 0; /* Sentinela NULL. */
+
+    long pid = syscall_execve(path, argv, 0);
+
+    if (pid < 0) {
+        write_str("execve: falha ao executar binario\n");
+        return;
+    }
+
+    if (is_background) {
+        announce_background(pid);
+    } else {
+        wait_pid(pid);
+    }
+}
+
 static void command_ping(char *arg, int is_background)
 {
     char command[96];
@@ -513,7 +660,7 @@ static void execute_simple(char *line, int is_background)
     }
 
     if (streq(line, "help")) {
-        write_str("help ls ps cat <arquivo> touch <arquivo> echo <texto> > <arquivo> hello upper rev hang spin ping <ip>\n");
+        write_str("help ls ps cat <arq> touch <arq> write <arq> <txt> echo <txt> > <arq> hello upper rev hang spin ping <ip>\n");
     } else if (streq(line, "ls")) {
         command_ls();
     } else if (streq(line, "ps") || streq(line, "jobs")) {
@@ -536,8 +683,13 @@ static void execute_simple(char *line, int is_background)
         command_cat(line + 4);
     } else if (starts_with(line, "touch ")) {
         command_touch(line + 6);
+    } else if (starts_with(line, "write ")) {
+        command_write(line + 6);
     } else if (starts_with(line, "echo ")) {
         command_echo_redirect(line);
+    } else if (line[0] == '/') {
+        /* Caminho absoluto: tenta executar como binario ELF via sys_execve. */
+        command_execve(line, is_background);
     } else {
         write_str("comando desconhecido\n");
     }

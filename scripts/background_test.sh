@@ -37,8 +37,8 @@ make fat16-disk
     sleep 2
     echo 'quit'
 ) | qemu-system-x86_64 \
-    -drive format=raw,file=photon.img,if=floppy \
-    -drive format=raw,file=disk.img,if=ide,index=0,media=disk \
+    -drive format=raw,file=build/photon.img,if=floppy \
+    -drive format=raw,file=build/disk.img,if=ide,index=0,media=disk \
     -boot a \
     -display none \
     -serial file:background_test_serial.log \

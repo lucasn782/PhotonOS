@@ -184,7 +184,7 @@ int ata_write_sectors(uint32_t lba, uint8_t sector_count,
     return ata_wait_ready();
 }
 
-static size_t ata_block_read(vfs_node_t *node, size_t offset, size_t size,
+static int ata_block_read(vfs_node_t *node, uint64_t offset, uint32_t size,
     uint8_t *buffer)
 {
     (void)node;
@@ -197,7 +197,7 @@ static size_t ata_block_read(vfs_node_t *node, size_t offset, size_t size,
         return 0;
     }
 
-    return size;
+    return (int)size;
 }
 
 static size_t ata_block_write(vfs_node_t *node, size_t offset, size_t size,

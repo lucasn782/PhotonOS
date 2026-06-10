@@ -16,6 +16,7 @@
 #define SYS_SOCKET_RECV 18
 #define SYS_YIELD 19
 #define SYS_GET_TICKS 20
+#define SYS_READDIR 21
 #define PAGE_SIZE 4096UL
 
 struct malloc_block {
@@ -334,6 +335,11 @@ int getprocs(proc_info_t *buffer, size_t max_size)
 uint64_t get_ticks(void)
 {
     return (uint64_t)syscall0(SYS_GET_TICKS);
+}
+
+int readdir(int fd, vfs_dir_entry_t *buf, uint32_t count)
+{
+    return (int)syscall3(SYS_READDIR, (long)fd, (long)buf, (long)count);
 }
 
 int socket_send(uint32_t dest_ip, uint8_t protocol, const void *payload,

@@ -40,7 +40,7 @@ static const struct initrd_file initrd_files[] = {
     { "bin/ping", _binary_ping_elf_start, 0 },
 };
 
-static size_t initrd_read(vfs_node_t *node, size_t offset, size_t size,
+static int initrd_read(vfs_node_t *node, uint64_t offset, uint32_t size,
     uint8_t *buffer)
 {
     const uint8_t *data = node->data;
@@ -49,16 +49,16 @@ static size_t initrd_read(vfs_node_t *node, size_t offset, size_t size,
         return 0;
     }
 
-    size_t available = node->size - offset;
+    uint32_t available = (uint32_t)(node->size - offset);
     if (size > available) {
         size = available;
     }
 
-    for (size_t i = 0; i < size; i++) {
+    for (uint32_t i = 0; i < size; i++) {
         buffer[i] = data[offset + i];
     }
 
-    return size;
+    return (int)size;
 }
 
 void initrd_init(void)

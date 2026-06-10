@@ -123,14 +123,14 @@ vfs_node_t *vfs_find(const char *path)
     return current;
 }
 
-size_t vfs_read(vfs_node_t *node, size_t offset, size_t size, uint8_t *buffer)
+int vfs_read(vfs_node_t *node, uint64_t offset, uint32_t size, uint8_t *buffer)
 {
     if (node == 0 || node->read == 0 || buffer == 0) {
         return 0;
     }
 
     mutex_lock(&vfs_mutex);
-    size_t bytes = node->read(node, offset, size, buffer);
+    int bytes = node->read(node, offset, size, buffer);
     mutex_unlock(&vfs_mutex);
 
     return bytes;
@@ -148,4 +148,37 @@ size_t vfs_write(vfs_node_t *node, size_t offset, size_t size,
     mutex_unlock(&vfs_mutex);
 
     return bytes;
+}
+
+int vfs_readdir(vfs_node_t *node, uint32_t index, vfs_dir_entry_t *entry)
+{
+    if (node == 0 || node->type != VFS_NODE_DIRECTORY || entry == 0) {
+        return -1;
+    }
+
+    mutex_lock(&vfs_mutex);
+
+    if (node->readdir != 0) {
+        int result = node->readdir(node, index, entry);
+        mutex_unlock(&vfs_mutex);
+        return result;
+    }
+
+    vfs_node_t *child = node->child;
+    for (uint32_t i = 0; i < index && child != 0; i++) {
+        child = child->sibling;
+    }
+
+    if (child == 0) {
+        mutex_unlock(&vfs_mutex);
+        return 0;
+    }
+
+    memory_zero(entry, sizeof(*entry));
+    copy_name(entry->name, child->name);
+    entry->size = (uint32_t)child->size;
+    entry->type = (uint32_t)child->type;
+
+    mutex_unlock(&vfs_mutex);
+    return 1;
 }

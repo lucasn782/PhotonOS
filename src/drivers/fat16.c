@@ -210,6 +210,7 @@ static int load_bpb_at(uint32_t partition_lba)
     fat16.data_lba = fat16.root_lba + fat16.root_dir_sectors;
     fat16.mounted = 1;
 
+    klog("FAT16: Setor de Boot (BPB) validado com sucesso.\n");
     return 1;
 }
 
@@ -853,18 +854,25 @@ done:
     return written;
 }
 
-static size_t fat16_vfs_read(vfs_node_t *node, size_t offset, size_t size,
+static int fat16_open(vfs_node_t *node)
+{
+    (void)node;
+    return 0;
+}
+
+static int fat16_read(vfs_node_t *node, uint64_t offset, uint32_t size,
     uint8_t *buffer)
 {
     struct fat16_node_data *data = node->data;
-    size_t bytes;
+    int bytes;
 
     if (data == 0) {
         return 0;
     }
 
     mutex_lock(&fat16_mutex);
-    bytes = read_chain(data->first_cluster, data->size, offset, size, buffer);
+    bytes = (int)read_chain(data->first_cluster, data->size, (size_t)offset,
+        (size_t)size, buffer);
     mutex_unlock(&fat16_mutex);
 
     return bytes;
@@ -950,8 +958,210 @@ static void mount_file(vfs_node_t *parent, const char *name,
         return;
     }
     node->size = entry->size;
-    node->read = fat16_vfs_read;
+    node->read = fat16_read;
+    node->open = fat16_open;
     node->write = fat16_vfs_write;
+}
+
+static int get_subdir_entry(uint16_t first_cluster, uint32_t entry_index, fat16_entry_t *out_entry)
+{
+    uint32_t entries_per_sector = FAT16_SECTOR_SIZE / sizeof(fat16_entry_t);
+    uint32_t entries_per_cluster = entries_per_sector * fat16.bpb.sectors_per_cluster;
+    
+    uint32_t cluster_skip = entry_index / entries_per_cluster;
+    uint32_t index_in_cluster = entry_index % entries_per_cluster;
+    uint32_t sector_in_cluster = index_in_cluster / entries_per_sector;
+    uint32_t index_in_sector = index_in_cluster % entries_per_sector;
+    
+    uint16_t cluster = first_cluster;
+    for (uint32_t i = 0; i < cluster_skip; i++) {
+        uint16_t next;
+        if (!read_fat_entry(cluster, &next)) {
+            return -1;
+        }
+        if (next >= FAT16_EOC || next == FAT16_BAD_CLUSTER || next == FAT16_FREE_CLUSTER) {
+            return 0;
+        }
+        cluster = next;
+    }
+    
+    uint32_t sector_lba = cluster_to_lba(cluster) + sector_in_cluster;
+    if (!read_sector(sector_lba, sector_buffer)) {
+        return -1;
+    }
+    
+    fat16_entry_t *entries = (fat16_entry_t *)sector_buffer;
+    *out_entry = entries[index_in_sector];
+    return 1;
+}
+
+static int fat16_readdir(vfs_node_t *node, uint32_t index, vfs_dir_entry_t *entry)
+{
+    if (node == 0 || entry == 0) {
+        return -1;
+    }
+
+    mutex_lock(&fat16_mutex);
+
+    if (node == vfs_root()) {
+        uint32_t root_lba = fat16.partition_lba + fat16.root_lba;
+        uint32_t entries_per_sector = FAT16_SECTOR_SIZE / sizeof(fat16_entry_t);
+        uint32_t i = 0;
+        uint32_t usable_count = 0;
+
+        while (i < fat16.bpb.root_entry_count) {
+            uint32_t sector = root_lba + (i / entries_per_sector);
+            uint32_t idx_in_sector = i % entries_per_sector;
+
+            if (!read_sector(sector, sector_buffer)) {
+                mutex_unlock(&fat16_mutex);
+                return -1;
+            }
+
+            fat16_entry_t *entries = (fat16_entry_t *)sector_buffer;
+            fat16_entry_t *ent = &entries[idx_in_sector];
+
+            if ((uint8_t)ent->name[0] == 0x00) {
+                mutex_unlock(&fat16_mutex);
+                return 0;
+            }
+
+            if ((uint8_t)ent->name[0] != 0xE5 &&
+                (ent->attributes & FAT16_ATTR_VOLUME_ID) == 0 &&
+                (ent->attributes & FAT16_ATTR_LONG_NAME) != FAT16_ATTR_LONG_NAME) {
+
+                if (usable_count == index) {
+                    entry_to_vfs_name(ent, entry->name);
+                    entry->size = ent->size;
+                    entry->type = (ent->attributes & FAT16_ATTR_DIRECTORY) ? VFS_NODE_DIRECTORY : VFS_NODE_FILE;
+
+                    mutex_unlock(&fat16_mutex);
+                    return 1;
+                }
+                usable_count++;
+            }
+            i++;
+        }
+
+        mutex_unlock(&fat16_mutex);
+        return 0;
+    }
+
+    struct fat16_node_data *data = node->data;
+    if (data == 0) {
+        mutex_unlock(&fat16_mutex);
+        return -1;
+    }
+
+    uint16_t first_cluster = data->first_cluster;
+    uint32_t i = 0;
+    uint32_t usable_count = 0;
+
+    for (;;) {
+        fat16_entry_t ent;
+        int res = get_subdir_entry(first_cluster, i, &ent);
+        if (res == 0) {
+            mutex_unlock(&fat16_mutex);
+            return 0;
+        }
+        if (res < 0) {
+            mutex_unlock(&fat16_mutex);
+            return -1;
+        }
+
+        if ((uint8_t)ent.name[0] == 0x00) {
+            mutex_unlock(&fat16_mutex);
+            return 0;
+        }
+
+        if ((uint8_t)ent.name[0] != 0xE5 &&
+            (ent.attributes & FAT16_ATTR_VOLUME_ID) == 0 &&
+            (ent.attributes & FAT16_ATTR_LONG_NAME) != FAT16_ATTR_LONG_NAME) {
+
+            if (usable_count == index) {
+                entry_to_vfs_name(&ent, entry->name);
+                entry->size = ent.size;
+                entry->type = (ent.attributes & FAT16_ATTR_DIRECTORY) ? VFS_NODE_DIRECTORY : VFS_NODE_FILE;
+
+                mutex_unlock(&fat16_mutex);
+                return 1;
+            }
+            usable_count++;
+        }
+        i++;
+    }
+}
+
+static void mount_dir_entries_recursive(vfs_node_t *parent_node, uint16_t first_cluster)
+{
+    if (!cluster_is_data(first_cluster)) {
+        return;
+    }
+
+    uint8_t *local_buffer = kmalloc(FAT16_SECTOR_SIZE);
+    if (local_buffer == 0) {
+        return;
+    }
+
+    uint16_t cluster = first_cluster;
+    uint32_t entries_per_sector = FAT16_SECTOR_SIZE / sizeof(fat16_entry_t);
+
+    while (cluster_is_data(cluster) && cluster < FAT16_EOC && cluster != FAT16_BAD_CLUSTER) {
+        uint32_t cluster_lba = cluster_to_lba(cluster);
+
+        for (uint8_t sector = 0; sector < fat16.bpb.sectors_per_cluster; sector++) {
+            if (!read_sector(cluster_lba + sector, local_buffer)) {
+                kfree(local_buffer);
+                return;
+            }
+
+            fat16_entry_t *entries = (fat16_entry_t *)local_buffer;
+            for (uint32_t i = 0; i < entries_per_sector; i++) {
+                if ((uint8_t)entries[i].name[0] == 0x00) {
+                    kfree(local_buffer);
+                    return;
+                }
+
+                if ((uint8_t)entries[i].name[0] != 0xE5 &&
+                    (entries[i].attributes & FAT16_ATTR_VOLUME_ID) == 0 &&
+                    (entries[i].attributes & FAT16_ATTR_LONG_NAME) != FAT16_ATTR_LONG_NAME) {
+
+                    char name[VFS_NAME_MAX];
+                    entry_to_vfs_name(&entries[i], name);
+                    if (name[0] != '\0') {
+                        if (!(name[0] == '.' && (name[1] == '\0' || (name[1] == '.' && name[2] == '\0')))) {
+                            struct fat16_entry_location location;
+                            location.sector_lba = cluster_lba + sector;
+                            location.index = i;
+
+                            if (entries[i].attributes & FAT16_ATTR_DIRECTORY) {
+                                vfs_node_t *sub_node = vfs_create_node(parent_node, name, VFS_NODE_DIRECTORY);
+                                if (sub_node != 0) {
+                                    sub_node->data = create_node_data(&entries[i], &location);
+                                    sub_node->size = entries[i].size;
+                                    sub_node->readdir = fat16_readdir;
+                                    mount_dir_entries_recursive(sub_node, entries[i].starting_cluster);
+                                }
+                            } else {
+                                mount_file(parent_node, name, &entries[i], &location);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        uint16_t next;
+        if (!read_fat_entry(cluster, &next)) {
+            break;
+        }
+        if (next >= FAT16_EOC || next == FAT16_BAD_CLUSTER || next == FAT16_FREE_CLUSTER) {
+            break;
+        }
+        cluster = next;
+    }
+
+    kfree(local_buffer);
 }
 
 static void mount_root_entries(void)
@@ -959,6 +1169,8 @@ static void mount_root_entries(void)
     vfs_node_t *root = vfs_root();
     vfs_node_t *bin = ensure_directory(root, "bin");
     uint32_t root_lba = fat16.partition_lba + fat16.root_lba;
+
+    root->readdir = fat16_readdir;
 
     for (uint32_t sector = 0; sector < fat16.root_dir_sectors; sector++) {
         if (!read_sector(root_lba + sector, sector_buffer)) {
@@ -971,7 +1183,9 @@ static void mount_root_entries(void)
             if ((uint8_t)entries[i].name[0] == 0x00) {
                 return;
             }
-            if (!entry_is_usable_file(&entries[i])) {
+            if ((uint8_t)entries[i].name[0] == 0xE5 ||
+                (entries[i].attributes & FAT16_ATTR_VOLUME_ID) ||
+                (entries[i].attributes & FAT16_ATTR_LONG_NAME) == FAT16_ATTR_LONG_NAME) {
                 continue;
             }
 
@@ -981,13 +1195,27 @@ static void mount_root_entries(void)
                 continue;
             }
 
+            if (name[0] == '.' && (name[1] == '\0' || (name[1] == '.' && name[2] == '\0'))) {
+                continue;
+            }
+
             struct fat16_entry_location location;
             location.sector_lba = root_lba + sector;
             location.index = i;
 
-            mount_file(root, name, &entries[i], &location);
-            if (bin != 0) {
-                mount_file(bin, name, &entries[i], &location);
+            if (entries[i].attributes & FAT16_ATTR_DIRECTORY) {
+                vfs_node_t *sub_node = vfs_create_node(root, name, VFS_NODE_DIRECTORY);
+                if (sub_node != 0) {
+                    sub_node->data = create_node_data(&entries[i], &location);
+                    sub_node->size = entries[i].size;
+                    sub_node->readdir = fat16_readdir;
+                    mount_dir_entries_recursive(sub_node, entries[i].starting_cluster);
+                }
+            } else {
+                mount_file(root, name, &entries[i], &location);
+                if (bin != 0) {
+                    mount_file(bin, name, &entries[i], &location);
+                }
             }
         }
     }
@@ -1039,6 +1267,7 @@ int fat16_mount(uint32_t partition_lba)
         return 0;
     }
 
+    klog("FAT16: Particao ativa montada em /dev/ata0p1.\n");
     mount_root_entries();
     klog("FAT16: volume montado via VFS.\n");
     return 1;
@@ -1295,7 +1524,8 @@ int fat16_vfs_create(const char *path)
             data->dir_entry_index = location.index;
         }
         node->size = entry.size;
-        node->read = fat16_vfs_read;
+        node->read = fat16_read;
+        node->open = fat16_open;
         node->write = fat16_vfs_write;
     }
 
