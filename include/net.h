@@ -3,6 +3,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include "sys/socket.h"
 
 #define ETH_TYPE_ARP  0x0806U
 #define ETH_TYPE_IPV4 0x0800U
@@ -51,37 +52,6 @@ struct __attribute__((packed)) ip_header {
     uint32_t dest_ip;
 };
 
-struct __attribute__((packed)) icmp_packet {
-    uint8_t type;
-    uint8_t code;
-    uint16_t checksum;
-    uint16_t id;
-    uint16_t sequence;
-};
-
-static inline uint16_t htons(uint16_t value)
-{
-    return (uint16_t)((value << 8) | (value >> 8));
-}
-
-static inline uint16_t ntohs(uint16_t value)
-{
-    return htons(value);
-}
-
-static inline uint32_t htonl(uint32_t value)
-{
-    return ((value & 0x000000FFU) << 24) |
-        ((value & 0x0000FF00U) << 8) |
-        ((value & 0x00FF0000U) >> 8) |
-        ((value & 0xFF000000U) >> 24);
-}
-
-static inline uint32_t ntohl(uint32_t value)
-{
-    return htonl(value);
-}
-
 void net_poll_packets(void);
 void net_handle_arp(uint8_t *frame, size_t frame_length);
 void net_handle_icmp(uint8_t *frame, size_t frame_length);
@@ -89,5 +59,8 @@ void net_kernel_thread(void);
 
 int sys_socket_send(uint32_t dest_ip, uint8_t protocol, const void *payload, size_t len);
 int sys_socket_recv(uint8_t protocol, void *buffer, size_t max_len);
+
+int sys_socket(int domain, int type, int protocol);
+int sys_bind(int fd, const struct sockaddr *addr, uint32_t addrlen);
 
 #endif

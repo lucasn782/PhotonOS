@@ -5,6 +5,8 @@
 #include "serial.h"
 #include "mutex.h"
 #include "vmm.h"
+#include "heap.h"
+#include "vfs.h"
 
 #define NET_LOCAL_IPV4 0x0A00020FU
 
@@ -22,23 +24,57 @@ struct arp_entry {
 static struct arp_entry arp_cache[ARP_CACHE_SIZE];
 static size_t arp_cache_count = 0;
 
-#define RX_QUEUE_SIZE 16
+#define SOCKET_RX_BUF_SIZE 16
 #define RX_PACKET_DATA_SIZE 1500U
 #define NET_IPV4_PAYLOAD_MAX 1480U
 #define NET_USER_BASE 0x0000008000000000ULL
 #define NET_PAGE_SIZE 4096ULL
 
-struct rx_packet {
-    uint8_t protocol;
-    uint8_t data[RX_PACKET_DATA_SIZE];
+struct udp_header {
+    uint16_t src_port;
+    uint16_t dest_port;
+    uint16_t length;
+    uint16_t checksum;
+} __attribute__((packed));
+
+struct socket_packet {
+    uint8_t *data;
     size_t len;
 };
 
-static struct rx_packet rx_queue[RX_QUEUE_SIZE];
-static size_t rx_queue_head = 0;
-static size_t rx_queue_tail = 0;
-static size_t rx_queue_count = 0;
-static mutex_t rx_queue_mutex = {0};
+struct socket {
+    int fd;
+    int domain;
+    int type;
+    int protocol;
+    uint16_t local_port;
+    uint32_t local_addr;
+    
+    struct socket_packet rx_queue[SOCKET_RX_BUF_SIZE];
+    size_t rx_head;
+    size_t rx_tail;
+    size_t rx_count;
+    
+    int active;
+};
+
+#define MAX_SOCKETS 16
+static struct socket sockets[MAX_SOCKETS];
+
+static inline uint64_t save_and_disable_interrupts(void)
+{
+    uint64_t rflags;
+    __asm__ volatile ("pushfq; popq %0" : "=r"(rflags));
+    __asm__ volatile ("cli" ::: "memory");
+    return rflags;
+}
+
+static inline void restore_interrupts(uint64_t rflags)
+{
+    if ((rflags & 0x200ULL) != 0) {
+        __asm__ volatile ("sti" ::: "memory");
+    }
+}
 
 static void net_memcpy(void *dest, const void *src, size_t count)
 {
@@ -182,64 +218,104 @@ static void arp_send_request(uint32_t ip)
     e1000_send_packet(frame, sizeof(frame));
 }
 
-static void rx_queue_enqueue(uint8_t protocol, const uint8_t *data, size_t len)
+static int net_validate_udp_checksum(struct ip_header *ip, struct udp_header *udp)
 {
-    mutex_lock(&rx_queue_mutex);
-
-    if (rx_queue_count == RX_QUEUE_SIZE) {
-        rx_queue_head = (rx_queue_head + 1) % RX_QUEUE_SIZE;
-        rx_queue_count--;
+    uint16_t checksum = ntohs(udp->checksum);
+    if (checksum == 0) {
+        return 1;
     }
 
-    struct rx_packet *pkt = &rx_queue[rx_queue_tail];
-    pkt->protocol = protocol;
-    pkt->len = len > RX_PACKET_DATA_SIZE ? RX_PACKET_DATA_SIZE : len;
-    for (size_t i = 0; i < pkt->len; i++) {
-        pkt->data[i] = data[i];
+    uint32_t sum = 0;
+
+    const uint8_t *src_bytes = (const uint8_t *)&ip->src_ip;
+    sum += ((uint16_t)src_bytes[0] << 8) | src_bytes[1];
+    sum += ((uint16_t)src_bytes[2] << 8) | src_bytes[3];
+
+    const uint8_t *dest_bytes = (const uint8_t *)&ip->dest_ip;
+    sum += ((uint16_t)dest_bytes[0] << 8) | dest_bytes[1];
+    sum += ((uint16_t)dest_bytes[2] << 8) | dest_bytes[3];
+
+    sum += (uint16_t)ip->protocol;
+    sum += ntohs(udp->length);
+
+    uint16_t udp_len = ntohs(udp->length);
+    const uint8_t *bytes = (const uint8_t *)udp;
+    size_t length = udp_len;
+
+    while (length > 1) {
+        sum += ((uint16_t)bytes[0] << 8) | bytes[1];
+        bytes += 2;
+        length -= 2;
+    }
+    if (length != 0) {
+        sum += (uint16_t)bytes[0] << 8;
     }
 
-    rx_queue_tail = (rx_queue_tail + 1) % RX_QUEUE_SIZE;
-    rx_queue_count++;
+    while ((sum >> 16) != 0) {
+        sum = (sum & 0xFFFFU) + (sum >> 16);
+    }
 
-    mutex_unlock(&rx_queue_mutex);
-    scheduler_wake_socket_receivers(protocol);
+    return (uint16_t)~sum == 0;
 }
 
-static int rx_queue_dequeue(uint8_t protocol, void *buffer, size_t max_len,
-    size_t *out_len)
+int socket_vfs_read(vfs_node_t *node, uint64_t offset, uint32_t size, uint8_t *buffer)
 {
-    mutex_lock(&rx_queue_mutex);
-
-    for (size_t i = 0; i < rx_queue_count; i++) {
-        size_t idx = (rx_queue_head + i) % RX_QUEUE_SIZE;
-        if (rx_queue[idx].protocol == protocol) {
-            size_t copy_len = rx_queue[idx].len;
-            if (copy_len > max_len) {
-                copy_len = max_len;
-            }
-
-            for (size_t j = 0; j < copy_len; j++) {
-                ((uint8_t *)buffer)[j] = rx_queue[idx].data[j];
-            }
-            *out_len = copy_len;
-
-            size_t target_idx = idx;
-            size_t next_logical = i + 1;
-            while (next_logical < rx_queue_count) {
-                size_t next_idx = (rx_queue_head + next_logical) % RX_QUEUE_SIZE;
-                rx_queue[target_idx] = rx_queue[next_idx];
-                target_idx = next_idx;
-                next_logical++;
-            }
-            rx_queue_tail = (rx_queue_tail + RX_QUEUE_SIZE - 1) % RX_QUEUE_SIZE;
-            rx_queue_count--;
-            mutex_unlock(&rx_queue_mutex);
-            return 1;
-        }
+    (void)offset;
+    if (node == 0 || node->data == 0 || buffer == 0) {
+        return -1;
     }
 
-    mutex_unlock(&rx_queue_mutex);
+    struct socket *sock = (struct socket *)node->data;
+    uint64_t rflags = save_and_disable_interrupts();
+
+    if (sock->rx_count == 0) {
+        restore_interrupts(rflags);
+        return -11;
+    }
+
+    struct socket_packet *pkt = &sock->rx_queue[sock->rx_head];
+    size_t copy_len = pkt->len;
+    if (copy_len > size) {
+        copy_len = size;
+    }
+
+    net_memcpy(buffer, pkt->data, copy_len);
+
+    kfree(pkt->data);
+    pkt->data = 0;
+
+    sock->rx_head = (sock->rx_head + 1) % SOCKET_RX_BUF_SIZE;
+    sock->rx_count--;
+
+    restore_interrupts(rflags);
+
+    return (int)copy_len;
+}
+
+size_t socket_vfs_write(vfs_node_t *node, size_t offset, size_t size, const uint8_t *buffer)
+{
+    (void)node; (void)offset; (void)size; (void)buffer;
     return 0;
+}
+
+void socket_vfs_close(vfs_node_t *node)
+{
+    if (node == 0) return;
+    struct socket *sock = (struct socket *)node->data;
+    if (sock != 0) {
+        uint64_t rflags = save_and_disable_interrupts();
+        sock->active = 0;
+        for (size_t i = 0; i < sock->rx_count; i++) {
+            size_t idx = (sock->rx_head + i) % SOCKET_RX_BUF_SIZE;
+            if (sock->rx_queue[idx].data != 0) {
+                kfree(sock->rx_queue[idx].data);
+                sock->rx_queue[idx].data = 0;
+            }
+        }
+        sock->rx_count = 0;
+        restore_interrupts(rflags);
+    }
+    kfree(node);
 }
 
 void net_handle_arp(uint8_t *frame, size_t frame_length)
@@ -357,8 +433,6 @@ void net_poll_packets(void)
     if (ethertype == ETH_TYPE_ARP) {
         net_handle_arp(frame, (size_t)length);
     } else if (ethertype == ETH_TYPE_IPV4) {
-        net_handle_icmp(frame, (size_t)length);
-
         if ((size_t)length >= sizeof(struct eth_header) + sizeof(struct ip_header)) {
             struct ip_header *ip = (struct ip_header *)(frame + sizeof(struct eth_header));
             size_t ip_header_length = (size_t)(ip->ver_ihl & 0x0FU) * 4U;
@@ -370,9 +444,94 @@ void net_poll_packets(void)
                 (size_t)length >= sizeof(struct eth_header) + total_length &&
                 net_is_local_ipv4(ip->dest_ip)) {
 
+                if (net_checksum(ip, ip_header_length) != 0) {
+                    klog("NET: Checksum IP invalido.\n");
+                    return;
+                }
+
                 uint8_t *payload = (uint8_t *)ip + ip_header_length;
                 size_t payload_len = (size_t)total_length - ip_header_length;
-                rx_queue_enqueue(ip->protocol, payload, payload_len);
+
+                if (ip->protocol == IP_PROTO_ICMP) {
+                    if (payload_len < sizeof(struct icmp_packet)) {
+                        return;
+                    }
+                    struct icmp_packet *icmp = (struct icmp_packet *)payload;
+                    if (net_checksum(icmp, payload_len) != 0) {
+                        klog("NET: Checksum ICMP invalido.\n");
+                        return;
+                    }
+                    
+                    net_handle_icmp(frame, (size_t)length);
+                }
+                else if (ip->protocol == IP_PROTO_UDP) {
+                    if (payload_len < sizeof(struct udp_header)) {
+                        return;
+                    }
+                    struct udp_header *udp = (struct udp_header *)payload;
+                    if (!net_validate_udp_checksum(ip, udp)) {
+                        klog("NET: Checksum UDP invalido.\n");
+                        return;
+                    }
+                }
+
+                uint64_t rflags = save_and_disable_interrupts();
+                int dispatched = 0;
+                for (int i = 0; i < MAX_SOCKETS; i++) {
+                    struct socket *sock = &sockets[i];
+                    if (!sock->active) {
+                        continue;
+                    }
+
+                    int match = 0;
+                    size_t route_len = 0;
+                    uint8_t *route_data = 0;
+
+                    if (sock->type == SOCK_RAW && sock->protocol == ip->protocol) {
+                        match = 1;
+                        route_len = payload_len;
+                        route_data = payload;
+                    }
+                    else if (sock->type == SOCK_DGRAM && ip->protocol == IP_PROTO_UDP) {
+                        struct udp_header *udp = (struct udp_header *)payload;
+                        if (sock->local_port == ntohs(udp->dest_port)) {
+                            match = 1;
+                            route_len = payload_len - sizeof(struct udp_header);
+                            route_data = payload + sizeof(struct udp_header);
+                        }
+                    }
+
+                    if (match) {
+                        dispatched = 1;
+                        if (sock->rx_count >= SOCKET_RX_BUF_SIZE) {
+                            klog("NET: Buffer do socket cheio, descartando pacote.\n");
+                            continue;
+                        }
+
+                        uint8_t *pkt_buf = kmalloc(route_len);
+                        if (pkt_buf == 0) {
+                            klog("NET: Falha de kmalloc ao enfileirar pacote.\n");
+                            continue;
+                        }
+
+                        net_memcpy(pkt_buf, route_data, route_len);
+
+                        size_t tail = sock->rx_tail;
+                        sock->rx_queue[tail].data = pkt_buf;
+                        sock->rx_queue[tail].len = route_len;
+
+                        sock->rx_tail = (tail + 1) % SOCKET_RX_BUF_SIZE;
+                        sock->rx_count++;
+
+                        scheduler_wake_socket_receivers(sock->protocol);
+                    }
+                }
+
+                if (!dispatched) {
+                    klog("NET: Pacote descartado por falta de socket ativo.\n");
+                }
+
+                restore_interrupts(rflags);
             }
         }
     }
@@ -468,28 +627,144 @@ int sys_socket_recv(uint8_t protocol, void *buffer, size_t max_len)
         return -1;
     }
 
-    if (max_len > RX_PACKET_DATA_SIZE) {
-        max_len = RX_PACKET_DATA_SIZE;
+    struct socket *sock = 0;
+    for (int i = 0; i < MAX_SOCKETS; i++) {
+        if (sockets[i].active && sockets[i].protocol == protocol) {
+            sock = &sockets[i];
+            break;
+        }
     }
-    if (max_len == 0 || !user_buffer_accessible(buffer, max_len)) {
+
+    if (sock == 0) {
         return -1;
     }
 
-    size_t match_len = 0;
-
-    // Loop para aguardar pacote com bloqueio/despertar
     for (int attempts = 0; attempts < 10000; attempts++) {
         net_poll_packets();
 
-        if (rx_queue_dequeue(protocol, buffer, max_len, &match_len)) {
+        uint64_t rflags = save_and_disable_interrupts();
+        if (sock->rx_count > 0) {
+            struct socket_packet *pkt = &sock->rx_queue[sock->rx_head];
+            size_t copy_len = pkt->len;
+            if (copy_len > max_len) {
+                copy_len = max_len;
+            }
+            net_memcpy(buffer, pkt->data, copy_len);
+            kfree(pkt->data);
+            pkt->data = 0;
+            sock->rx_head = (sock->rx_head + 1) % SOCKET_RX_BUF_SIZE;
+            sock->rx_count--;
+            restore_interrupts(rflags);
             klog("NET: Syscall socket_recv recebeu pacote.\n");
-            return (int)match_len;
+            return (int)copy_len;
         }
+        restore_interrupts(rflags);
 
-        // Bloqueia tarefa aguardando pacote e cede controle
         scheduler_sleep_current(TASK_WAIT_SOCKET_RECV, (uint64_t)protocol);
         scheduler_yield();
     }
 
+    return 0;
+}
+
+int sys_socket(int domain, int type, int protocol)
+{
+    if (domain != AF_INET) {
+        return -1;
+    }
+    if (type != SOCK_RAW && type != SOCK_DGRAM) {
+        return -1;
+    }
+
+    uint64_t rflags = save_and_disable_interrupts();
+    int slot = -1;
+    for (int i = 0; i < MAX_SOCKETS; i++) {
+        if (!sockets[i].active) {
+            slot = i;
+            break;
+        }
+    }
+
+    if (slot < 0) {
+        restore_interrupts(rflags);
+        return -1;
+    }
+
+    struct socket *sock = &sockets[slot];
+    sock->domain = domain;
+    sock->type = type;
+    sock->protocol = protocol;
+    sock->local_port = 0;
+    sock->local_addr = 0;
+    sock->rx_head = 0;
+    sock->rx_tail = 0;
+    sock->rx_count = 0;
+    for (int j = 0; j < SOCKET_RX_BUF_SIZE; j++) {
+        sock->rx_queue[j].data = 0;
+        sock->rx_queue[j].len = 0;
+    }
+    sock->active = 1;
+
+    restore_interrupts(rflags);
+
+    vfs_node_t *node = kmalloc(sizeof(vfs_node_t));
+    if (node == 0) {
+        uint64_t rflags2 = save_and_disable_interrupts();
+        sock->active = 0;
+        restore_interrupts(rflags2);
+        return -1;
+    }
+
+    for (int j = 0; j < VFS_NAME_MAX; j++) {
+        node->name[j] = 0;
+    }
+    node->name[0] = 's';
+    node->type = VFS_NODE_DEVICE;
+    node->data = sock;
+    node->read = socket_vfs_read;
+    node->write = socket_vfs_write;
+    node->close = socket_vfs_close;
+
+    task_t *task = scheduler_current_task();
+    int fd = task_alloc_fd(task, node);
+    if (fd < 0) {
+        kfree(node);
+        uint64_t rflags2 = save_and_disable_interrupts();
+        sock->active = 0;
+        restore_interrupts(rflags2);
+        return -1;
+    }
+
+    sock->fd = fd;
+    return fd;
+}
+
+int sys_bind(int fd, const struct sockaddr *addr, uint32_t addrlen)
+{
+    task_t *task = scheduler_current_task();
+    if (task == 0 || fd < 0 || fd >= TASK_MAX_FDS) {
+        return -1;
+    }
+    vfs_node_t *node = task->file_descriptors[fd];
+    if (node == 0 || node->read != socket_vfs_read) {
+        return -1;
+    }
+    if (addr == 0 || addrlen < sizeof(struct sockaddr_in)) {
+        return -1;
+    }
+    if (!vmm_is_mapped((uint64_t *)task->cr3, (uintptr_t)addr)) {
+        return -1;
+    }
+
+    struct sockaddr_in addr_in;
+    net_memcpy(&addr_in, addr, sizeof(struct sockaddr_in));
+
+    struct socket *sock = (struct socket *)node->data;
+    if (sock == 0 || !sock->active) {
+        return -1;
+    }
+
+    sock->local_port = ntohs(addr_in.sin_port);
+    sock->local_addr = addr_in.sin_addr.s_addr;
     return 0;
 }

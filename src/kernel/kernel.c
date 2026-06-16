@@ -58,6 +58,8 @@
 #define SYS_READDIR 21ULL
 #define SYS_EXECVE 22ULL
 #define SYS_FORK   23ULL
+#define SYS_SOCKET 24ULL
+#define SYS_BIND   25ULL
 
 #define PIC1_COMMAND 0x20
 #define PIC1_DATA 0x21
@@ -112,11 +114,13 @@ extern void keyboard_irq_stub(void);
 extern void timer_irq_stub(void);
 extern void tss_install(struct tss64 *tss);
 extern void syscall_entry(void);
+extern void double_fault_stub(void);
 
 static size_t cursor_row;
 static size_t cursor_col;
 static struct idt_entry idt[IDT_ENTRIES];
 static struct tss64 kernel_tss;
+static uint8_t double_fault_stack[4096] __attribute__((aligned(4096)));
 uint64_t syscall_kernel_rsp0;
 static vfs_node_t console_stdin;
 static vfs_node_t console_stdout;
@@ -394,6 +398,7 @@ void tss_set_rsp0(uint64_t rsp0)
 static void tss_init(void)
 {
     memory_set(&kernel_tss, 0, sizeof(kernel_tss));
+    kernel_tss.ist1 = (uint64_t)&double_fault_stack[4096];
     kernel_tss.iomap_base = sizeof(kernel_tss);
     tss_install(&kernel_tss);
 }
@@ -596,7 +601,7 @@ static int sys_open(const char *path, int flags)
     return -1;
 }
 
-static int task_alloc_fd(task_t *task, vfs_node_t *node)
+int task_alloc_fd(task_t *task, vfs_node_t *node)
 {
     if (task == 0 || node == 0) {
         return -1;
@@ -1103,8 +1108,13 @@ static int sys_close(int fd)
         return -1;
     }
 
+    vfs_node_t *node = task->file_descriptors[fd];
     task->file_descriptors[fd] = 0;
     task->fd_offsets[fd] = 0;
+
+    if (node->close != 0) {
+        node->close(node);
+    }
     return 0;
 }
 
@@ -1327,6 +1337,12 @@ uint64_t syscall_handler(uint64_t number, uint64_t arg1, uint64_t arg2,
     else if (number == SYS_FORK) {
         ret = (uint64_t)sys_fork(arg6);
     }
+    else if (number == SYS_SOCKET) {
+        ret = (uint64_t)sys_socket((int)arg1, (int)arg2, (int)arg3);
+    }
+    else if (number == SYS_BIND) {
+        ret = (uint64_t)sys_bind((int)arg1, (const struct sockaddr *)arg2, (uint32_t)arg3);
+    }
 
     scheduler_handle_syscall_signals(arg6, ret);
 
@@ -1401,11 +1417,91 @@ static void idt_load(void)
     __asm__ volatile ("lidt %0" : : "m"(idtr));
 }
 
+static void vga_put_hex(uint64_t value)
+{
+    char hex_digits[] = "0123456789ABCDEF";
+    char buffer[16];
+
+    for (int i = 15; i >= 0; i--) {
+        buffer[i] = hex_digits[value & 0xF];
+        value >>= 4;
+    }
+
+    vga_puts("0x");
+    for (int i = 0; i < 16; i++) {
+        vga_put_char(buffer[i]);
+    }
+}
+
+static void klog_hex(uint64_t value)
+{
+    char hex_digits[] = "0123456789ABCDEF";
+    char buffer[16];
+
+    for (int i = 15; i >= 0; i--) {
+        buffer[i] = hex_digits[value & 0xF];
+        value >>= 4;
+    }
+
+    klog("0x");
+    for (int i = 0; i < 16; i++) {
+        serial_putc(buffer[i]);
+    }
+}
+
+void double_fault_handler(uint64_t rip, uint64_t cs, uint64_t rflags, uint64_t rsp, uint64_t ss, uint64_t error_code)
+{
+    __asm__ volatile ("cli");
+
+    uint64_t cr0, cr2, cr3, cr4;
+    __asm__ volatile ("mov %%cr0, %0" : "=r"(cr0));
+    __asm__ volatile ("mov %%cr2, %0" : "=r"(cr2));
+    __asm__ volatile ("mov %%cr3, %0" : "=r"(cr3));
+    __asm__ volatile ("mov %%cr4, %0" : "=r"(cr4));
+
+    vga_clear();
+    vga_puts("================ KERNEL PANIC: DOUBLE FAULT (INT 0x08) ================\n");
+    vga_puts("A pilha de kernel estourou ou ocorreu uma falha grave em Ring 0.\n");
+    vga_puts("Estado da CPU no momento da falha:\n");
+    vga_puts("  RIP: "); vga_put_hex(rip); vga_puts("\n");
+    vga_puts("  CS:  "); vga_put_hex(cs);  vga_puts("\n");
+    vga_puts("  RSP: "); vga_put_hex(rsp); vga_puts("\n");
+    vga_puts("  SS:  "); vga_put_hex(ss);  vga_puts("\n");
+    vga_puts("  RFLAGS: "); vga_put_hex(rflags); vga_puts("\n");
+    vga_puts("  Error Code: "); vga_put_hex(error_code); vga_puts("\n");
+    vga_puts("\nRegistradores de controle:\n");
+    vga_puts("  CR0: "); vga_put_hex(cr0); vga_puts("\n");
+    vga_puts("  CR2: "); vga_put_hex(cr2); vga_puts("\n");
+    vga_puts("  CR3: "); vga_put_hex(cr3); vga_puts("\n");
+    vga_puts("  CR4: "); vga_put_hex(cr4); vga_puts("\n");
+    vga_puts("========================================================================\n");
+
+    klog("\n*** KERNEL PANIC: DOUBLE FAULT (INT 0x08) ***\n");
+    klog("Falha grave ou estouro de pilha de kernel detectado.\n");
+    klog("  RIP: "); klog_hex(rip); klog("\n");
+    klog("  CS:  "); klog_hex(cs);  klog("\n");
+    klog("  RSP: "); klog_hex(rsp); klog("\n");
+    klog("  SS:  "); klog_hex(ss);  klog("\n");
+    klog("  RFLAGS: "); klog_hex(rflags); klog("\n");
+    klog("  Error Code: "); klog_hex(error_code); klog("\n");
+    klog("  CR0: "); klog_hex(cr0); klog("\n");
+    klog("  CR2: "); klog_hex(cr2); klog("\n");
+    klog("  CR3: "); klog_hex(cr3); klog("\n");
+    klog("  CR4: "); klog_hex(cr4); klog("\n");
+    klog("O sistema foi interrompido.\n");
+
+    for (;;) {
+        __asm__ volatile ("hlt");
+    }
+}
+
 static void idt_init(void)
 {
     memory_set(idt, 0, sizeof(idt));
     idt_set_gate(IRQ_TIMER_VECTOR, timer_irq_stub);
     idt_set_gate(IRQ_KEYBOARD_VECTOR, keyboard_irq_stub);
+    idt_set_gate(8, double_fault_stub);
+    idt[8].ist = 1;
     idt_load();
 }
 

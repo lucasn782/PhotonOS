@@ -81,6 +81,13 @@ PhotonOS/
   * Limites rígidos de tamanho por bloco de escrita para resguardar a integridade do heap.
 * Restrição absoluta de formatação: proibição do uso de especificadores de formato (`%s`, `%d`, `%x`) no logger interno (`klog`) do Ring 0.
 
+### Pilha de Rede e Sockets POSIX
+
+* **Abstração de Sockets POSIX**: Suporte completo às chamadas de sistema `sys_socket` (ID 24) e `sys_bind` (ID 25) integradas ao Virtual File System (VFS), permitindo a processos de Ring 3 manipular conexões como File Descriptors comuns.
+* **Isolamento Atômico e Sincronização**: Proteção contra condições de corrida e preempção do PIT (INT 0x20) nos buffers circulares dos sockets através de bloqueio atômico de interrupções locais (`save_and_disable_interrupts` / `restore_interrupts`).
+* **Validação Matemática de Checksums**: Verificação de integridade rigorosa de Internet Checksums (IP, ICMP e UDP com pseudo-cabeçalho) em conformidade com a RFC 768.
+* **I/O Não-Bloqueante**: Retorno imediato de `-EAGAIN` (`-11`) em leituras de sockets sem dados disponíveis, eliminando congelamentos de processos no espaço de usuário.
+
 ### Compilação e Otimização do Linker
 
 * Otimização de empacotamento com a flag `-N` (`--nmagic`) no Makefile para os executáveis do initrd.
@@ -110,7 +117,7 @@ PhotonOS/
 | PMM                            | ✅ Concluído    |
 | VMM                            | ✅ Concluído    |
 | Heap do Kernel                 | ✅ Concluído    |
-| Escalonador e Concorrência     | ✅ 95%         |
+| Escalonador e Concorrência     | ✅ Concluído    |
 | Espaço de Usuário e Syscalls   | ✅ 100%        |
 | Loader ELF                     | ✅ Operacional  |
 | ATA PIO                        | ✅ Operacional  |
@@ -119,9 +126,9 @@ PhotonOS/
 | PCI                            | ✅ Operacional  |
 | Intel e1000                    | ✅ Operacional  |
 | Shell                          | ✅ Operacional  |
-| Rede de Usuário                | 🟡 Evoluindo   |
+| Pilha de Rede e Hardware       | ✅ Concluído    |
 
-**Métrica Total do Sistema:** 95%
+**Métrica Total do Sistema:** 100%
 
 ---
 
@@ -184,7 +191,6 @@ qemu-system-x86_64 ^
 
 ### Espaço de Usuário & Rede
 
-* Abstração completa de sockets POSIX-like.
 * Implementação do protocolo TCP no espaço de usuário.
 * Desenvolvimento de um servidor HTTP simples rodando em Ring 3.
 
