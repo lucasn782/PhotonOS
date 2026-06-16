@@ -57,6 +57,7 @@
 #define SYS_GET_TICKS 20ULL
 #define SYS_READDIR 21ULL
 #define SYS_EXECVE 22ULL
+#define SYS_FORK   23ULL
 
 #define PIC1_COMMAND 0x20
 #define PIC1_DATA 0x21
@@ -1230,6 +1231,20 @@ static int sys_readdir(int fd, vfs_dir_entry_t *buf, uint32_t count)
     return (int)read_count;
 }
 
+/*
+ * sys_fork - Duplica o processo chamador via fork semantico.
+ *
+ * Nao recebe argumentos de usuario; captura o frame de syscall atual
+ * (arg6 = endereço do syscall_frame no kernel stack do pai) para
+ * duplicar o estado exato dos registradores da CPU.
+ *
+ * Retorna o PID do filho para o pai. O filho recebera 0 via iretq.
+ */
+static int sys_fork(uint64_t frame_addr)
+{
+    return scheduler_fork_current(frame_addr);
+}
+
 uint64_t syscall_handler(uint64_t number, uint64_t arg1, uint64_t arg2,
     uint64_t arg3, uint64_t arg4, uint64_t arg5, uint64_t arg6)
 {
@@ -1308,6 +1323,9 @@ uint64_t syscall_handler(uint64_t number, uint64_t arg1, uint64_t arg2,
     else if (number == SYS_EXECVE) {
         ret = (uint64_t)sys_execve((const char *)arg1, (const char *const *)arg2,
             (const char *const *)arg3);
+    }
+    else if (number == SYS_FORK) {
+        ret = (uint64_t)sys_fork(arg6);
     }
 
     scheduler_handle_syscall_signals(arg6, ret);

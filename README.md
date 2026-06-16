@@ -57,9 +57,10 @@ PhotonOS/
 
 * Isolamento entre Ring 0 e Ring 3.
 * Troca de privilégio utilizando TSS.
-* Syscalls implementadas através de `syscall/sysret`.
+* Syscalls implementadas através de `syscall/sysret` com a macro `SYS_EXIT` mapeada corretamente no ID 5.
 * Carregamento de executáveis ELF de 64 bits.
 * Execução de aplicações independentes em espaço de usuário.
+* **Gerenciamento Dinâmico de Processos**: Suporte nativo a `sys_fork` (Syscall 23) e estabelecimento da trindade POSIX de processos (Fork, Exec, Exit).
 
 ### Sistema de Arquivos
 
@@ -100,26 +101,27 @@ PhotonOS/
 
 ---
 
-## 📊 Estado Atual do Desenvolvimento
+## 📊 Status de Desenvolvimento do Núcleo
 
-| Subsistema       | Status         |
-| ---------------- | -------------- |
-| Bootloader       | ✅ Estável      |
-| Long Mode x86_64 | ✅ Estável      |
-| PMM              | ✅ Concluído    |
-| VMM              | ✅ Concluído    |
-| Heap do Kernel   | ✅ Concluído    |
-| Scheduler        | ✅ Estável      |
-| Ring 3           | ✅ Operacional  |
-| Syscalls         | ✅ Operacional  |
-| Loader ELF       | ✅ Operacional  |
-| ATA PIO          | ✅ Operacional  |
-| FAT16            | ✅ Estável      |
-| VFS              | ✅ Estável      |
-| PCI              | ✅ Operacional  |
-| Intel e1000      | ✅ Operacional  |
-| Shell            | ✅ Operacional  |
-| Rede de Usuário  | 🟡 Evoluindo   |
+| Subsistema                     | Status         |
+| ------------------------------ | -------------- |
+| Bootloader                     | ✅ Estável      |
+| Long Mode x86_64               | ✅ Estável      |
+| PMM                            | ✅ Concluído    |
+| VMM                            | ✅ Concluído    |
+| Heap do Kernel                 | ✅ Concluído    |
+| Escalonador e Concorrência     | ✅ 95%         |
+| Espaço de Usuário e Syscalls   | ✅ 100%        |
+| Loader ELF                     | ✅ Operacional  |
+| ATA PIO                        | ✅ Operacional  |
+| FAT16                          | ✅ Estável      |
+| VFS                            | ✅ Estável      |
+| PCI                            | ✅ Operacional  |
+| Intel e1000                    | ✅ Operacional  |
+| Shell                          | ✅ Operacional  |
+| Rede de Usuário                | 🟡 Evoluindo   |
+
+**Métrica Total do Sistema:** 95%
 
 ---
 

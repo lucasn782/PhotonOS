@@ -28,6 +28,7 @@ void scheduler_wake_socket_receivers(uint8_t protocol);
 int scheduler_wait_current(uint32_t pid);
 void scheduler_terminate_task(task_t *task, int status);
 void scheduler_exit_current(int status);
+int scheduler_fork_current(uint64_t syscall_frame_addr);
 void scheduler_handle_syscall_signals(uint64_t syscall_frame_addr, uint64_t syscall_ret);
 uint64_t scheduler_tick(uint64_t current_rsp);
 

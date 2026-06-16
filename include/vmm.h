@@ -32,6 +32,7 @@ void vmm_map_in_space(uint64_t *pml4, uintptr_t virtual_addr,
     uintptr_t physical_addr, uint32_t flags);
 int vmm_is_mapped(uint64_t *pml4, uintptr_t virtual_addr);
 void vmm_switch_address_space(uint64_t *pml4);
+uint64_t *vmm_clone_address_space(uint64_t *parent_pml4);
 
 static inline void vmm_flush_tlb(uintptr_t addr)
 {

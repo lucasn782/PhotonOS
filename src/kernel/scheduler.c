@@ -4,6 +4,7 @@
 
 #include "memory.h"
 #include "mutex.h"
+#include "serial.h"
 #include "vfs.h"
 #include "vmm.h"
 #include "heap.h"
@@ -816,6 +817,127 @@ struct syscall_frame {
     uint64_t rcx; // rip
     uint64_t user_rsp;
 };
+
+/*
+ * scheduler_fork_current - Duplica o processo pai em execucao.
+ *
+ * syscall_frame_addr: endereco do struct syscall_frame salvo pelo stub ASM
+ *   no topo da kernel stack do pai durante a syscall.
+ *
+ * Retorna o PID do filho ao pai (o filho retornara 0 via iretq).
+ * Retorna -1 em caso de falha.
+ *
+ * Estrategia de retorno do filho:
+ *   O filho e inserido na tabela com um interrupt_task_frame pre-montado no
+ *   topo da sua nova kernel stack. Quando o scheduler_tick o selecionar, o
+ *   timer_irq_stub fara pop de todos os registradores + iretq, acordando o
+ *   filho em Ring 3 com RAX = 0.
+ */
+int scheduler_fork_current(uint64_t syscall_frame_addr)
+{
+    task_t *parent = current_task;
+    if (parent == 0) {
+        return -1;
+    }
+
+    /* Captura o frame de syscall do pai para copiar o contexto de CPU. */
+    struct syscall_frame *sframe = (struct syscall_frame *)syscall_frame_addr;
+    if (sframe == 0) {
+        return -1;
+    }
+
+    /* 1. Clona o espaco de endereçamento (deep-copy paginas de usuario). */
+    uint64_t *child_pml4 = vmm_clone_address_space((uint64_t *)parent->cr3);
+    if (child_pml4 == NULL) {
+        klog("fork: falha ao clonar PML4\n");
+        return -1;
+    }
+
+    /* 2. Aloca nova kernel stack para o filho. */
+    uint8_t *child_kstack = kmalloc(TASK_STACK_SIZE);
+    if (child_kstack == 0) {
+        klog("fork: falha ao alocar kernel stack do filho\n");
+        vmm_destroy_address_space(child_pml4);
+        return -1;
+    }
+
+    mutex_lock(&task_table_mutex);
+
+    /* 3. Obtem slot na tabela de tarefas. */
+    int slot = allocate_task_slot();
+    if (slot < 0) {
+        mutex_unlock(&task_table_mutex);
+        klog("fork: tabela de tarefas cheia\n");
+        kfree(child_kstack);
+        vmm_destroy_address_space(child_pml4);
+        return -1;
+    }
+
+    /* 4. Copia todo o TCB do pai para o filho. */
+    task_t *child = &tasks[slot];
+    *child = *parent;
+
+    /* 5. Ajusta campos exclusivos do filho. */
+    child->pid          = (uint32_t)slot + 1;
+    child->parent_pid   = parent->pid;
+    child->cr3          = (uint64_t)child_pml4;
+    child->state        = TASK_READY;
+    child->wait_reason  = TASK_WAIT_NONE;
+    child->wait_target  = 0;
+    child->exit_status  = 0;
+    child->active_signal = 0;
+    child->pending_signals = 0;
+    child->mutex_wait_next = 0;
+    /* Filho nao herda paginas fisicas rastreadas (gerenciadas pela PML4 clonada). */
+    child->user_page_count = 0;
+
+    /*
+     * 6. Constroi um interrupt_task_frame no topo da nova kernel stack do filho.
+     *
+     * O timer_irq_stub empilha os registradores nesta ordem (pop reverso):
+     *   r15, r14, r13, r12, r11, r10, r9, r8, rbp, rdi, rsi, rdx, rcx, rbx, rax
+     *   + frame de interrupcao da CPU: rip, cs, rflags, user_rsp, ss
+     *
+     * O filho acorda via iretq com RAX = 0 (retorno fork para filho).
+     * RIP = rcx do syscall_frame (endereco de retorno do syscall no userspace).
+     * RFLAGS = r11 do syscall_frame (flags salvas pelo syscall).
+     */
+    uintptr_t stack_top_addr = ((uintptr_t)child_kstack + TASK_STACK_SIZE) & ~0xFULL;
+    struct interrupt_task_frame *child_frame =
+        (struct interrupt_task_frame *)(stack_top_addr - sizeof(struct interrupt_task_frame));
+
+    child_frame->ss       = USER_DATA_SELECTOR;
+    child_frame->user_rsp = sframe->user_rsp;
+    child_frame->rflags   = sframe->r11;   /* r11 salva RFLAGS no syscall path */
+    child_frame->cs       = USER_CODE_SELECTOR;
+    child_frame->rip      = sframe->rcx;   /* rcx salva RIP de retorno no syscall path */
+    child_frame->rax      = 0;             /* Regra de Ouro do Fork: filho retorna 0 */
+    child_frame->rbx      = sframe->rbx;
+    child_frame->rcx      = sframe->rcx;
+    child_frame->rdx      = sframe->rdx;
+    child_frame->rsi      = sframe->rsi;
+    child_frame->rdi      = sframe->rdi;
+    child_frame->rbp      = sframe->rbp;
+    child_frame->r8       = sframe->r8;
+    child_frame->r9       = sframe->r9;
+    child_frame->r10      = sframe->r10;
+    child_frame->r11      = sframe->r11;
+    child_frame->r12      = sframe->r12;
+    child_frame->r13      = sframe->r13;
+    child_frame->r14      = sframe->r14;
+    child_frame->r15      = sframe->r15;
+
+    /* 7. Configura RSP e kernel_stack_top do filho. */
+    child->rsp              = (uint64_t)child_frame;
+    child->kernel_stack_top = stack_top_addr;
+
+    int child_pid = (int)child->pid;
+
+    mutex_unlock(&task_table_mutex);
+
+    klog("fork: filho inserido no escalonador\n");
+    return child_pid;
+}
 
 void scheduler_handle_syscall_signals(uint64_t syscall_frame_addr, uint64_t syscall_ret)
 {

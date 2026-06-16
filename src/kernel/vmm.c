@@ -324,3 +324,108 @@ void vmm_switch_address_space(uint64_t *pml4)
 
     __asm__ volatile ("mov %0, %%cr3" : : "r"((uint64_t)pml4) : "memory");
 }
+
+/*
+ * vmm_clone_address_space - Clona o espaco de endereçamento do processo pai
+ * para um novo PML4 de filho.
+ *
+ * Higher-half (entradas 256-511): copiadas por referencia (Kernel compartilhado).
+ * Entrada 0 (identity map de boot): copiada por referencia.
+ * Lower-half de usuario (entradas 1-255 com bit USER): deep-copy por pagina.
+ *   - Aloca novo frame fisico via pmm_alloc().
+ *   - Copia 4096 bytes do frame do pai para o frame do filho.
+ *   - Mapeia o novo frame na PML4 do filho com as mesmas flags.
+ *
+ * Retorna ponteiro para a nova PML4 ou NULL em caso de falha.
+ */
+uint64_t *vmm_clone_address_space(uint64_t *parent_pml4)
+{
+    if (!valid_table_pointer(parent_pml4)) {
+        return NULL;
+    }
+
+    uint64_t *child_pml4 = pmm_alloc();
+    if (child_pml4 == NULL) {
+        return NULL;
+    }
+    clear_page(child_pml4);
+
+    /* Entrada 0: identity-map de boot (MMIO, early structures). */
+    child_pml4[0] = parent_pml4[0];
+
+    /* Higher-half (256-511): mapeamentos do Kernel - compartilhamento direto. */
+    for (int i = 256; i < 512; i++) {
+        child_pml4[i] = parent_pml4[i];
+    }
+
+    /* Lower-half de usuario (1-255): deep-copy por pagina. */
+    for (uintptr_t pml4_i = 1; pml4_i < 256; pml4_i++) {
+        if ((parent_pml4[pml4_i] & VMM_PAGE_PRESENT) == 0 ||
+            (parent_pml4[pml4_i] & VMM_USER) == 0 ||
+            !valid_table_entry(parent_pml4[pml4_i])) {
+            continue;
+        }
+
+        uint64_t *parent_pdpt = entry_table(parent_pml4[pml4_i]);
+        if (!valid_table_pointer(parent_pdpt)) {
+            continue;
+        }
+
+        for (uintptr_t pdpt_i = 0; pdpt_i < VMM_TABLE_ENTRIES; pdpt_i++) {
+            if ((parent_pdpt[pdpt_i] & VMM_PAGE_PRESENT) == 0 ||
+                (parent_pdpt[pdpt_i] & VMM_USER) == 0 ||
+                !valid_table_entry(parent_pdpt[pdpt_i])) {
+                continue;
+            }
+
+            uint64_t *parent_pd = entry_table(parent_pdpt[pdpt_i]);
+            if (!valid_table_pointer(parent_pd)) {
+                continue;
+            }
+
+            for (uintptr_t pd_i = 0; pd_i < VMM_TABLE_ENTRIES; pd_i++) {
+                if ((parent_pd[pd_i] & VMM_PAGE_PRESENT) == 0 ||
+                    (parent_pd[pd_i] & VMM_USER) == 0 ||
+                    !valid_table_entry(parent_pd[pd_i])) {
+                    continue;
+                }
+
+                uint64_t *parent_pt = entry_table(parent_pd[pd_i]);
+                if (!valid_table_pointer(parent_pt)) {
+                    continue;
+                }
+
+                for (uintptr_t pt_i = 0; pt_i < VMM_TABLE_ENTRIES; pt_i++) {
+                    if ((parent_pt[pt_i] & VMM_PAGE_PRESENT) == 0) {
+                        continue;
+                    }
+
+                    /* Calcula o endereco virtual desta pagina. */
+                    uintptr_t virt = (pml4_i << 39) | (pdpt_i << 30) |
+                                     (pd_i   << 21) | (pt_i   << 12);
+
+                    /* Aloca novo frame fisico para o filho. */
+                    void *child_frame = pmm_alloc();
+                    if (child_frame == NULL) {
+                        /* Falha de memoria: retorna NULL sem destruir parcialmente. */
+                        return NULL;
+                    }
+
+                    /* Copia profunda: 4096 bytes do frame do pai -> frame do filho. */
+                    uint64_t parent_phys = parent_pt[pt_i] & VMM_ENTRY_ADDR_MASK;
+                    uint8_t *src = (uint8_t *)parent_phys;
+                    uint8_t *dst = (uint8_t *)child_frame;
+                    for (uint64_t b = 0; b < VMM_PAGE_SIZE; b++) {
+                        dst[b] = src[b];
+                    }
+
+                    /* Preserva as mesmas flags de permissao do pai. */
+                    uint32_t flags = (uint32_t)(parent_pt[pt_i] & VMM_ENTRY_FLAGS_MASK);
+                    map_in_pml4(child_pml4, virt, (uintptr_t)child_frame, flags);
+                }
+            }
+        }
+    }
+
+    return child_pml4;
+}

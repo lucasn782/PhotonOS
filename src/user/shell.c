@@ -7,6 +7,7 @@
 #define SYS_OPEN 2
 #define SYS_READ 3
 #define SYS_SPAWN 4
+#define SYS_EXIT  5
 #define SYS_CREATE 6
 #define SYS_WAIT 7
 #define SYS_PIPE 8
@@ -19,6 +20,7 @@
 #define SYS_CLOSE 15
 #define SYS_LIST 16
 #define SYS_EXECVE 22
+#define SYS_FORK   23
 #define SIGINT 2
 
 #define FD_STDIN_SAVE 29
@@ -29,6 +31,17 @@ void free(void *ptr);
 
 static unsigned int next_background_job = 1;
 static volatile int shell_interrupted;
+
+static long syscall0(long number)
+{
+    long ret;
+    __asm__ volatile (
+        "syscall"
+        : "=a"(ret)
+        : "a"(number)
+        : "rcx", "r11", "memory");
+    return ret;
+}
 
 static long syscall1(long number, long arg1)
 {
@@ -509,6 +522,41 @@ static void wait_pid(long pid)
     } while (state > 0);
 }
 
+/*
+ * fork - Invoca sys_fork (SYS_FORK = 23) sem argumentos.
+ * Retorna o PID do filho para o pai, 0 para o filho, -1 em caso de falha.
+ */
+static long fork(void)
+{
+    return syscall0(SYS_FORK);
+}
+
+/*
+ * command_forktest - Demonstra a semantica de fork:
+ *   Pai recebe o PID do filho; filho recebe 0.
+ *   O filho imprime sua mensagem e termina via sys_exit.
+ *   O pai aguarda o filho encerrar antes de retornar ao shell.
+ */
+static void command_forktest(void)
+{
+    long pid = fork();
+
+    if (pid == 0) {
+        /* Codigo do filho */
+        write_str("[filho] fork() retornou 0 - sou o filho!\n");
+        syscall1(SYS_EXIT, 0);
+        /* Nunca alcancado. */
+        for (;;) {}
+    } else if (pid > 0) {
+        /* Codigo do pai */
+        write_str("[pai] fork() retornou pid do filho\n");
+        wait_pid(pid);
+        write_str("[pai] filho encerrado - fork OK\n");
+    } else {
+        write_str("forktest: fork() falhou\n");
+    }
+}
+
 static long spawn_program(const char *path)
 {
     long pid = syscall1(SYS_SPAWN, (long)path);
@@ -660,7 +708,7 @@ static void execute_simple(char *line, int is_background)
     }
 
     if (streq(line, "help")) {
-        write_str("help ls ps cat <arq> touch <arq> write <arq> <txt> echo <txt> > <arq> hello upper rev hang spin ping <ip>\n");
+        write_str("help ls ps cat <arq> touch <arq> write <arq> <txt> echo <txt> > <arq> hello upper rev hang spin ping <ip> forktest\n");
     } else if (streq(line, "ls")) {
         command_ls();
     } else if (streq(line, "ps") || streq(line, "jobs")) {
@@ -687,6 +735,8 @@ static void execute_simple(char *line, int is_background)
         command_write(line + 6);
     } else if (starts_with(line, "echo ")) {
         command_echo_redirect(line);
+    } else if (streq(line, "forktest")) {
+        command_forktest();
     } else if (line[0] == '/') {
         /* Caminho absoluto: tenta executar como binario ELF via sys_execve. */
         command_execve(line, is_background);
