@@ -4,7 +4,7 @@
 #include "mutex.h"
 
 static vfs_node_t *root_node;
-static mutex_t vfs_mutex;
+mutex_t vfs_mutex;
 
 static void memory_zero(void *ptr, size_t size)
 {

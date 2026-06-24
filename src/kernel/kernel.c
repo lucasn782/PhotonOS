@@ -16,6 +16,8 @@
 #include "vmm.h"
 #include "video.h"
 #include "mouse.h"
+#include "apic.h"
+#include "smp.h"
 
 #define VGA_WIDTH 80
 #define VGA_HEIGHT 25
@@ -62,6 +64,7 @@
 #define SYS_FORK   23ULL
 #define SYS_SOCKET 24ULL
 #define SYS_BIND   25ULL
+#define SYS_CONNECT 26ULL
 
 #define PIC1_COMMAND 0x20
 #define PIC1_DATA 0x21
@@ -1397,6 +1400,9 @@ uint64_t syscall_handler(uint64_t number, uint64_t arg1, uint64_t arg2,
     else if (number == SYS_BIND) {
         ret = (uint64_t)sys_bind((int)arg1, (const struct sockaddr *)arg2, (uint32_t)arg3);
     }
+    else if (number == SYS_CONNECT) {
+        ret = (uint64_t)sys_connect((int)arg1, (const struct sockaddr *)arg2, (uint32_t)arg3);
+    }
 
     scheduler_handle_syscall_signals(arg6, ret);
     return ret;
@@ -1776,8 +1782,20 @@ void kmain(void)
     }
     
     int network_ready = pci_init() == 0;
+    if (network_ready) {
+        net_init();
+    }
     console_nodes_init();
     klog("VFS: initrd e armazenamento persistente inicializados.\n");
+
+    apic_init();
+    klog("APIC: PIC legado desativado. Local APIC mapeado e ativo.\n");
+
+    smp_init();
+    klog("SMP: trampolim instalado. Inicializando APs...\n");
+    smp_boot_ap(1);
+    smp_boot_ap(2);
+    smp_boot_ap(3);
     
     tss_init();
     syscall_init();

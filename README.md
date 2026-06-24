@@ -1,6 +1,6 @@
-# PhotonOS v2.0 🌌
+# PhotonOS v3.0 🌌
 
-O **PhotonOS v2.0** é um sistema operacional monolítico freestanding desenvolvido do zero para a arquitetura **x86_64**, executando em **64-bit Long Mode**. O projeto concluiu com sucesso o seu ciclo de estabilização do Ring 0 e ativação de hardware, fornecendo um kernel robusto com suporte a execução em Ring 3, pipeline gráfico por software, barramento PCI, interface de rede e1000 estável, e uma interface Shell própria executando em espaço de usuário.
+O **PhotonOS v3.0** é um sistema operacional monolítico freestanding desenvolvido do zero para a arquitetura **x86_64**, executando em **64-bit Long Mode**. O projeto homologou com sucesso o seu ciclo de suporte nativo a **Multiprocessamento Simétrico (SMP)** na Trilha 8, consolidando um núcleo multi-core resiliente integrado com execução em Ring 3, pipeline gráfico por software, barramento PCI, interface de rede e1000 estável e console interativo no espaço de usuário.
 
 ---
 
@@ -26,6 +26,15 @@ PhotonOS/
 ---
 
 ## 🚀 Funcionalidades Consolidadas
+
+### ⚡ Multiprocessamento Simétrico (SMP) - V3.0 [NOVO]
+> [!IMPORTANT]
+> **Arquitetura Multi-Core Nativa:** O PhotonOS v3.0 oferece suporte a multiprocessamento simétrico na arquitetura x86_64. O Bootstrap Processor (BSP) gerencia a descoberta e a inicialização física individual dos Application Processors (APs), possibilitando a execução paralela em Ring 0.
+* **Ecossistema APIC Nativo:** Desativação completa do controlador PIC 8259 legado (mascarando todas as linhas de interrupção nas portas de I/O `0x21` e `0xA1`) e ativação do Local APIC (LAPIC) para permitir o envio de interrupções interprocessador (IPIs) e suporte futuro ao I/O APIC.
+* **Código Trampolim Alocado em `0x7000`:** Copiado dinamicamente como um blob binário de 16 bits para o endereço físico `0x7000` (garantido pelo mapeamento de identidade), servindo como ponto de entrada em Modo Real e guiando os APs na transição segura para o Modo Longo de 64 bits.
+* **Sequenciamento INIT-SIPI Calibrado por `rdtsc`:** Utilização de atrasos de temporização calibrados pelo registrador de timestamp (`rdtsc`) para o envio seguro de IPIs de inicialização (INIT) e de inicialização física (Startup IPI) através do registrador ICR do LAPIC.
+* **Pilhas Isoladas por Núcleo:** Alocação dinâmica de páginas físicas individuais de 4 KiB pelo PMM para funcionarem como pilhas de kernel Ring 0 exclusivas para cada processador secundário, evitando corrupções por colisão de memória.
+* **Sincronização por Spinlocks Atômicos:** Implementação de primitivas de exclusão mútua baseadas em Spinlocks de barramento bloqueante (`__sync_lock_test_and_set`), garantindo sincronização e serialização de logs durante a execução da função `ap_kmain` nos processadores secundários.
 
 ### Inicialização, Modo Longo de 64-bits & Core
 * **GDT e Alinhamento:** Correção do descritor da GDT (`dq` substituindo o antigo `dd`), garantindo a carga linear correta dos 64 bits da base e impedindo falhas de paginação silenciosas.
@@ -86,24 +95,25 @@ PhotonOS/
 
 ---
 
-## 📊 Status de Desenvolvimento do Núcleo
+## 📊 Status do Projeto & Ecossistema de Trilhas
 
-| Subsistema                     | Status         |
-| ------------------------------ | -------------- |
-| Bootloader                     | ✅ Estável      |
-| Long Mode x86_64               | ✅ Estável      |
-| PMM / VMM / Heap               | ✅ Concluído    |
-| Escalonador e Concorrência     | ✅ Concluído    |
-| Espaço de Usuário e Syscalls   | ✅ Concluído    |
-| Loader ELF                     | ✅ Operacional  |
-| ATA PIO / FAT16 / VFS          | ✅ Estável      |
-| Subsistema Gráfico e UI        | ✅ Concluído    |
-| IPC e Sincronização de Pipes   | ✅ Concluído    |
-| Barramento PCI & Intel e1000   | ✅ Operacional  |
-| Pilha de Rede e Sockets        | ✅ Concluído    |
-| Shell                          | ✅ Operacional  |
+O desenvolvimento do PhotonOS é estruturado em trilhas de aprendizado e implementação de engenharia de software de baixo nível. Com a homologação bem-sucedida do multiprocessamento, todas as oito trilhas principais do sistema estão concluídas.
 
-**Métrica Total do Sistema:** 100%
+**Progresso Geral do Sistema:**
+`[██████████████████████████████████████████████████]` **100% Concluído (V3.0)**
+
+### 🛣️ Ecossistema de Trilhas de Engenharia
+
+| Trilha | Descrição | Status | Versão de Entrega |
+| :---: | :--- | :---: | :---: |
+| **Trilha 1** | Bootloader Real Mode (16-bit) e Transição de Privilégios | 100% | v1.0 |
+| **Trilha 2** | GDT, IDT, Tratamento de Interrupções e Proteção de Ring 0 | 100% | v1.0 |
+| **Trilha 3** | Configuração de Paginação (PML4) e Entrada em 64-bit Long Mode | 100% | v1.0 |
+| **Trilha 4** | Gerenciador de Memória Física (PMM), Virtual (VMM) e Heap Dinâmico | 100% | v1.0 |
+| **Trilha 5** | Processos, Escalonamento Preemptivo (Round-Robin) e Espaço de Usuário | 100% | v2.0 |
+| **Trilha 6** | Armazenamento (ATA PIO), Sistema de Arquivos FAT16 e VFS POSIX | 100% | v2.0 |
+| **Trilha 7** | Subsistema Gráfico VBE, Double Buffering e Barramento PCI/Driver e1000 | 100% | v2.0 |
+| **Trilha 8** | **Multiprocessamento Simétrico (SMP): Suporte Multi-Core Nativo** | 100% | v3.0 |
 
 ---
 
@@ -173,6 +183,25 @@ qemu-system-x86_64 ^
 
 * Aprimoramento da proteção de memória ativa (flags WP, W^X) e isolamento avançado de páginas de kernel.
 * Adição de semáforos e variáveis de condição ao scheduler.
+
+---
+
+## 🕒 Changelog / Linha do Tempo
+
+### `v3.0` - The SMP Update 🚀 (Versão Atual)
+* **Multiprocessamento Simétrico (SMP):** Suporte nativo a múltiplos núcleos de processamento (BSP + APs) com sincronização e inicialização de hardware avançada.
+* **Ecossistema APIC:** Desativação do PIC 8259 legado (portas `0x21` e `0xA1`) e ativação do Local APIC (LAPIC) no BSP e APs.
+* **Código Trampolim em 0x7000:** Bootstrap de processadores secundários de Modo Real de 16-bit para Modo Longo de 64-bit.
+* **Sincronização Ring 0:** Spinlocks atômicos baseados em instruções intrínsecas do compilador.
+* **Pilha Isolada por Núcleo:** Alocação de páginas físicas dedicadas de 4 KiB por Application Processor.
+
+### `v2.0` - The Graphics & Networking Update 🌌
+* Implementação do driver e1000 PCI de rede e sockets UDP.
+* Pipeline gráfico por software via VBE (1024x768x32bpp) com Double Buffering.
+* Mitigação de Double Faults e suporte à trindade fork/exec/exit em Ring 3.
+
+### `v1.0` - The Core 64-bit Update ⚙️
+* Setup básico de kernel 64-bit, tabelas PML4 de paginação, tratamento de IRQs, GDT/IDT/TSS estáveis e Heap do Kernel.
 
 ---
 

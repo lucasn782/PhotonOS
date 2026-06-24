@@ -62,5 +62,8 @@ int sys_socket_recv(uint8_t protocol, void *buffer, size_t max_len);
 
 int sys_socket(int domain, int type, int protocol);
 int sys_bind(int fd, const struct sockaddr *addr, uint32_t addrlen);
+int sys_connect(int fd, const struct sockaddr *addr, uint32_t addrlen);
+
+void net_init(void);
 
 #endif

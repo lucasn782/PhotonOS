@@ -33,12 +33,51 @@ static size_t arp_cache_count = 0;
 #define NET_PAGE_SIZE 4096ULL
 #define NET_THREAD_POLL_BURST 8
 
+/* TCP control flags (RFC 793) */
+#define TCP_FLAG_FIN 0x01U
+#define TCP_FLAG_SYN 0x02U
+#define TCP_FLAG_RST 0x04U
+#define TCP_FLAG_ACK 0x10U
+
 struct udp_header {
     uint16_t src_port;
     uint16_t dest_port;
     uint16_t length;
     uint16_t checksum;
 } __attribute__((packed));
+
+struct tcp_header {
+    uint16_t src_port;
+    uint16_t dest_port;
+    uint32_t seq_num;
+    uint32_t ack_num;
+    uint16_t data_offset_flags;
+    uint16_t window_size;
+    uint16_t checksum;
+    uint16_t urgent_ptr;
+} __attribute__((packed));
+
+enum tcp_state {
+    TCP_CLOSED,
+    TCP_LISTEN,
+    TCP_SYN_SENT,
+    TCP_SYN_RECEIVED,
+    TCP_ESTABLISHED,
+    TCP_CLOSE_WAIT,
+    TCP_FIN_WAIT_1,
+    TCP_CLOSING,
+    TCP_LAST_ACK,
+    TCP_FIN_WAIT_2,
+    TCP_TIME_WAIT
+};
+
+struct tcb {
+    uint32_t iss;       // Initial Send Sequence Number
+    uint32_t snd_una;   // Send Unacknowledged
+    uint32_t snd_nxt;   // Send Next
+    uint32_t rcv_nxt;   // Receive Next
+    uint32_t rcv_wnd;   // Receive Window
+};
 
 struct socket_packet {
     uint8_t *data;
@@ -50,19 +89,42 @@ struct socket {
     int domain;
     int type;
     int protocol;
+    int state;
+    
     uint16_t local_port;
     uint32_t local_addr;
+    uint16_t remote_port;
+    uint32_t remote_addr;
     
     struct socket_packet rx_queue[SOCKET_RX_BUF_SIZE];
     size_t rx_head;
     size_t rx_tail;
     size_t rx_count;
     
+    struct socket_packet tx_queue[SOCKET_RX_BUF_SIZE];
+    size_t tx_head;
+    size_t tx_tail;
+    size_t tx_count;
+    
+    mutex_t mutex;
+    struct tcb *tcb;
     int active;
 };
 
 #define MAX_SOCKETS 16
 static struct socket sockets[MAX_SOCKETS];
+static mutex_t sockets_mutex;
+
+void net_init(void)
+{
+    mutex_init(&sockets_mutex);
+    for (int i = 0; i < MAX_SOCKETS; i++) {
+        mutex_init(&sockets[i].mutex);
+        sockets[i].active = 0;
+        sockets[i].tcb    = 0;
+    }
+    klog("NET: Tabela de sockets inicializada.\n");
+}
 
 static inline uint64_t save_and_disable_interrupts(void)
 {
@@ -287,6 +349,193 @@ static int net_validate_udp_checksum(struct ip_header *ip, struct udp_header *ud
     return (uint16_t)~sum == 0;
 }
 
+static uint16_t net_calculate_udp_checksum(uint32_t src_ip, uint32_t dest_ip, const uint8_t *udp_packet, uint16_t udp_len)
+{
+    uint32_t sum = 0;
+    
+    const uint8_t *src_bytes = (const uint8_t *)&src_ip;
+    sum += ((uint16_t)src_bytes[0] << 8) | src_bytes[1];
+    sum += ((uint16_t)src_bytes[2] << 8) | src_bytes[3];
+    
+    const uint8_t *dest_bytes = (const uint8_t *)&dest_ip;
+    sum += ((uint16_t)dest_bytes[0] << 8) | dest_bytes[1];
+    sum += ((uint16_t)dest_bytes[2] << 8) | dest_bytes[3];
+    
+    sum += (uint16_t)IP_PROTO_UDP;
+    sum += udp_len;
+    
+    const uint8_t *bytes = udp_packet;
+    size_t length = udp_len;
+    while (length > 1) {
+        sum += ((uint16_t)bytes[0] << 8) | bytes[1];
+        bytes += 2;
+        length -= 2;
+    }
+    if (length != 0) {
+        sum += (uint16_t)bytes[0] << 8;
+    }
+    
+    while ((sum >> 16) != 0) {
+        sum = (sum & 0xFFFFU) + (sum >> 16);
+    }
+    
+    return (uint16_t)~sum;
+}
+
+static uint16_t net_calculate_tcp_checksum(uint32_t src_ip, uint32_t dest_ip, const uint8_t *tcp_packet, uint16_t tcp_len)
+{
+    uint32_t sum = 0;
+    
+    const uint8_t *src_bytes = (const uint8_t *)&src_ip;
+    sum += ((uint16_t)src_bytes[0] << 8) | src_bytes[1];
+    sum += ((uint16_t)src_bytes[2] << 8) | src_bytes[3];
+    
+    const uint8_t *dest_bytes = (const uint8_t *)&dest_ip;
+    sum += ((uint16_t)dest_bytes[0] << 8) | dest_bytes[1];
+    sum += ((uint16_t)dest_bytes[2] << 8) | dest_bytes[3];
+    
+    sum += (uint16_t)6; // IP_PROTO_TCP = 6
+    sum += tcp_len;
+    
+    const uint8_t *bytes = tcp_packet;
+    size_t length = tcp_len;
+    while (length > 1) {
+        sum += ((uint16_t)bytes[0] << 8) | bytes[1];
+        bytes += 2;
+        length -= 2;
+    }
+    if (length != 0) {
+        sum += (uint16_t)bytes[0] << 8;
+    }
+    
+    while ((sum >> 16) != 0) {
+        sum = (sum & 0xFFFFU) + (sum >> 16);
+    }
+    
+    return (uint16_t)~sum;
+}
+
+int net_send_ipv4(uint32_t dest_ip, uint8_t protocol, const void *payload, size_t len)
+{
+    if (payload == 0 || len > NET_IPV4_PAYLOAD_MAX) {
+        return -1;
+    }
+
+    uint8_t dest_mac[NET_ETH_ADDR_LEN];
+    int resolved = 0;
+
+    if (net_is_broadcast_ipv4(dest_ip)) {
+        for (size_t i = 0; i < NET_ETH_ADDR_LEN; i++) {
+            dest_mac[i] = 0xFF;
+        }
+        resolved = 1;
+    } else {
+        uint32_t next_hop_ip = net_next_hop_ipv4(dest_ip);
+        if (next_hop_ip != dest_ip) {
+            klog("NET: Destino fora da sub-rede, usando gateway padrao.\n");
+        }
+
+        for (int attempts = 0; attempts < 1000; attempts++) {
+            net_poll_packets();
+            if (arp_resolve(next_hop_ip, dest_mac)) {
+                resolved = 1;
+                break;
+            }
+            if (attempts % 100 == 0) {
+                arp_send_request(next_hop_ip);
+            }
+            scheduler_yield();
+        }
+    }
+
+    if (!resolved) {
+        klog("NET: Falha ao resolver MAC por ARP.\n");
+        return -1;
+    }
+
+    uint8_t stack_frame[1600];
+    
+    struct eth_header *eth = (struct eth_header *)stack_frame;
+    struct ip_header *ip = (struct ip_header *)(stack_frame + sizeof(struct eth_header));
+    uint8_t *ip_payload = stack_frame + sizeof(struct eth_header) + sizeof(struct ip_header);
+
+    for (size_t i = 0; i < len; i++) {
+        ip_payload[i] = ((const uint8_t *)payload)[i];
+    }
+
+    net_copy_mac(eth->dest_mac, dest_mac);
+    net_copy_mac(eth->src_mac, net_local_mac);
+    eth->ethertype = htons(ETH_TYPE_IPV4);
+
+    ip->ver_ihl = 0x45;
+    ip->tos = 0;
+    ip->total_length = htons(sizeof(struct ip_header) + len);
+    static uint16_t ip_id = 0;
+    ip->id = htons(ip_id++);
+    ip->flags_fragment = 0;
+    ip->ttl = 64;
+    ip->protocol = protocol;
+    ip->src_ip = htonl(NET_LOCAL_IPV4);
+    ip->dest_ip = dest_ip;
+    ip->checksum = 0;
+    ip->checksum = htons(net_checksum(ip, sizeof(struct ip_header)));
+
+    int sent = e1000_send_packet(stack_frame, sizeof(struct eth_header) + sizeof(struct ip_header) + len);
+    if (sent > 0) {
+        return 0;
+    }
+
+    return -1;
+}
+
+int net_send_udp(uint32_t dest_ip, uint16_t src_port, uint16_t dest_port, const void *payload, size_t len)
+{
+    size_t udp_len = sizeof(struct udp_header) + len;
+    uint8_t *udp_buf = kmalloc(udp_len);
+    if (udp_buf == 0) {
+        klog("NET: Falha de alocacao para pacote UDP.\n");
+        return -1;
+    }
+    
+    struct udp_header *udp = (struct udp_header *)udp_buf;
+    udp->src_port = htons(src_port);
+    udp->dest_port = htons(dest_port);
+    udp->length = htons((uint16_t)udp_len);
+    udp->checksum = 0;
+    
+    net_memcpy(udp_buf + sizeof(struct udp_header), payload, len);
+    
+    udp->checksum = net_calculate_udp_checksum(htonl(NET_LOCAL_IPV4), dest_ip, udp_buf, (uint16_t)udp_len);
+    
+    int ret = net_send_ipv4(dest_ip, IP_PROTO_UDP, udp_buf, udp_len);
+    kfree(udp_buf);
+    return ret;
+}
+
+static int net_send_tcp_packet(struct socket *sock, uint8_t flags)
+{
+    struct tcp_header tcp;
+    tcp.src_port = htons(sock->local_port);
+    tcp.dest_port = htons(sock->remote_port);
+    
+    if (flags & 0x02) { // SYN
+        tcp.seq_num = htonl(sock->tcb->iss);
+        tcp.ack_num = 0;
+    } else { // ACK
+        tcp.seq_num = htonl(sock->tcb->snd_nxt);
+        tcp.ack_num = htonl(sock->tcb->rcv_nxt);
+    }
+    
+    tcp.data_offset_flags = htons((5 << 12) | flags);
+    tcp.window_size = htons((uint16_t)sock->tcb->rcv_wnd);
+    tcp.checksum = 0;
+    tcp.urgent_ptr = 0;
+    
+    tcp.checksum = net_calculate_tcp_checksum(htonl(NET_LOCAL_IPV4), sock->remote_addr, (const uint8_t *)&tcp, sizeof(struct tcp_header));
+    
+    return net_send_ipv4(sock->remote_addr, 6, &tcp, sizeof(struct tcp_header));
+}
+
 int socket_vfs_read(vfs_node_t *node, uint64_t offset, uint32_t size, uint8_t *buffer)
 {
     (void)offset;
@@ -295,36 +544,88 @@ int socket_vfs_read(vfs_node_t *node, uint64_t offset, uint32_t size, uint8_t *b
     }
 
     struct socket *sock = (struct socket *)node->data;
-    uint64_t rflags = save_and_disable_interrupts();
+    
+    for (;;) {
+        mutex_lock(&sock->mutex);
+        if (sock->rx_count > 0) {
+            struct socket_packet *pkt = &sock->rx_queue[sock->rx_head];
+            size_t copy_len = pkt->len;
+            if (copy_len > size) {
+                copy_len = size;
+            }
 
-    if (sock->rx_count == 0) {
-        restore_interrupts(rflags);
-        return -11;
+            net_memcpy(buffer, pkt->data, copy_len);
+
+            kfree(pkt->data);
+            pkt->data = 0;
+
+            sock->rx_head = (sock->rx_head + 1) % SOCKET_RX_BUF_SIZE;
+            sock->rx_count--;
+            mutex_unlock(&sock->mutex);
+            return (int)copy_len;
+        }
+        
+        mutex_unlock(&sock->mutex);
+        
+        // Temporarily release VFS mutex to prevent global deadlock while sleeping
+        mutex_unlock(&vfs_mutex);
+        
+        uint64_t rflags = save_and_disable_interrupts();
+        mutex_lock(&sock->mutex);
+        if (sock->rx_count == 0) {
+            scheduler_sleep_current(TASK_WAIT_SOCKET_RECV, (uint64_t)sock);
+            mutex_unlock(&sock->mutex);
+            restore_interrupts(rflags);
+            scheduler_yield();
+        } else {
+            mutex_unlock(&sock->mutex);
+            restore_interrupts(rflags);
+        }
+        
+        // Re-acquire VFS mutex
+        mutex_lock(&vfs_mutex);
     }
-
-    struct socket_packet *pkt = &sock->rx_queue[sock->rx_head];
-    size_t copy_len = pkt->len;
-    if (copy_len > size) {
-        copy_len = size;
-    }
-
-    net_memcpy(buffer, pkt->data, copy_len);
-
-    kfree(pkt->data);
-    pkt->data = 0;
-
-    sock->rx_head = (sock->rx_head + 1) % SOCKET_RX_BUF_SIZE;
-    sock->rx_count--;
-
-    restore_interrupts(rflags);
-
-    return (int)copy_len;
 }
 
 size_t socket_vfs_write(vfs_node_t *node, size_t offset, size_t size, const uint8_t *buffer)
 {
-    (void)node; (void)offset; (void)size; (void)buffer;
-    return 0;
+    (void)offset;
+    if (node == 0 || node->data == 0 || buffer == 0 || size == 0) {
+        return 0;
+    }
+    struct socket *sock = (struct socket *)node->data;
+    
+    mutex_lock(&sock->mutex);
+    if (!sock->active) {
+        mutex_unlock(&sock->mutex);
+        return 0;
+    }
+    
+    uint32_t dest_ip = sock->remote_addr;
+    if (dest_ip == 0) {
+        mutex_unlock(&sock->mutex);
+        return 0;
+    }
+    
+    int result = -1;
+    if (sock->type == SOCK_DGRAM && sock->protocol == IP_PROTO_UDP) {
+        uint16_t src_port = sock->local_port;
+        uint16_t dest_port = sock->remote_port;
+        mutex_unlock(&sock->mutex);
+        
+        result = net_send_udp(dest_ip, src_port, dest_port, buffer, size);
+    }
+    else if (sock->type == SOCK_RAW) {
+        uint8_t protocol = sock->protocol;
+        mutex_unlock(&sock->mutex);
+        
+        result = net_send_ipv4(dest_ip, protocol, buffer, size);
+    }
+    else {
+        mutex_unlock(&sock->mutex);
+    }
+    
+    return result == 0 ? size : 0;
 }
 
 void socket_vfs_close(vfs_node_t *node)
@@ -333,6 +634,7 @@ void socket_vfs_close(vfs_node_t *node)
     struct socket *sock = (struct socket *)node->data;
     if (sock != 0) {
         uint64_t rflags = save_and_disable_interrupts();
+        mutex_lock(&sock->mutex);
         sock->active = 0;
         for (size_t i = 0; i < sock->rx_count; i++) {
             size_t idx = (sock->rx_head + i) % SOCKET_RX_BUF_SIZE;
@@ -342,6 +644,21 @@ void socket_vfs_close(vfs_node_t *node)
             }
         }
         sock->rx_count = 0;
+        
+        for (size_t i = 0; i < sock->tx_count; i++) {
+            size_t idx = (sock->tx_head + i) % SOCKET_RX_BUF_SIZE;
+            if (sock->tx_queue[idx].data != 0) {
+                kfree(sock->tx_queue[idx].data);
+                sock->tx_queue[idx].data = 0;
+            }
+        }
+        sock->tx_count = 0;
+        
+        if (sock->tcb != 0) {
+            kfree(sock->tcb);
+            sock->tcb = 0;
+        }
+        mutex_unlock(&sock->mutex);
         restore_interrupts(rflags);
     }
     kfree(node);
@@ -502,6 +819,146 @@ void net_poll_packets(void)
                         klog("NET: Checksum UDP invalido.\n");
                         return;
                     }
+
+                    uint16_t src_port = ntohs(udp->src_port);
+                    uint16_t dest_port = ntohs(udp->dest_port);
+                    uint16_t udp_len = ntohs(udp->length);
+                    if (udp_len < sizeof(struct udp_header) || payload_len < udp_len) {
+                        return;
+                    }
+                    size_t udp_payload_len = (size_t)udp_len - sizeof(struct udp_header);
+                    uint8_t *udp_payload = payload + sizeof(struct udp_header);
+
+                    uint64_t rflags_udp = save_and_disable_interrupts();
+                    mutex_lock(&sockets_mutex);
+                    struct socket *target_sock = 0;
+                    for (int i = 0; i < MAX_SOCKETS; i++) {
+                        struct socket *s = &sockets[i];
+                        if (s->active && s->type == SOCK_DGRAM && s->protocol == IP_PROTO_UDP) {
+                            if (s->local_port == dest_port) {
+                                target_sock = s;
+                                break;
+                            }
+                        }
+                    }
+
+                    if (target_sock != 0) {
+                        mutex_lock(&target_sock->mutex);
+                        if (target_sock->rx_count >= SOCKET_RX_BUF_SIZE) {
+                            klog("NET: Buffer do socket cheio, descartando pacote.\n");
+                        } else {
+                            uint8_t *pkt_buf = kmalloc(udp_payload_len);
+                            if (pkt_buf == 0) {
+                                klog("NET: Falha de kmalloc ao enfileirar pacote.\n");
+                            } else {
+                                net_memcpy(pkt_buf, udp_payload, udp_payload_len);
+                                size_t tail = target_sock->rx_tail;
+                                target_sock->rx_queue[tail].data = pkt_buf;
+                                target_sock->rx_queue[tail].len = udp_payload_len;
+                                target_sock->rx_tail = (tail + 1) % SOCKET_RX_BUF_SIZE;
+                                target_sock->rx_count++;
+
+                                target_sock->remote_addr = ip->src_ip;
+                                target_sock->remote_port = src_port;
+                            }
+                        }
+                        mutex_unlock(&target_sock->mutex);
+                        mutex_unlock(&sockets_mutex);
+                        restore_interrupts(rflags_udp);
+
+                        uint64_t rflags_wake = save_and_disable_interrupts();
+                        scheduler_wake_socket(target_sock);
+                        scheduler_wake_socket_receivers(IP_PROTO_UDP);
+                        restore_interrupts(rflags_wake);
+                    } else {
+                        mutex_unlock(&sockets_mutex);
+                        restore_interrupts(rflags_udp);
+                    }
+                    return;
+                }
+                else if (ip->protocol == IP_PROTO_TCP) {
+                    /* TCP SYN-ACK reception: complete the Three-Way Handshake */
+                    if (payload_len < sizeof(struct tcp_header)) {
+                        return;
+                    }
+                    struct tcp_header *tcp_in = (struct tcp_header *)payload;
+                    uint16_t flags = ntohs(tcp_in->data_offset_flags) & 0x01FFU;
+
+                    if ((flags & (TCP_FLAG_SYN | TCP_FLAG_ACK)) ==
+                            (TCP_FLAG_SYN | TCP_FLAG_ACK)) {
+                        /* Find the client socket waiting in SYN_SENT state */
+                        uint64_t rflags_tcp = save_and_disable_interrupts();
+                        mutex_lock(&sockets_mutex);
+                        for (int i = 0; i < MAX_SOCKETS; i++) {
+                            struct socket *s = &sockets[i];
+                            if (!s->active || s->type != SOCK_STREAM) {
+                                continue;
+                            }
+                            if (s->state != (int)TCP_SYN_SENT) {
+                                continue;
+                            }
+                            if (s->remote_addr != ip->src_ip) {
+                                continue;
+                            }
+                            if (s->remote_port != ntohs(tcp_in->src_port)) {
+                                continue;
+                            }
+
+                            uint32_t seg_seq = ntohl(tcp_in->seq_num);
+                            uint32_t seg_ack = ntohl(tcp_in->ack_num);
+
+                            /* 1. Valide os numeros de sequencia e confirmacao */
+                            if (seg_ack != s->tcb->snd_nxt) {
+                                continue;
+                            }
+
+                            /* 2. Atualize o estado do socket para ESTABLISHED */
+                            s->state = (int)TCP_ESTABLISHED;
+
+                            /* 3. Incremente os contadores internos */
+                            s->tcb->rcv_nxt = seg_seq + 1U;
+                            s->tcb->snd_una = seg_ack;
+
+                            klog("NET: TCP ESTABLISHED - Three-Way Handshake concluido.\n");
+
+                            /* Send the final ACK */
+                            mutex_unlock(&sockets_mutex);
+                            restore_interrupts(rflags_tcp);
+
+                            /* 4. Monte e envie um pacote de confirmacao final contendo apenas a flag ACK */
+                            net_send_tcp_packet(s, TCP_FLAG_ACK);
+
+                            /* 5. Acorde a tarefa de usuario que invocou a syscall sys_connect */
+                            uint64_t rflags2 = save_and_disable_interrupts();
+                            scheduler_wake_socket(s);
+                            restore_interrupts(rflags2);
+                            return;
+                        }
+                        mutex_unlock(&sockets_mutex);
+                        restore_interrupts(rflags_tcp);
+                        return;
+                    }
+
+                    /* RST: abort any connecting socket */
+                    if (flags & TCP_FLAG_RST) {
+                        uint64_t rflags_rst = save_and_disable_interrupts();
+                        mutex_lock(&sockets_mutex);
+                        for (int i = 0; i < MAX_SOCKETS; i++) {
+                            struct socket *s = &sockets[i];
+                            if (!s->active || s->type != SOCK_STREAM) {
+                                continue;
+                            }
+                            if (s->remote_addr == ip->src_ip) {
+                                s->state = (int)TCP_CLOSED;
+                                klog("NET: TCP RST recebido, conexao abortada.\n");
+                                scheduler_wake_socket(s);
+                            }
+                        }
+                        mutex_unlock(&sockets_mutex);
+                        restore_interrupts(rflags_rst);
+                        return;
+                    }
+                    return;
                 }
 
                 uint64_t rflags = save_and_disable_interrupts();
@@ -708,11 +1165,11 @@ int sys_socket(int domain, int type, int protocol)
     if (domain != AF_INET) {
         return -1;
     }
-    if (type != SOCK_RAW && type != SOCK_DGRAM) {
+    if (type != SOCK_RAW && type != SOCK_DGRAM && type != SOCK_STREAM) {
         return -1;
     }
 
-    uint64_t rflags = save_and_disable_interrupts();
+    mutex_lock(&sockets_mutex);
     int slot = -1;
     for (int i = 0; i < MAX_SOCKETS; i++) {
         if (!sockets[i].active) {
@@ -722,32 +1179,41 @@ int sys_socket(int domain, int type, int protocol)
     }
 
     if (slot < 0) {
-        restore_interrupts(rflags);
+        mutex_unlock(&sockets_mutex);
         return -1;
     }
 
     struct socket *sock = &sockets[slot];
-    sock->domain = domain;
-    sock->type = type;
-    sock->protocol = protocol;
-    sock->local_port = 0;
-    sock->local_addr = 0;
-    sock->rx_head = 0;
-    sock->rx_tail = 0;
-    sock->rx_count = 0;
+    sock->domain      = domain;
+    sock->type        = type;
+    sock->protocol    = protocol;
+    sock->state       = (int)TCP_CLOSED;
+    sock->local_port  = 0;
+    sock->local_addr  = 0;
+    sock->remote_port = 0;
+    sock->remote_addr = 0;
+    sock->rx_head     = 0;
+    sock->rx_tail     = 0;
+    sock->rx_count    = 0;
+    sock->tx_head     = 0;
+    sock->tx_tail     = 0;
+    sock->tx_count    = 0;
+    sock->tcb         = 0;
     for (int j = 0; j < SOCKET_RX_BUF_SIZE; j++) {
         sock->rx_queue[j].data = 0;
-        sock->rx_queue[j].len = 0;
+        sock->rx_queue[j].len  = 0;
+        sock->tx_queue[j].data = 0;
+        sock->tx_queue[j].len  = 0;
     }
     sock->active = 1;
 
-    restore_interrupts(rflags);
+    mutex_unlock(&sockets_mutex);
 
     vfs_node_t *node = kmalloc(sizeof(vfs_node_t));
     if (node == 0) {
-        uint64_t rflags2 = save_and_disable_interrupts();
+        mutex_lock(&sockets_mutex);
         sock->active = 0;
-        restore_interrupts(rflags2);
+        mutex_unlock(&sockets_mutex);
         return -1;
     }
 
@@ -755,23 +1221,24 @@ int sys_socket(int domain, int type, int protocol)
         node->name[j] = 0;
     }
     node->name[0] = 's';
-    node->type = VFS_NODE_DEVICE;
-    node->data = sock;
-    node->read = socket_vfs_read;
-    node->write = socket_vfs_write;
-    node->close = socket_vfs_close;
+    node->type    = VFS_NODE_SOCKET;
+    node->data    = sock;
+    node->read    = socket_vfs_read;
+    node->write   = socket_vfs_write;
+    node->close   = socket_vfs_close;
 
     task_t *task = scheduler_current_task();
     int fd = task_alloc_fd(task, node);
     if (fd < 0) {
         kfree(node);
-        uint64_t rflags2 = save_and_disable_interrupts();
+        mutex_lock(&sockets_mutex);
         sock->active = 0;
-        restore_interrupts(rflags2);
+        mutex_unlock(&sockets_mutex);
         return -1;
     }
 
     sock->fd = fd;
+    klog("NET: Socket criado e vinculado ao descritor.\n");
     return fd;
 }
 
@@ -796,11 +1263,121 @@ int sys_bind(int fd, const struct sockaddr *addr, uint32_t addrlen)
     net_memcpy(&addr_in, addr, sizeof(struct sockaddr_in));
 
     struct socket *sock = (struct socket *)node->data;
-    if (sock == 0 || !sock->active) {
+    if (sock == 0) {
         return -1;
     }
 
+    mutex_lock(&sockets_mutex);
+    if (!sock->active) {
+        mutex_unlock(&sockets_mutex);
+        return -1;
+    }
     sock->local_port = ntohs(addr_in.sin_port);
     sock->local_addr = addr_in.sin_addr.s_addr;
+    mutex_unlock(&sockets_mutex);
+
+    klog("NET: Socket vinculado a porta local.\n");
+    return 0;
+}
+
+extern volatile uint64_t kernel_ticks;
+
+int sys_connect(int fd, const struct sockaddr *addr, uint32_t addrlen)
+{
+    task_t *task = scheduler_current_task();
+    if (task == 0 || fd < 0 || fd >= TASK_MAX_FDS) {
+        return -1;
+    }
+    vfs_node_t *node = task->file_descriptors[fd];
+    if (node == 0 || node->read != socket_vfs_read) {
+        return -1;
+    }
+    if (addr == 0 || addrlen < sizeof(struct sockaddr_in)) {
+        return -1;
+    }
+    if (!vmm_is_mapped((uint64_t *)task->cr3, (uintptr_t)addr)) {
+        return -1;
+    }
+
+    struct sockaddr_in addr_in;
+    net_memcpy(&addr_in, addr, sizeof(struct sockaddr_in));
+
+    struct socket *sock = (struct socket *)node->data;
+    if (sock == 0) {
+        return -1;
+    }
+
+    mutex_lock(&sockets_mutex);
+    if (!sock->active) {
+        mutex_unlock(&sockets_mutex);
+        return -1;
+    }
+
+    /* --- UDP: apenas registra o destino, retorna imediatamente --- */
+    if (sock->type == SOCK_DGRAM) {
+        sock->remote_addr = addr_in.sin_addr.s_addr;
+        sock->remote_port = ntohs(addr_in.sin_port);
+        mutex_unlock(&sockets_mutex);
+        klog("NET: UDP connect - destino remoto definido.\n");
+        return 0;
+    }
+
+    /* --- TCP: inicia o Three-Way Handshake (RFC 793) --- */
+    if (sock->type != SOCK_STREAM) {
+        mutex_unlock(&sockets_mutex);
+        return -1;
+    }
+
+    /* Allocate and initialise the TCB */
+    struct tcb *tcb = kmalloc(sizeof(struct tcb));
+    if (tcb == 0) {
+        mutex_unlock(&sockets_mutex);
+        klog("NET: Falha ao alocar TCB para TCP connect.\n");
+        return -1;
+    }
+
+    /* ISN derived from kernel_ticks (simple, non-cryptographic) */
+    tcb->iss     = (uint32_t)kernel_ticks;
+    tcb->snd_una = tcb->iss;
+    tcb->snd_nxt = tcb->iss + 1;
+    tcb->rcv_nxt = 0;
+    tcb->rcv_wnd = 65535U;
+
+    sock->tcb         = tcb;
+    sock->remote_addr = addr_in.sin_addr.s_addr;
+    sock->remote_port = ntohs(addr_in.sin_port);
+    sock->state       = (int)TCP_SYN_SENT;
+    mutex_unlock(&sockets_mutex);
+
+    klog("NET: TCP SYN_SENT - enviando segmento SYN.\n");
+
+    /* Dispatch the SYN segment via the now-active net_send_tcp_packet */
+    if (net_send_tcp_packet(sock, TCP_FLAG_SYN) != 0) {
+        mutex_lock(&sockets_mutex);
+        sock->state = (int)TCP_CLOSED;
+        kfree(tcb);
+        sock->tcb = 0;
+        mutex_unlock(&sockets_mutex);
+        klog("NET: Falha ao enviar SYN TCP.\n");
+        return -1;
+    }
+
+    /* Block the calling task until the network thread receives SYN-ACK */
+    uint64_t rflags = save_and_disable_interrupts();
+    scheduler_sleep_current(TASK_WAIT_NETWORK, (uint64_t)sock);
+    restore_interrupts(rflags);
+    scheduler_yield();
+
+    /* When we wake up, check whether the handshake completed */
+    mutex_lock(&sockets_mutex);
+    int established = (sock->state == (int)TCP_ESTABLISHED);
+    mutex_unlock(&sockets_mutex);
+
+    if (!established) {
+        klog("NET: TCP connect falhou - conexao nao estabelecida.\n");
+        return -1;
+    }
+
+    klog("NET: TCP connect bem-sucedido - estado ESTABLISHED.\n");
     return 0;
 }

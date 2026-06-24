@@ -11,8 +11,11 @@
 #define ICMP_TYPE_ECHO_REQ   8U
 
 #define AF_INET 2
+#define SOCK_STREAM 1
 #define SOCK_DGRAM 2
 #define SOCK_RAW 3
+
+#define IP_PROTO_TCP 6U
 
 struct sockaddr {
     uint16_t sa_family;
@@ -63,6 +66,7 @@ static inline uint32_t ntohl(uint32_t value)
 
 int socket(int domain, int type, int protocol);
 int bind(int fd, const struct sockaddr *addr, uint32_t addrlen);
+int connect(int fd, const struct sockaddr *addr, uint32_t addrlen);
 
 int socket_send(uint32_t dest_ip, uint8_t protocol, const void *payload,
     size_t len);

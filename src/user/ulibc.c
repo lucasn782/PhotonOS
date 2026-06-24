@@ -21,6 +21,7 @@
 #define SYS_READDIR 21
 #define SYS_SOCKET 24
 #define SYS_BIND 25
+#define SYS_CONNECT 26
 #define PAGE_SIZE 4096UL
 
 struct malloc_block {
@@ -382,6 +383,11 @@ int socket(int domain, int type, int protocol)
 int bind(int fd, const struct sockaddr *addr, uint32_t addrlen)
 {
     return (int)syscall3(SYS_BIND, fd, (long)addr, addrlen);
+}
+
+int connect(int fd, const struct sockaddr *addr, uint32_t addrlen)
+{
+    return (int)syscall3(SYS_CONNECT, fd, (long)addr, addrlen);
 }
 
 static int inet_is_digit(char ch)

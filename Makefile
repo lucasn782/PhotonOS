@@ -31,7 +31,8 @@ KERNEL_OBJS := build/boot/kernel_asm.o build/user/shell_blob.o build/user/hello_
                build/kernel/kernel.o build/kernel/memory.o build/kernel/vmm.o \
                build/drivers/serial.o build/drivers/video.o build/drivers/mouse.o build/kernel/scheduler.o build/kernel/mutex.o build/kernel/heap.o \
                build/kernel/vfs.o build/kernel/initrd.o build/kernel/elf.o build/kernel/net.o build/drivers/fat16.o \
-               build/drivers/ata.o build/drivers/pci.o build/drivers/e1000.o
+               build/drivers/ata.o build/drivers/pci.o build/drivers/e1000.o \
+               build/kernel/apic.o build/kernel/smp.o build/kernel/trampoline_blob.o
 
 CFLAGS := -ffreestanding -m64 -nostdlib -mno-red-zone -fno-pic -fno-pie \
           -fno-stack-protector -Wall -Wextra -Iinclude
@@ -53,6 +54,18 @@ $(BOOT_BIN): src/boot/boot.asm
 
 build/boot/kernel_asm.o: src/boot/kernel.asm
 	@mkdir -p $(dir $@) && $(NASM) -f elf64 $< -o $@
+
+build/kernel/trampoline.bin: src/kernel/trampoline.asm
+	@mkdir -p $(dir $@) && $(NASM) -f bin $< -o $@
+
+build/kernel/trampoline_blob.o: build/kernel/trampoline.bin
+	cd build/kernel && $(LD) -r -b binary trampoline.bin -o trampoline_blob.o
+
+build/kernel/apic.o: src/kernel/apic.c include/apic.h include/vmm.h include/memory.h
+	@mkdir -p $(dir $@) && $(CC) $(CFLAGS) -c $< -o $@
+
+build/kernel/smp.o: src/kernel/smp.c include/smp.h include/apic.h include/memory.h include/serial.h
+	@mkdir -p $(dir $@) && $(CC) $(CFLAGS) -c $< -o $@
 
 build/kernel/kernel.o: src/kernel/kernel.c include/*.h
 	@mkdir -p $(dir $@) && $(CC) $(CFLAGS) -c $< -o $@

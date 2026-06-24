@@ -511,6 +511,20 @@ void scheduler_wake_socket_receivers(uint8_t protocol)
     }
 }
 
+void scheduler_wake_socket(void *sock)
+{
+    for (uint32_t i = 0; i < task_count; i++) {
+        if (tasks[i].state == TASK_BLOCKED &&
+            (tasks[i].wait_reason == TASK_WAIT_SOCKET_RECV ||
+             tasks[i].wait_reason == TASK_WAIT_NETWORK) &&
+            tasks[i].wait_target == (uint64_t)sock) {
+            tasks[i].state = TASK_READY;
+            tasks[i].wait_reason = TASK_WAIT_NONE;
+            tasks[i].wait_target = 0;
+        }
+    }
+}
+
 int scheduler_wait_current(uint32_t pid)
 {
     task_t *child = 0;

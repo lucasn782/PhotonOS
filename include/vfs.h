@@ -11,7 +11,11 @@ typedef enum vfs_node_type {
     VFS_NODE_DIRECTORY,
     VFS_NODE_DEVICE,
     VFS_NODE_PIPE,
+    VFS_NODE_SOCKET,
 } vfs_node_type_t;
+
+struct mutex;
+extern struct mutex vfs_mutex;
 
 typedef struct vfs_node vfs_node_t;
 
