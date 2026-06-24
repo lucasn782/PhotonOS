@@ -955,9 +955,10 @@ void scheduler_handle_syscall_signals(uint64_t syscall_frame_addr, uint64_t sysc
     if (handler == 0 || handler == (uintptr_t)-1) {
         task->pending_signals &= ~signal_bit(signum);
         scheduler_terminate_task(task, -1);
-        for (;;) {
-            __asm__ volatile ("sti; hlt");
-        }
+        /* Não trava o CPU — retorna ao syscall_entry.
+         * Na próxima tick do timer (IRQ 0), o scheduler verá que a task
+         * atual está ZOMBIE e selecionará outra task. */
+        return;
     }
 
     struct syscall_frame *frame = (struct syscall_frame *)syscall_frame_addr;

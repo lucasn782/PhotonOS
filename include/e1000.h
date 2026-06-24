@@ -40,7 +40,7 @@
 #define E1000_TX_STATUS_DD (1U << 0)
 #define E1000_RX_STATUS_DD (1U << 0)
 
-int e1000_init(uint32_t bar0_address);
+int e1000_init(uint64_t bar_address);
 void e1000_reset(void);
 void e1000_write_reg(uint32_t reg, uint32_t val);
 uint32_t e1000_read_reg(uint32_t reg);

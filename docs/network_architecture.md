@@ -1,10 +1,36 @@
-# Arquitetura de Rede e Sockets POSIX (v1.7)
+# Arquitetura de Rede, Barramento PCI e Sockets POSIX (v2.0)
 
-O PhotonOS (v1.7) implementa uma pilha de rede integrada ao Virtual File System (VFS), fornecendo chamadas de sistema baseadas em POSIX para a criação, vinculação e leitura de sockets em espaço de usuário (Ring 3).
+O PhotonOS v2.0 implementa uma pilha de rede totalmente integrada com o barramento PCI, inicializando controladores de rede via barramento de DMA físico puro e disponibilizando sockets integrados ao Virtual File System (VFS) com suporte a chamadas POSIX no espaço de usuário (Ring 3).
 
 ---
 
-## 1. Abstração de Sockets no VFS
+## 1. Varredura e Sondagem de Hardware (PCI Bus Scan)
+
+A ativação do subsistema de rede inicia-se com a varredura dinâmica do barramento PCI pelo Kernel. Esta rotina é responsável por localizar o hardware do controlador Ethernet (Intel e1000) e configurar seus canais de E/S.
+
+*   **Mecanismo de Acesso:** A comunicação com o espaço de configuração do barramento PCI é realizada via portas de E/S padrão da arquitetura x86_64:
+    *   `0xCF8` (PCI Config Address): Armazena o endereço do dispositivo (Bus, Slot, Function e Register Offset) que se deseja ler ou escrever.
+    *   `0xCFC` (PCI Config Data): Canal de transferência para leitura e escrita dos dados de configuração de 32 bits correspondentes.
+*   **Algoritmo de Sondagem:**
+    1.  O Kernel realiza uma varredura completa varrendo todos os 256 barramentos possíveis (`bus`), 32 slots por barramento (`slot`) e 8 funções por slot (`func`).
+    2.  O registro de offset `0x08` (PCI Class Code Offset) é lido para cada dispositivo ativo.
+    3.  A filtragem é baseada no Class Code `0x02` (Network Controller) e Subclass Code `0x00` (Ethernet Controller), garantindo o acoplamento do driver Intel e1000 apenas aos dispositivos de rede compatíveis.
+    4.  Uma vez localizado, os registradores BAR0/BAR1 do dispositivo são lidos para identificar o endereço base do mapeamento de E/S em memória (MMIO BAR).
+
+---
+
+## 2. DMA Físico Puro e Bus Mastering
+
+Para contornar o problema crônico de perda de pacotes em taxas de transferência elevadas, o driver e1000 foi homologado para utilizar um pipeline de DMA físico puro coordenado com o Physical Memory Manager (PMM).
+
+*   **Alocação de Descritores RX/TX:** Os anéis de descritores de transmissão (TX Ring) e recepção (RX Ring) são alocados diretamente em frames de memória física de 4KB usando o PMM (`pmm_alloc`).
+*   **Mapeamento de Buffers de Pacotes:** Os buffers de payloads individuais associados a cada descritor das filas RX e TX são alocados através de chamadas consecutivas a `pmm_alloc()`. O driver converte esses endereços virtuais em seus correspondentes físicos reais utilizando o VMM (`vmm_virt_to_phys`), escrevendo os endereços físicos diretamente na estrutura de controle do hardware (`desc->addr`).
+*   **Bus Mastering:** O driver PCI configura o registrador de Comando do dispositivo (`PCI_COMMAND_OFFSET` = `0x04`) ativando a flag de *Bus Master* (`PCI_COMMAND_BUS_MASTER` = `1U << 2`), permitindo que a placa de rede efetue transferências DMA bidirecionais diretamente com a memória RAM física sem passar pelo gargalo da CPU.
+*   **Mitigação de Paging Faults:** Ao atrelar o DMA a frames físicos reais e contíguos obtidos via PMM e mapeados de forma estática, elimina-se o risco de falhas de página durante o recebimento assíncrono de pacotes. Isso viabiliza o funcionamento pleno e nativo do comando `ping` no Shell.
+
+---
+
+## 3. Abstração de Sockets no VFS
 
 A interface de sockets é unificada com a abstração de arquivos através do VFS. As seguintes chamadas de sistema foram disponibilizadas para Ring 3:
 
@@ -13,13 +39,13 @@ A interface de sockets é unificada com a abstração de arquivos através do VF
 
 ### Ciclo de Vida do VFS Node
 Quando um processo chama `sys_close` (Syscall 15), o Kernel invoca automaticamente o callback de liberação `node->close(node)`. Para sockets, isso executa a rotina `socket_vfs_close`, que:
-1. Desativa o socket de forma segura.
-2. Esvazia a fila de pacotes pendentes e libera a memória de todos os payloads usando `kfree()`.
-3. Libera o nó de VFS alocado no Kernel Heap.
+1.  Desativa o socket de forma segura.
+2.  Esvazia a fila de pacotes pendentes e libera a memória de todos os payloads usando `kfree()`.
+3.  Libera o nó de VFS alocado no Kernel Heap.
 
 ---
 
-## 2. Proteção Atômica dos Ring Buffers
+## 4. Proteção Atômica dos Ring Buffers
 
 Em um ambiente multitarefa preemptivo, a inserção de pacotes pelo driver `e1000` (no contexto de IRQ/Thread de rede) e a remoção dos pacotes pelo processo de usuário (via `read()`) podem causar condições de corrida críticas nos ponteiros circulares de leitura (`rx_head`/`rx_tail`).
 
@@ -46,7 +72,7 @@ Isso garante que a preempção pelo temporizador PIT (INT 0x20) seja temporariam
 
 ---
 
-## 3. Validação Matemática de Checksum (RFC 768)
+## 5. Validação Matemática de Checksum (RFC 768)
 
 Para garantir a robustez na integridade dos dados trafegados, todas as camadas de parse aplicam validações estritas de checksum. Qualquer pacote inválido é descartado silenciosamente:
 
@@ -66,7 +92,7 @@ Se o checksum calculado não bater com o cabeçalho recebido, o pacote é imedia
 
 ---
 
-## 4. I/O Não-Bloqueante e Timeout (`-EAGAIN`)
+## 6. I/O Não-Bloqueante e Timeout (`-EAGAIN`)
 
 A leitura de sockets via `sys_read` opera no modo não-bloqueante seguro para evitar congelamentos do Shell ou de utilitários caso a conexão caia.
 
@@ -74,7 +100,7 @@ Se um processo chamar `read()` em um socket cujo ring buffer estiver vazio (`rx_
 
 ---
 
-## 5. Regras de Design de Logs do Kernel
+## 7. Regras de Design de Logs do Kernel
 
 Em total conformidade com a política de hardening do PhotonOS, nenhuma chamada de depuração ou log de descarte/erros na camada de rede utiliza especificadores de formato (`%d`, `%x`, `%s`). Todos os logs em Ring 0 são estritamente estáticos:
 

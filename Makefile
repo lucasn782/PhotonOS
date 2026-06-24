@@ -29,7 +29,7 @@ KERNEL_MAX_BYTES := $(shell expr $(KERNEL_SECTORS) \* 512)
 KERNEL_OBJS := build/boot/kernel_asm.o build/user/shell_blob.o build/user/hello_blob.o build/user/upper_blob.o \
                build/user/rev_blob.o build/user/hang_blob.o build/user/spin_blob.o build/user/ping_blob.o \
                build/kernel/kernel.o build/kernel/memory.o build/kernel/vmm.o \
-               build/drivers/serial.o build/kernel/scheduler.o build/kernel/mutex.o build/kernel/heap.o \
+               build/drivers/serial.o build/drivers/video.o build/drivers/mouse.o build/kernel/scheduler.o build/kernel/mutex.o build/kernel/heap.o \
                build/kernel/vfs.o build/kernel/initrd.o build/kernel/elf.o build/kernel/net.o build/drivers/fat16.o \
                build/drivers/ata.o build/drivers/pci.o build/drivers/e1000.o
 
@@ -38,8 +38,8 @@ CFLAGS := -ffreestanding -m64 -nostdlib -mno-red-zone -fno-pic -fno-pie \
 USER_CFLAGS := $(CFLAGS) -fno-builtin -fno-asynchronous-unwind-tables \
                -mcmodel=large
 LDFLAGS := -nostdlib -z max-page-size=0x1000 -T linker.ld -Map=build/photon.map
-USER_LDFLAGS := -nostdlib -s -N -z max-page-size=0x1000 \
-                -Ttext=0x8000001000 -e _start
+USER_LDFLAGS := -nostdlib -s -N --no-warn-rwx-segments -z max-page-size=0x1000 \
+               -Ttext=0x8000001000 -e _start
 
 .PHONY: all clean run run-fat16 fat16-disk background-test test-net release
 
@@ -64,6 +64,12 @@ build/kernel/vmm.o: src/kernel/vmm.c include/vmm.h include/memory.h
 	@mkdir -p $(dir $@) && $(CC) $(CFLAGS) -c $< -o $@
 
 build/drivers/serial.o: src/drivers/serial.c include/serial.h
+	@mkdir -p $(dir $@) && $(CC) $(CFLAGS) -c $< -o $@
+
+build/drivers/video.o: src/drivers/video.c include/video.h include/font_8x16.h include/vmm.h
+	@mkdir -p $(dir $@) && $(CC) $(CFLAGS) -c $< -o $@
+
+build/drivers/mouse.o: src/drivers/mouse.c include/mouse.h include/video.h include/serial.h
 	@mkdir -p $(dir $@) && $(CC) $(CFLAGS) -c $< -o $@
 
 build/kernel/scheduler.o: src/kernel/scheduler.c include/scheduler.h include/mutex.h include/task.h

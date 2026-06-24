@@ -32,5 +32,8 @@ void sigreturn(void);
 int getprocs(proc_info_t *buffer, size_t max_size);
 uint64_t get_ticks(void);
 int readdir(int fd, vfs_dir_entry_t *buf, uint32_t count);
+int read(int fd, void *buf, size_t count);
+int write(int fd, const void *buf, size_t count);
+int close(int fd);
 
 #endif

@@ -1,6 +1,5 @@
 #include "e1000.h"
 
-#include "heap.h"
 #include "memory.h"
 #include "mutex.h"
 #include "serial.h"
@@ -13,6 +12,9 @@
 #define E1000_MMIO_SIZE 0x20000ULL
 #define E1000_RX_RING_VADDR 0x00000000F0020000ULL
 #define E1000_TX_RING_VADDR 0x00000000F0021000ULL
+#define E1000_RX_BUFFER_VADDR 0x00000000F0030000ULL
+#define E1000_TX_BUFFER_VADDR \
+    (E1000_RX_BUFFER_VADDR + (E1000_RX_DESC_COUNT * PMM_PAGE_SIZE))
 
 struct e1000_rx_desc {
     uint64_t addr;
@@ -35,13 +37,15 @@ struct e1000_tx_desc {
 
 struct e1000_state {
     volatile uint8_t *mmio;
-    uintptr_t bar0_phys;
+    uintptr_t bar_phys;
     struct e1000_rx_desc *rx_descs;
     struct e1000_tx_desc *tx_descs;
     uintptr_t rx_descs_phys;
     uintptr_t tx_descs_phys;
     void *rx_buffers[E1000_RX_DESC_COUNT];
     void *tx_buffers[E1000_TX_DESC_COUNT];
+    uintptr_t rx_buffer_phys[E1000_RX_DESC_COUNT];
+    uintptr_t tx_buffer_phys[E1000_TX_DESC_COUNT];
     uint32_t rx_read;
     uint32_t tx_tail;
     mutex_t rx_lock;
@@ -50,11 +54,6 @@ struct e1000_state {
 };
 
 static struct e1000_state e1000;
-
-static uintptr_t align_up_uintptr(uintptr_t value, uintptr_t alignment)
-{
-    return (value + alignment - 1ULL) & ~(alignment - 1ULL);
-}
 
 static void e1000_memset(void *dest, uint8_t value, size_t count)
 {
@@ -81,7 +80,8 @@ void e1000_write_reg(uint32_t reg, uint32_t val)
         return;
     }
 
-    *(volatile uint32_t *)(e1000.mmio + reg) = val;
+    volatile uint32_t *mmio_reg = (volatile uint32_t *)(e1000.mmio + reg);
+    *mmio_reg = val;
 }
 
 uint32_t e1000_read_reg(uint32_t reg)
@@ -90,7 +90,20 @@ uint32_t e1000_read_reg(uint32_t reg)
         return 0;
     }
 
-    return *(volatile uint32_t *)(e1000.mmio + reg);
+    volatile uint32_t *mmio_reg = (volatile uint32_t *)(e1000.mmio + reg);
+    return *mmio_reg;
+}
+
+static inline void e1000_memory_barrier(void)
+{
+    __asm__ volatile("" : : : "memory");
+}
+
+static void e1000_write_tail(uint32_t reg, uint32_t val)
+{
+    e1000_memory_barrier();
+    e1000_write_reg(reg, val);
+    e1000_memory_barrier();
 }
 
 static uint64_t save_and_disable_interrupts(void)
@@ -108,11 +121,11 @@ static void restore_interrupts(uint64_t rflags)
     }
 }
 
-static void e1000_map_mmio(uint32_t bar0_address)
+static void e1000_map_mmio(uint64_t bar_address)
 {
-    uintptr_t bar0 = (uintptr_t)bar0_address;
-    uintptr_t phys_base = bar0 & ~(PMM_PAGE_SIZE - 1ULL);
-    uintptr_t offset = bar0 & (PMM_PAGE_SIZE - 1ULL);
+    uintptr_t bar = (uintptr_t)bar_address;
+    uintptr_t phys_base = bar & ~(PMM_PAGE_SIZE - 1ULL);
+    uintptr_t offset = bar & (PMM_PAGE_SIZE - 1ULL);
     uint32_t flags = PAGE_PRESENT | PAGE_WRITABLE | PAGE_CACHE_DISABLE;
 
     for (uintptr_t page = 0; page < E1000_MMIO_SIZE; page += PMM_PAGE_SIZE) {
@@ -120,40 +133,57 @@ static void e1000_map_mmio(uint32_t bar0_address)
     }
 
     e1000.mmio = (volatile uint8_t *)(E1000_MMIO_VADDR + offset);
-    e1000.bar0_phys = bar0;
+    e1000.bar_phys = bar;
 }
 
-static void *e1000_alloc_descriptor_page(uintptr_t virtual_alias,
-    uintptr_t *physical_out)
+static int e1000_dma_address_from_page(void *page, uintptr_t *physical_out)
 {
-    void *raw = kmalloc((size_t)(PMM_PAGE_SIZE * 2ULL));
-    if (raw == 0) {
-        return 0;
+    uintptr_t address = (uintptr_t)page;
+    uintptr_t physical = address;
+
+    if (address >= PMM_TOTAL_MEMORY) {
+        physical = vmm_virt_to_phys(address);
     }
 
-    uintptr_t aligned = align_up_uintptr((uintptr_t)raw, PMM_PAGE_SIZE);
-    uintptr_t physical = vmm_virt_to_phys(aligned);
-    if (physical == 0) {
-        return 0;
+    if (physical == 0 || physical >= PMM_TOTAL_MEMORY ||
+        (physical & (PMM_PAGE_SIZE - 1ULL)) != 0) {
+        return -1;
+    }
+
+    *physical_out = physical;
+    return 0;
+}
+
+static int e1000_alloc_dma_page(uintptr_t virtual_alias, void **virtual_out,
+    uintptr_t *physical_out)
+{
+    void *physical_page = pmm_alloc();
+    if (physical_page == 0) {
+        return -1;
+    }
+
+    uintptr_t physical;
+    if (e1000_dma_address_from_page(physical_page, &physical) != 0) {
+        klog("e1000: pagina DMA invalida.\n");
+        return -1;
     }
 
     vmm_map(virtual_alias, physical, PAGE_PRESENT | PAGE_WRITABLE);
     *physical_out = physical;
-    return (void *)virtual_alias;
+    *virtual_out = (void *)virtual_alias;
+    return 0;
 }
 
 static int e1000_alloc_rings(void)
 {
-    e1000.rx_descs = e1000_alloc_descriptor_page(E1000_RX_RING_VADDR,
-        &e1000.rx_descs_phys);
-    if (e1000.rx_descs == 0) {
+    if (e1000_alloc_dma_page(E1000_RX_RING_VADDR,
+        (void **)&e1000.rx_descs, &e1000.rx_descs_phys) != 0) {
         klog("e1000: falha ao alocar RX ring.\n");
         return -1;
     }
 
-    e1000.tx_descs = e1000_alloc_descriptor_page(E1000_TX_RING_VADDR,
-        &e1000.tx_descs_phys);
-    if (e1000.tx_descs == 0) {
+    if (e1000_alloc_dma_page(E1000_TX_RING_VADDR,
+        (void **)&e1000.tx_descs, &e1000.tx_descs_phys) != 0) {
         klog("e1000: falha ao alocar TX ring.\n");
         return -1;
     }
@@ -166,28 +196,46 @@ static int e1000_alloc_rings(void)
     return 0;
 }
 
+static uintptr_t e1000_rx_buffer_vaddr(uint32_t index)
+{
+    return E1000_RX_BUFFER_VADDR + ((uintptr_t)index * PMM_PAGE_SIZE);
+}
+
+static uintptr_t e1000_tx_buffer_vaddr(uint32_t index)
+{
+    return E1000_TX_BUFFER_VADDR + ((uintptr_t)index * PMM_PAGE_SIZE);
+}
+
 static int e1000_alloc_packet_buffers(void)
 {
     for (uint32_t i = 0; i < E1000_RX_DESC_COUNT; i++) {
-        void *buffer = pmm_alloc();
-        if (buffer == 0) {
+        uintptr_t phys;
+        void *buffer;
+
+        if (e1000_alloc_dma_page(e1000_rx_buffer_vaddr(i), &buffer,
+            &phys) != 0) {
             klog("e1000: falha ao alocar buffer RX.\n");
             return -1;
         }
 
         e1000.rx_buffers[i] = buffer;
-        e1000.rx_descs[i].addr = (uint64_t)(uintptr_t)buffer;
+        e1000.rx_buffer_phys[i] = phys;
+        e1000.rx_descs[i].addr = (uint64_t)phys;
     }
 
     for (uint32_t i = 0; i < E1000_TX_DESC_COUNT; i++) {
-        void *buffer = pmm_alloc();
-        if (buffer == 0) {
+        uintptr_t phys;
+        void *buffer;
+
+        if (e1000_alloc_dma_page(e1000_tx_buffer_vaddr(i), &buffer,
+            &phys) != 0) {
             klog("e1000: falha ao alocar buffer TX.\n");
             return -1;
         }
 
         e1000.tx_buffers[i] = buffer;
-        e1000.tx_descs[i].addr = (uint64_t)(uintptr_t)buffer;
+        e1000.tx_buffer_phys[i] = phys;
+        e1000.tx_descs[i].addr = (uint64_t)phys;
         e1000.tx_descs[i].status = E1000_TX_STATUS_DD;
     }
 
@@ -203,7 +251,7 @@ static void e1000_configure_rx(void)
     e1000_write_reg(E1000_REG_RDBAH, (uint32_t)(e1000.rx_descs_phys >> 32));
     e1000_write_reg(E1000_REG_RDLEN, ring_bytes);
     e1000_write_reg(E1000_REG_RDH, 0);
-    e1000_write_reg(E1000_REG_RDT, E1000_RX_DESC_COUNT - 1U);
+    e1000_write_tail(E1000_REG_RDT, E1000_RX_DESC_COUNT - 1U);
     e1000.rx_read = 0;
 
     e1000_write_reg(E1000_REG_RCTL,
@@ -219,7 +267,7 @@ static void e1000_configure_tx(void)
     e1000_write_reg(E1000_REG_TDBAH, (uint32_t)(e1000.tx_descs_phys >> 32));
     e1000_write_reg(E1000_REG_TDLEN, ring_bytes);
     e1000_write_reg(E1000_REG_TDH, 0);
-    e1000_write_reg(E1000_REG_TDT, 0);
+    e1000_write_tail(E1000_REG_TDT, 0);
     e1000.tx_tail = 0;
 
     e1000_write_reg(E1000_REG_TCTL,
@@ -230,7 +278,7 @@ static void e1000_configure_tx(void)
     e1000_write_reg(E1000_REG_TIPG, 10U | (8U << 10) | (6U << 20));
 }
 
-int e1000_init(uint32_t bar0_address)
+int e1000_init(uint64_t bar_address)
 {
     if (e1000.initialized) {
         return 0;
@@ -240,7 +288,7 @@ int e1000_init(uint32_t bar0_address)
     mutex_init(&e1000.rx_lock);
     mutex_init(&e1000.tx_lock);
 
-    e1000_map_mmio(bar0_address);
+    e1000_map_mmio(bar_address);
     (void)e1000_read_reg(E1000_REG_STATUS);
     e1000_write_reg(E1000_REG_IMC, 0xFFFFFFFFU);
 
@@ -286,6 +334,7 @@ int e1000_send_packet(const void *packet, size_t length)
     }
 
     e1000_memcpy(e1000.tx_buffers[tail], packet, length);
+    desc->addr = (uint64_t)e1000.tx_buffer_phys[tail];
     desc->length = (uint16_t)length;
     desc->cso = 0;
     desc->cmd = E1000_TX_CMD_EOP | E1000_TX_CMD_IFCS | E1000_TX_CMD_RS;
@@ -295,7 +344,7 @@ int e1000_send_packet(const void *packet, size_t length)
 
     tail = (tail + 1U) % E1000_TX_DESC_COUNT;
     e1000.tx_tail = tail;
-    e1000_write_reg(E1000_REG_TDT, tail);
+    e1000_write_tail(E1000_REG_TDT, tail);
 
     mutex_unlock(&e1000.tx_lock);
     restore_interrupts(rflags);
@@ -326,8 +375,13 @@ int e1000_receive_packet(void *buffer_out, size_t max_length)
         result = (int)length;
     }
 
+    desc->addr = (uint64_t)e1000.rx_buffer_phys[index];
+    desc->length = 0;
+    desc->checksum = 0;
+    desc->errors = 0;
+    desc->special = 0;
     desc->status = 0;
-    e1000_write_reg(E1000_REG_RDT, index);
+    e1000_write_tail(E1000_REG_RDT, index);
     e1000.rx_read = (index + 1U) % E1000_RX_DESC_COUNT;
 
     mutex_unlock(&e1000.rx_lock);

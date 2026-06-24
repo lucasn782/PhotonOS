@@ -9,6 +9,8 @@
 #include "vfs.h"
 
 #define NET_LOCAL_IPV4 0x0A00020FU
+#define NET_IPV4_NETMASK 0xFFFFFF00U
+#define NET_DEFAULT_GATEWAY_IPV4 0x0A000202U
 
 static const uint8_t net_local_mac[NET_ETH_ADDR_LEN] = {
     0x52, 0x54, 0x00, 0x12, 0x34, 0x56
@@ -29,6 +31,7 @@ static size_t arp_cache_count = 0;
 #define NET_IPV4_PAYLOAD_MAX 1480U
 #define NET_USER_BASE 0x0000008000000000ULL
 #define NET_PAGE_SIZE 4096ULL
+#define NET_THREAD_POLL_BURST 8
 
 struct udp_header {
     uint16_t src_port;
@@ -116,6 +119,32 @@ static uint16_t net_checksum(const void *data, size_t length)
 static int net_is_local_ipv4(uint32_t ip)
 {
     return ip == htonl(NET_LOCAL_IPV4);
+}
+
+static int net_is_broadcast_ipv4(uint32_t ip)
+{
+    uint32_t host_ip = ntohl(ip);
+    uint32_t local_broadcast =
+        (NET_LOCAL_IPV4 & NET_IPV4_NETMASK) | ~NET_IPV4_NETMASK;
+
+    return host_ip == 0xFFFFFFFFU || host_ip == local_broadcast;
+}
+
+static int net_is_on_link_ipv4(uint32_t ip)
+{
+    uint32_t host_ip = ntohl(ip);
+
+    return (host_ip & NET_IPV4_NETMASK) ==
+        (NET_LOCAL_IPV4 & NET_IPV4_NETMASK);
+}
+
+static uint32_t net_next_hop_ipv4(uint32_t dest_ip)
+{
+    if (net_is_on_link_ipv4(dest_ip)) {
+        return dest_ip;
+    }
+
+    return htonl(NET_DEFAULT_GATEWAY_IPV4);
 }
 
 static int user_buffer_accessible(const void *buffer, size_t len)
@@ -542,7 +571,9 @@ void net_kernel_thread(void)
     klog("NET: Thread de rede em background iniciada.\n");
 
     for (;;) {
-        net_poll_packets();
+        for (int i = 0; i < NET_THREAD_POLL_BURST; i++) {
+            net_poll_packets();
+        }
         scheduler_yield();
     }
 }
@@ -559,20 +590,25 @@ int sys_socket_send(uint32_t dest_ip, uint8_t protocol, const void *payload, siz
     uint8_t dest_mac[NET_ETH_ADDR_LEN];
     int resolved = 0;
 
-    if (dest_ip == 0xFFFFFFFFU) {
+    if (net_is_broadcast_ipv4(dest_ip)) {
         for (size_t i = 0; i < NET_ETH_ADDR_LEN; i++) {
             dest_mac[i] = 0xFF;
         }
         resolved = 1;
     } else {
+        uint32_t next_hop_ip = net_next_hop_ipv4(dest_ip);
+        if (next_hop_ip != dest_ip) {
+            klog("NET: Destino fora da sub-rede, usando gateway padrao.\n");
+        }
+
         for (int attempts = 0; attempts < 1000; attempts++) {
             net_poll_packets();
-            if (arp_resolve(dest_ip, dest_mac)) {
+            if (arp_resolve(next_hop_ip, dest_mac)) {
                 resolved = 1;
                 break;
             }
             if (attempts % 100 == 0) {
-                arp_send_request(dest_ip);
+                arp_send_request(next_hop_ip);
             }
             scheduler_yield();
         }

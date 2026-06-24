@@ -129,17 +129,29 @@ void _start(const char *arg)
         exit(1);
     }
 
+    int sock_fd = socket(AF_INET, SOCK_RAW, IP_PROTO_ICMP);
+    if (sock_fd < 0) {
+        printf("ping: falha ao criar socket\n");
+        exit(1);
+    }
+
+    struct sockaddr_in local_addr;
+    local_addr.sin_family = AF_INET;
+    local_addr.sin_port = 0;
+    local_addr.sin_addr.s_addr = 0;
+    if (bind(sock_fd, (struct sockaddr *)&local_addr, sizeof(local_addr)) < 0) {
+        printf("ping: falha ao fazer bind\n");
+        close(sock_fd);
+        exit(1);
+    }
+
     printf("A disparar ping contra %s com %u bytes de dados...\n",
         target_text, (unsigned int)PING_PACKET_SIZE);
 
     for (int i = 0; i < PING_REQUEST_COUNT; i++) {
         fill_ping_payload(&request, (uint16_t)(i + 1));
-        transmitted++;
 
         uint64_t start_ticks = get_ticks();
-        printf("[SYS] Socket enviado em Ring 3. Payload de %u bytes transmitido.\n",
-            (unsigned int)PING_PACKET_SIZE);
-
         if (socket_send(target_ip, IP_PROTO_ICMP, &request, sizeof(request)) < 0) {
             printf("ping: falha ao enviar pacote ICMP seq=%u\n",
                 (unsigned int)(i + 1));
@@ -147,11 +159,14 @@ void _start(const char *arg)
             continue;
         }
 
+        transmitted++;
+        printf("[SYS] Socket enviado em Ring 3. Payload de %u bytes transmitido.\n",
+            (unsigned int)PING_PACKET_SIZE);
+
         int got_reply = 0;
         for (int timeout_ticks = 0; timeout_ticks < PING_TIMEOUT_TICKS;
             timeout_ticks++) {
-            int bytes = socket_recv(IP_PROTO_ICMP, reply_buffer,
-                sizeof(reply_buffer));
+            int bytes = read(sock_fd, reply_buffer, sizeof(reply_buffer));
 
             if (bytes > 0 &&
                 is_matching_echo_reply(reply_buffer, bytes, &request)) {
@@ -209,5 +224,6 @@ void _start(const char *arg)
             (unsigned int)min_rtt, (unsigned int)avg_rtt, (unsigned int)max_rtt);
     }
     
+    close(sock_fd);
     exit(received_count == 0 ? 1 : 0);
 }

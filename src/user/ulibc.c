@@ -6,17 +6,21 @@
 #include "sys/socket.h"
 
 #define SYS_WRITE 1
+#define SYS_READ 3
 #define SYS_EXIT 5
 #define SYS_BRK 9
 #define SYS_SIGNAL 10
 #define SYS_KILL 11
 #define SYS_SIGRETURN 12
 #define SYS_GETPROCS 13
+#define SYS_CLOSE 15
 #define SYS_SOCKET_SEND 17
 #define SYS_SOCKET_RECV 18
 #define SYS_YIELD 19
 #define SYS_GET_TICKS 20
 #define SYS_READDIR 21
+#define SYS_SOCKET 24
+#define SYS_BIND 25
 #define PAGE_SIZE 4096UL
 
 struct malloc_block {
@@ -353,6 +357,31 @@ int socket_recv(uint8_t protocol, void *buffer, size_t max_len)
 {
     return (int)syscall3(SYS_SOCKET_RECV, (long)protocol, (long)buffer,
         (long)max_len);
+}
+
+int read(int fd, void *buf, size_t count)
+{
+    return (int)syscall3(SYS_READ, fd, (long)buf, (long)count);
+}
+
+int write(int fd, const void *buf, size_t count)
+{
+    return (int)syscall3(SYS_WRITE, fd, (long)buf, (long)count);
+}
+
+int close(int fd)
+{
+    return (int)syscall1(SYS_CLOSE, fd);
+}
+
+int socket(int domain, int type, int protocol)
+{
+    return (int)syscall3(SYS_SOCKET, domain, type, protocol);
+}
+
+int bind(int fd, const struct sockaddr *addr, uint32_t addrlen)
+{
+    return (int)syscall3(SYS_BIND, fd, (long)addr, addrlen);
 }
 
 static int inet_is_digit(char ch)

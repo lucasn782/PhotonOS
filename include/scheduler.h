@@ -31,5 +31,7 @@ void scheduler_exit_current(int status);
 int scheduler_fork_current(uint64_t syscall_frame_addr);
 void scheduler_handle_syscall_signals(uint64_t syscall_frame_addr, uint64_t syscall_ret);
 uint64_t scheduler_tick(uint64_t current_rsp);
+int task_alloc_fd(task_t *task, vfs_node_t *node);
+void scheduler_wake_socket(void *sock);
 
 #endif

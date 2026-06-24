@@ -1,8 +1,6 @@
-# PhotonOS 🌌
+# PhotonOS v2.0 🌌
 
-O **PhotonOS** é um sistema operacional monolítico freestanding desenvolvido do zero para a arquitetura **x86_64**, executando em **64-bit Long Mode**. O projeto tem como objetivo explorar os principais conceitos de engenharia de sistemas operacionais modernos, incluindo gerenciamento de memória, multitarefa preemptiva, isolamento de privilégios, sistemas de arquivos persistentes e comunicação em rede.
-
-Atualmente o sistema possui suporte a execução em Ring 3, carregamento de binários ELF, escalonamento multitarefa, armazenamento FAT16, driver PCI Intel e1000 e uma interface Shell própria executando em espaço de usuário.
+O **PhotonOS v2.0** é um sistema operacional monolítico freestanding desenvolvido do zero para a arquitetura **x86_64**, executando em **64-bit Long Mode**. O projeto concluiu com sucesso o seu ciclo de estabilização do Ring 0 e ativação de hardware, fornecendo um kernel robusto com suporte a execução em Ring 3, pipeline gráfico por software, barramento PCI, interface de rede e1000 estável, e uma interface Shell própria executando em espaço de usuário.
 
 ---
 
@@ -29,76 +27,56 @@ PhotonOS/
 
 ## 🚀 Funcionalidades Consolidadas
 
-### Inicialização e Arquitetura
-
+### Inicialização, Modo Longo de 64-bits & Core
+* **GDT e Alinhamento:** Correção do descritor da GDT (`dq` substituindo o antigo `dd`), garantindo a carga linear correta dos 64 bits da base e impedindo falhas de paginação silenciosas.
+* **TSS e Mitigação de Falhas:** Configuração do Interrupt Stack Table (IST1) na TSS apontando para pilha isolada dedicada (`double_fault_stack`), com a flag `idt[8].ist = 1` configurada, impedindo Triple Faults na ocorrência de estouros de pilha de kernel.
 * Bootloader próprio em Assembly x86.
-* Transição de Modo Real (16-bit) para Modo Protegido (32-bit).
-* Entrada em **64-bit Long Mode**.
-* Kernel executando em arquitetura x86_64 freestanding.
+* Transição de Modo Real (16-bit) para Modo Protegido (32-bit) e entrada em **64-bit Long Mode**.
 * Paginação baseada em tabelas PML4.
 
 ### Gerenciamento de Memória
-
-* Gerenciador de memória física (PMM).
-* Gerenciamento de memória virtual (VMM).
-* Kernel Heap dinâmico.
-* Interface de alocação dinâmica via `kmalloc()` e `kfree()`.
+* Gerenciador de memória física (PMM) e de memória virtual (VMM).
+* Kernel Heap dinâmico com interface de alocação via `kmalloc()` e `kfree()`.
 * Mapeamento de memória para processos em espaço de usuário.
 
-### Escalonamento e Concorrência
+### Subsistema Gráfico, Terminal e UI por Software
+* **Pipeline Gráfico:** Ativação do modo VBE em 1024x768x32-bit com mapeamento de alta memória para o Linear Framebuffer (LFB) em `0xFFFFFFFFC0000000` (flags: Cache Disable e Write-Through).
+* **Console Dinâmico:** Substituição de constantes VGA estáticas por uma grade adaptativa orientada a Stride ($128 \times 48$). Implementação de *Deferred Buffering* no backbuffer mapeado em `0xFFFFFFFFC1000000` para otimização de barramento.
+* **Elementos de UI:** Cursor de texto renderizado via software e sprite do mouse em formato de Seta Angular Simétrica ($19 \times 12$), com salvamento e restauração dos pixels subjacentes no backbuffer para evitar rastros.
 
-* Escalonador Round-Robin preemptivo.
-* Troca de contexto baseada em interrupções do PIT.
-* Controle de tarefas do Kernel.
-* Estruturas de escalonamento separadas do subsistema de memória.
-* Mecanismos de sincronização via Mutex.
+### Escalonamento, Concorrência e IPC
+* **Atomicidade em Pipes:** Blindagem de segurança nas rotinas `pipe_read` e `pipe_write` usando exclusão mútua (`pipe->lock` via mutexes) e controle estrito de interrupções, eliminando janelas de vulnerabilidade assíncronas e prevenindo Deadlocks durante o encadeamento de comandos no `/bin/shell`.
+* Escalonador Round-Robin preemptivo baseado em interrupções do PIT.
+* Estruturas de escalonamento isoladas do subsistema de memória e mecanismos de sincronização via Mutex.
 
 ### Espaço de Usuário (Ring 3)
-
-* Isolamento entre Ring 0 e Ring 3.
-* Troca de privilégio utilizando TSS.
+* Isolamento entre Ring 0 e Ring 3 com troca de privilégio utilizando TSS.
 * Syscalls implementadas através de `syscall/sysret` com a macro `SYS_EXIT` mapeada corretamente no ID 5.
 * Carregamento de executáveis ELF de 64 bits.
-* Execução de aplicações independentes em espaço de usuário.
 * **Gerenciamento Dinâmico de Processos**: Suporte nativo a `sys_fork` (Syscall 23) e estabelecimento da trindade POSIX de processos (Fork, Exec, Exit).
 
 ### Sistema de Arquivos
-
-* Driver ATA PIO.
-* Sistema de Arquivos FAT16.
+* Driver ATA PIO e Sistema de Arquivos FAT16.
 * Integração com Virtual File System (VFS) com suporte completo a subdiretórios recursivos e navegação de caminhos.
-* Operações de leitura (`sys_read`) e escrita (`sys_write`) persistentes através de cadeias de clusters (cluster chains).
-* Alocação dinâmica de novos clusters na tabela FAT quando arquivos são expandidos.
-* Sincronização automática de metadados (tamanho e cluster inicial) nas entradas de diretórios de 32 bytes no disco virtual.
+* Operações de leitura (`sys_read`) e escrita (`sys_write`) persistentes através de alocação dinâmica de novos clusters na tabela FAT.
 
 ### Segurança e Robustez (Ring 0 / Ring 3)
-
-* Isolamento entre Ring 0 e Ring 3 com TSS.
-* Syscalls implementadas através de `syscall/sysret`.
-* Hardening de chamadas de sistema de I/O (`sys_read`, `sys_write`, `sys_execve`):
-  * Validação rigorosa dos buffers do espaço de usuário (Ring 3) usando `vmm_is_mapped` antes do acesso em Ring 0.
-  * Cópia de segurança de caminhos e dados via buffers temporários no Kernel Heap (`kmalloc`) para evitar page faults e vulnerabilidades de concorrência.
-  * Limites rígidos de tamanho por bloco de escrita para resguardar a integridade do heap.
+* Hardening de chamadas de sistema de I/O (`sys_read`, `sys_write`, `sys_execve`) com validação de buffers do espaço de usuário (`vmm_is_mapped`) e cópia de segurança em buffers do kernel (`kmalloc`).
 * Restrição absoluta de formatação: proibição do uso de especificadores de formato (`%s`, `%d`, `%x`) no logger interno (`klog`) do Ring 0.
 
-### Pilha de Rede e Sockets POSIX
-
-* **Abstração de Sockets POSIX**: Suporte completo às chamadas de sistema `sys_socket` (ID 24) e `sys_bind` (ID 25) integradas ao Virtual File System (VFS), permitindo a processos de Ring 3 manipular conexões como File Descriptors comuns.
-* **Isolamento Atômico e Sincronização**: Proteção contra condições de corrida e preempção do PIT (INT 0x20) nos buffers circulares dos sockets através de bloqueio atômico de interrupções locais (`save_and_disable_interrupts` / `restore_interrupts`).
-* **Validação Matemática de Checksums**: Verificação de integridade rigorosa de Internet Checksums (IP, ICMP e UDP com pseudo-cabeçalho) em conformidade com a RFC 768.
-* **I/O Não-Bloqueante**: Retorno imediato de `-EAGAIN` (`-11`) em leituras de sockets sem dados disponíveis, eliminando congelamentos de processos no espaço de usuário.
+### Subsistema de Rede & Barramento PCI
+* **Sondagem de Hardware:** Varredura dinâmica de barramento PCI baseada em Class Code (`0x02`) e Subclass Code (`0x00`) para detecção de placas Ethernet via portas `0xCF8`/`0xCFC`.
+* **DMA Físico Puro:** Alocação e alinhamento do anel de descritores RX/TX e buffers de pacotes usando diretamente frames físicos provenientes do PMM (`pmm_alloc`), mapeados no espaço virtual do driver e1000, ativando o recurso de *Bus Mastering* e possibilitando a operação robusta do utilitário `ping` nativo.
+* **Sockets POSIX:** Chamadas de sistema `sys_socket` (ID 24) e `sys_bind` (ID 25) integradas ao VFS com proteção atômica de ring buffers e I/O não-bloqueante (`-EAGAIN`).
+* **Checksums:** Validação de checksums IP, ICMP e UDP (com pseudo-cabeçalho) em conformidade com a RFC 768.
 
 ### Compilação e Otimização do Linker
-
-* Otimização de empacotamento com a flag `-N` (`--nmagic`) no Makefile para os executáveis do initrd.
-* Fusão de seções text/data e desativação de padding de 4KB por página nos ELFs integrados, reduzindo o tamanho de `photon.bin` de **149KB** para **96KB** (respeitando o limite físico estrito de 144KB do boot loader).
+* Otimização de empacotamento com a flag `-N` (`--nmagic`) no Makefile para os executáveis do initrd, reduzindo o tamanho de `photon.bin` para respeitar o limite de 144KB.
 
 ### Console e Utilitários
-
-* Shell interativo no espaço de usuário (/bin/shell) com comandos como `ls`, `ps`, `cat`, `touch`, `write` (escrita direta em arquivos), redirecionamentos (`>`) e suporte a pipes básicos.
+* Shell interativo no espaço de usuário (/bin/shell) com comandos como `ls`, `ps`, `cat`, `touch`, `write`, redirecionamentos (`>`) e suporte a pipes.
 * Biblioteca padrão de usuário (`pulibc`).
 * Programas de teste e demonstração:
-
   * hello
   * upper
   * rev
@@ -114,19 +92,16 @@ PhotonOS/
 | ------------------------------ | -------------- |
 | Bootloader                     | ✅ Estável      |
 | Long Mode x86_64               | ✅ Estável      |
-| PMM                            | ✅ Concluído    |
-| VMM                            | ✅ Concluído    |
-| Heap do Kernel                 | ✅ Concluído    |
+| PMM / VMM / Heap               | ✅ Concluído    |
 | Escalonador e Concorrência     | ✅ Concluído    |
-| Espaço de Usuário e Syscalls   | ✅ 100%        |
+| Espaço de Usuário e Syscalls   | ✅ Concluído    |
 | Loader ELF                     | ✅ Operacional  |
-| ATA PIO                        | ✅ Operacional  |
-| FAT16                          | ✅ Estável      |
-| VFS                            | ✅ Estável      |
-| PCI                            | ✅ Operacional  |
-| Intel e1000                    | ✅ Operacional  |
+| ATA PIO / FAT16 / VFS          | ✅ Estável      |
+| Subsistema Gráfico e UI        | ✅ Concluído    |
+| IPC e Sincronização de Pipes   | ✅ Concluído    |
+| Barramento PCI & Intel e1000   | ✅ Operacional  |
+| Pilha de Rede e Sockets        | ✅ Concluído    |
 | Shell                          | ✅ Operacional  |
-| Pilha de Rede e Hardware       | ✅ Concluído    |
 
 **Métrica Total do Sistema:** 100%
 

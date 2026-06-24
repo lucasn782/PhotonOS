@@ -14,6 +14,8 @@
 #include "serial.h"
 #include "vfs.h"
 #include "vmm.h"
+#include "video.h"
+#include "mouse.h"
 
 #define VGA_WIDTH 80
 #define VGA_HEIGHT 25
@@ -112,6 +114,7 @@ struct tss64 {
 
 extern void keyboard_irq_stub(void);
 extern void timer_irq_stub(void);
+extern void mouse_irq_stub(void);
 extern void tss_install(struct tss64 *tss);
 extern void syscall_entry(void);
 extern void double_fault_stub(void);
@@ -134,6 +137,16 @@ static int keyboard_extended;
 static int keyboard_altgr;
 static uint32_t foreground_pid;
 volatile uint64_t kernel_ticks;
+
+size_t kernel_console_cursor_row(void)
+{
+    return cursor_row;
+}
+
+size_t kernel_console_cursor_col(void)
+{
+    return cursor_col;
+}
 
 struct pipe_buffer {
     uint8_t data[PIPE_BUFFER_SIZE];
@@ -168,65 +181,36 @@ struct syscall_saved_frame {
 };
 
 // US-QWERTY Keymap - Set 1 PS/2 Scancodes
-// Normal characters (without Shift modifier)
 static const char keymap_normal[128] = {
-    // Row 0: Escape and function keys (not used in ASCII)
-    // 0x01 = Escape (handled separately)
-    
-    // Row 1: Number row
     [0x02] = '1', [0x03] = '2', [0x04] = '3', [0x05] = '4',
     [0x06] = '5', [0x07] = '6', [0x08] = '7', [0x09] = '8',
     [0x0A] = '9', [0x0B] = '0', [0x0C] = '-', [0x0D] = '=',
-    
-    // Row 2: QWERTY row
     [0x10] = 'q', [0x11] = 'w', [0x12] = 'e', [0x13] = 'r',
     [0x14] = 't', [0x15] = 'y', [0x16] = 'u', [0x17] = 'i',
     [0x18] = 'o', [0x19] = 'p', [0x1A] = '[', [0x1B] = ']',
-    
-    // Row 3: ASDF row
     [0x1E] = 'a', [0x1F] = 's', [0x20] = 'd', [0x21] = 'f',
     [0x22] = 'g', [0x23] = 'h', [0x24] = 'j', [0x25] = 'k',
     [0x26] = 'l', [0x27] = ';', [0x28] = '\'', [0x29] = '`',
-    
-    // Row 4: ZXCV row
     [0x2B] = '\\', [0x2C] = 'z', [0x2D] = 'x', [0x2E] = 'c',
     [0x2F] = 'v', [0x30] = 'b', [0x31] = 'n', [0x32] = 'm',
-    [0x33] = ',', [0x34] = '.', [0x35] = '/',
-    
-    // Spacebar
-    [0x39] = ' ',
-    
-    // Ensure all other entries are explicitly 0 (NUL)
+    [0x33] = ',', [0x34] = '.', [0x35] = '/', [0x39] = ' ',
     [0x00] = 0, [0x01] = 0, [0x0E] = 0, [0x0F] = 0,
     [0x1C] = 0, [0x1D] = 0, [0x2A] = 0, [0x36] = 0, [0x3A] = 0,
 };
 
-// Shifted characters (with Shift modifier)
 static const char keymap_shift[128] = {
-    // Row 1: Number row + Shift (symbols)
     [0x02] = '!', [0x03] = '@', [0x04] = '#', [0x05] = '$',
     [0x06] = '%', [0x07] = '&', [0x08] = '/', [0x09] = '(',
     [0x0A] = ')', [0x0B] = '=', [0x0C] = '_', [0x0D] = '+',
-    
-    // Row 2: QWERTY row + Shift (uppercase)
     [0x10] = 'Q', [0x11] = 'W', [0x12] = 'E', [0x13] = 'R',
     [0x14] = 'T', [0x15] = 'Y', [0x16] = 'U', [0x17] = 'I',
     [0x18] = 'O', [0x19] = 'P', [0x1A] = '{', [0x1B] = '}',
-    
-    // Row 3: ASDF row + Shift (uppercase + special)
     [0x1E] = 'A', [0x1F] = 'S', [0x20] = 'D', [0x21] = 'F',
     [0x22] = 'G', [0x23] = 'H', [0x24] = 'J', [0x25] = 'K',
     [0x26] = 'L', [0x27] = ':', [0x28] = '"', [0x29] = '~',
-    
-    // Row 4: ZXCV row + Shift (uppercase + pipe symbol)
     [0x2B] = '|', [0x2C] = 'Z', [0x2D] = 'X', [0x2E] = 'C',
     [0x2F] = 'V', [0x30] = 'B', [0x31] = 'N', [0x32] = 'M',
-    [0x33] = '<', [0x34] = '>', [0x35] = '?',
-    
-    // Spacebar (same in shift mode)
-    [0x39] = ' ',
-    
-    // Ensure all other entries are explicitly 0 (NUL)
+    [0x33] = '<', [0x34] = '>', [0x35] = '?', [0x39] = ' ',
     [0x00] = 0, [0x01] = 0, [0x0E] = 0, [0x0F] = 0,
     [0x1C] = 0, [0x1D] = 0, [0x2A] = 0, [0x36] = 0, [0x3A] = 0,
 };
@@ -240,7 +224,6 @@ static const char keymap_altgr[128] = {
 static void memory_set(void *dest, uint8_t value, size_t count)
 {
     uint8_t *bytes = dest;
-
     for (size_t i = 0; i < count; i++) {
         bytes[i] = value;
     }
@@ -277,7 +260,6 @@ static uint64_t rdmsr(uint32_t msr)
 {
     uint32_t low;
     uint32_t high;
-
     __asm__ volatile ("rdmsr" : "=a"(low), "=d"(high) : "c"(msr));
     return ((uint64_t)high << 32) | low;
 }
@@ -286,7 +268,6 @@ static void wrmsr(uint32_t msr, uint64_t value)
 {
     uint32_t low = (uint32_t)value;
     uint32_t high = (uint32_t)(value >> 32);
-
     __asm__ volatile ("wrmsr" : : "c"(msr), "a"(low), "d"(high));
 }
 
@@ -297,6 +278,10 @@ static uint16_t vga_cell(char ch, uint8_t attr)
 
 static void vga_scroll(void)
 {
+    if (video_active) {
+        return;
+    }
+
     if (cursor_row < VGA_HEIGHT) {
         return;
     }
@@ -317,6 +302,10 @@ static void vga_scroll(void)
 
 static void vga_update_hardware_cursor(size_t x, size_t y)
 {
+    if (video_active) {
+        return;
+    }
+
     uint16_t pos = (uint16_t)(y * VGA_WIDTH + x);
 
     outb(VGA_CRTC_ADDRESS, 0x0F);
@@ -326,8 +315,90 @@ static void vga_update_hardware_cursor(size_t x, size_t y)
     outb(VGA_CRTC_DATA, (uint8_t)((pos >> 8) & 0xFF));
 }
 
+static size_t graphic_console_cols(void)
+{
+    uint32_t cols = video_console_cols();
+    return cols == 0 ? 1U : (size_t)cols;
+}
+
+static size_t graphic_console_rows(void)
+{
+    uint32_t rows = video_console_rows();
+    return rows == 0 ? 1U : (size_t)rows;
+}
+
+static void graphic_scroll_if_needed(size_t rows)
+{
+    if (rows == 0) {
+        cursor_row = 0;
+        return;
+    }
+
+    if (cursor_row < rows) {
+        return;
+    }
+
+    video_scroll();
+    cursor_row = rows - 1U;
+}
+
+static void graphic_draw_cell(size_t col, size_t row, char ch)
+{
+    if (video_console_cols() == 0 || video_console_rows() == 0) {
+        return;
+    }
+
+    video_draw_char((int)(col * VIDEO_FONT_WIDTH),
+        (int)(row * VIDEO_FONT_HEIGHT), ch, 0x00FFFFFF, 0x00000000);
+}
+
 static void vga_put_char(char ch)
 {
+    if (video_active) {
+        size_t cols = graphic_console_cols();
+        size_t rows = graphic_console_rows();
+
+        if (ch == '\b') {
+            if (cursor_col > 0) {
+                cursor_col--;
+            } else if (cursor_row > 0) {
+                cursor_row--;
+                cursor_col = cols - 1U;
+            } else {
+                return;
+            }
+            graphic_draw_cell(cursor_col, cursor_row, ' ');
+            return;
+        }
+
+        if (ch == '\n') {
+            cursor_col = 0;
+            cursor_row++;
+            graphic_scroll_if_needed(rows);
+            return;
+        }
+
+        if (ch == '\r') {
+            cursor_col = 0;
+            return;
+        }
+
+        if (cursor_col >= cols) {
+            cursor_col = 0;
+            cursor_row++;
+        }
+        graphic_scroll_if_needed(rows);
+
+        graphic_draw_cell(cursor_col, cursor_row, ch);
+        cursor_col++;
+        if (cursor_col >= cols) {
+            cursor_col = 0;
+            cursor_row++;
+            graphic_scroll_if_needed(rows);
+        }
+        return;
+    }
+
     if (ch == '\b') {
         if (cursor_col > 0) {
             cursor_col--;
@@ -373,6 +444,14 @@ static void vga_put_char(char ch)
 
 static void vga_clear(void)
 {
+    if (video_active) {
+        video_clear(0x00000000);
+        cursor_row = 0;
+        cursor_col = 0;
+        video_swap_buffers();
+        return;
+    }
+
     for (size_t i = 0; i < VGA_WIDTH * VGA_HEIGHT; i++) {
         VGA_MEMORY[i] = vga_cell(' ', 0x07);
     }
@@ -386,6 +465,9 @@ static void vga_puts(const char *str)
 {
     while (*str) {
         vga_put_char(*str++);
+    }
+    if (video_active) {
+        video_swap_buffers();
     }
 }
 
@@ -435,7 +517,6 @@ static void memory_copy(void *dest, const void *src, size_t size)
 {
     uint8_t *out = dest;
     const uint8_t *in = src;
-
     for (size_t i = 0; i < size; i++) {
         out[i] = in[i];
     }
@@ -446,14 +527,11 @@ static int console_read(vfs_node_t *node, uint64_t offset, uint32_t size,
 {
     (void)node;
     (void)offset;
-
     uint32_t read_count = 0;
-
     while (read_count < size &&
         keyboard_queue_pop((char *)&buffer[read_count])) {
         read_count++;
     }
-
     return (int)read_count;
 }
 
@@ -462,12 +540,13 @@ static size_t console_write(vfs_node_t *node, size_t offset, size_t size,
 {
     (void)node;
     (void)offset;
-
     for (size_t i = 0; i < size; i++) {
         vga_put_char((char)buffer[i]);
         serial_putc((char)buffer[i]);
     }
-
+    if (video_active) {
+        video_swap_buffers();
+    }
     return size;
 }
 
@@ -475,7 +554,6 @@ static int pipe_read(vfs_node_t *node, uint64_t offset, uint32_t size,
     uint8_t *buffer)
 {
     (void)offset;
-
     struct pipe_end *end = node->data;
     if (end == 0 || !end->readable || end->pipe == 0) {
         return 0;
@@ -506,7 +584,6 @@ static size_t pipe_write(vfs_node_t *node, size_t offset, size_t size,
     const uint8_t *buffer)
 {
     (void)offset;
-
     struct pipe_end *end = node->data;
     if (end == 0 || !end->writable || end->pipe == 0) {
         return 0;
@@ -550,7 +627,6 @@ static void console_nodes_init(void)
 static void keyboard_queue_push(char ch)
 {
     size_t next = (keyboard_queue_write + 1) % KEYBOARD_QUEUE_SIZE;
-
     if (next == keyboard_queue_read) {
         return;
     }
@@ -623,7 +699,6 @@ static int task_owns_stdin(task_t *task)
     if (task == 0) {
         return 0;
     }
-
     return foreground_pid == 0 || foreground_pid == task->pid;
 }
 
@@ -669,7 +744,6 @@ static int sys_read(int fd, void *buffer, uint32_t size)
     }
 
     if (bytes > 0) {
-        // Validate user pages before writing
         for (uint32_t i = 0; i < (uint32_t)bytes; i += 4096) {
             if (!vmm_is_mapped((uint64_t *)task->cr3, (uintptr_t)buffer + i)) {
                 if (kbuf != 0) kfree(kbuf);
@@ -692,25 +766,46 @@ static int sys_read(int fd, void *buffer, uint32_t size)
     return bytes;
 }
 
+// CORRIGIDO: Fallback de segurança para roteamento garantido do buffer de stdout/stderr gráfico
 static int sys_write(int fd, const uint8_t *buffer, size_t size)
 {
     task_t *task = scheduler_current_task();
 
-    if (task == 0 || fd < 0 || fd >= TASK_MAX_FDS || buffer == 0 ||
-        task->file_descriptors[fd] == 0 ||
+    if (task == 0 || fd < 0 || fd >= TASK_MAX_FDS || buffer == 0) {
+        return -1;
+    }
+
+    /* Fallback definitivo: roteamento atomico em Ring 0 para stdout (1) e stderr (2) */
+    if (fd == 1 || fd == 2) {
+        if (!vmm_is_mapped((uint64_t *)task->cr3, (uintptr_t)buffer)) {
+            return -1;
+        }
+        if (size > 1 && !vmm_is_mapped((uint64_t *)task->cr3, (uintptr_t)buffer + size - 1)) {
+            return -1;
+        }
+
+        for (size_t i = 0; i < size; i++) {
+            vga_put_char((char)buffer[i]);
+            serial_putc((char)buffer[i]);
+        }
+        /* CORRECAO B4: video_swap_buffers chamado UMA unica vez apos o loop
+         * completo, evitando swap duplo que ocorria quando console_write
+         * tambem invocava o swap pelo caminho vfs_write */
+        if (video_active) {
+            video_swap_buffers();
+        }
+        return (int)size;
+    }
+
+    if (task->file_descriptors[fd] == 0 ||
         task->file_descriptors[fd]->write == 0) {
         return -1;
     }
 
-    /* Limita o tamanho por chamada para conter uso de heap. */
     if (size > 4096) {
         size = 4096;
     }
 
-    /*
-     * Validação de segurança: verifica a primeira e a ultima pagina do
-     * buffer de usuario estao mapeadas no espaco de endereçamento do processo.
-     */
     if (!vmm_is_mapped((uint64_t *)task->cr3, (uintptr_t)buffer)) {
         return -1;
     }
@@ -719,10 +814,6 @@ static int sys_write(int fd, const uint8_t *buffer, size_t size)
         return -1;
     }
 
-    /*
-     * Buffer de bounce no Heap do Kernel: isola dados de usuario de Ring 0.
-     * O driver FAT16 escreve a partir deste buffer seguro via ATA PIO.
-     */
     uint8_t *kbuf = kmalloc(size);
     if (kbuf == 0 && size > 0) {
         return -1;
@@ -779,61 +870,38 @@ static int sys_spawn(const char *path)
     return pid;
 }
 
-/*
- * sys_execve - Carrega e executa um binario ELF a partir do VFS.
- *
- * path   : caminho absoluto do executavel (ex: "/bin/hello").
- * argv   : vetor de argumentos terminado em NULL (Ring 3). argv[1] e
- *          concatenado ao path para que elf_load_process possa receber
- *          "path arg" na forma que ja espera.
- * envp   : ignorado nesta versao (reservado para compatibilidade POSIX).
- *
- * Retorna o PID do novo processo ou -1 em caso de falha.
- */
 static int sys_execve(const char *path, const char *const *argv,
     const char *const *envp)
 {
     (void)envp;
-
     task_t *task = scheduler_current_task();
     if (task == 0) {
         return -1;
     }
 
-    /* Copia o caminho do executavel do espaco de usuario. */
     char exec_path[128];
     if (copy_user_path(exec_path, path, sizeof(exec_path)) != 0) {
         return -1;
     }
 
-    /*
-     * Monta a string de comando: "exec_path" ou "exec_path arg1 arg2..."
-     * elf_load_process ja sabe separar o path dos argumentos pelo primeiro
-     * espaco, portanto esta representacao flat e suficiente.
-     */
     char command[256];
     size_t cmd_len = 0;
 
-    /* Copia o caminho para o buffer de comando. */
     for (size_t i = 0; exec_path[i] != '\0' && cmd_len < sizeof(command) - 2U; i++) {
         command[cmd_len++] = exec_path[i];
     }
 
-    /* Concatena argumentos adicionais (argv[1..]) se existirem e estiverem mapeados. */
     if (argv != 0) {
-        /* Percorre a partir de argv[1] (argv[0] e o proprio path). */
         for (size_t argi = 1; cmd_len < sizeof(command) - 2U; argi++) {
-            /* Valida que o ponteiro argv[argi] esta mapeado no espaco do processo. */
             if (!vmm_is_mapped((uint64_t *)task->cr3, (uintptr_t)&argv[argi])) {
                 break;
             }
 
             const char *arg = argv[argi];
             if (arg == 0) {
-                break; /* Sentinela NULL - fim do vetor. */
+                break;
             }
 
-            /* Valida que o conteudo do argumento esta mapeado. */
             if (!vmm_is_mapped((uint64_t *)task->cr3, (uintptr_t)arg)) {
                 break;
             }
@@ -863,11 +931,9 @@ static int sys_execve(const char *path, const char *const *argv,
 static int sys_exit(int status)
 {
     scheduler_exit_current(status);
-
     for (;;) {
         __asm__ volatile ("sti; hlt");
     }
-
     return 0;
 }
 
@@ -935,7 +1001,6 @@ static int sys_kill(int pid, int signum)
 static uint64_t sys_sigreturn(uint64_t syscall_frame)
 {
     task_t *task = scheduler_current_task();
-
     (void)syscall_frame;
 
     if (task == 0 || task->active_signal == 0) {
@@ -1135,14 +1200,12 @@ static uint32_t proc_state_from_task(enum task_state state)
     if (state == TASK_BLOCKED) {
         return PROC_STATE_BLOCKED;
     }
-
     return PROC_STATE_ZOMBIE;
 }
 
 static void proc_copy_name(char *dest, const char *src)
 {
     size_t i = 0;
-
     while (src[i] != '\0' && i < PROC_NAME_MAX - 1U) {
         dest[i] = src[i];
         i++;
@@ -1241,15 +1304,6 @@ static int sys_readdir(int fd, vfs_dir_entry_t *buf, uint32_t count)
     return (int)read_count;
 }
 
-/*
- * sys_fork - Duplica o processo chamador via fork semantico.
- *
- * Nao recebe argumentos de usuario; captura o frame de syscall atual
- * (arg6 = endereço do syscall_frame no kernel stack do pai) para
- * duplicar o estado exato dos registradores da CPU.
- *
- * Retorna o PID do filho para o pai. O filho recebera 0 via iretq.
- */
 static int sys_fork(uint64_t frame_addr)
 {
     return scheduler_fork_current(frame_addr);
@@ -1345,7 +1399,6 @@ uint64_t syscall_handler(uint64_t number, uint64_t arg1, uint64_t arg2,
     }
 
     scheduler_handle_syscall_signals(arg6, ret);
-
     return ret;
 }
 
@@ -1356,6 +1409,9 @@ static void vga_put_u64(uint64_t value)
 
     if (value == 0) {
         vga_put_char('0');
+        if (video_active) {
+            video_swap_buffers();
+        }
         return;
     }
 
@@ -1366,6 +1422,9 @@ static void vga_put_u64(uint64_t value)
 
     while (length > 0) {
         vga_put_char(digits[--length]);
+    }
+    if (video_active) {
+        video_swap_buffers();
     }
 }
 
@@ -1410,10 +1469,8 @@ static void idt_set_gate(uint8_t vector, void (*handler)(void))
 static void idt_load(void)
 {
     struct idt_pointer idtr;
-
     idtr.limit = sizeof(idt) - 1;
     idtr.base = (uint64_t)idt;
-
     __asm__ volatile ("lidt %0" : : "m"(idtr));
 }
 
@@ -1427,9 +1484,15 @@ static void vga_put_hex(uint64_t value)
         value >>= 4;
     }
 
-    vga_puts("0x");
+    /* CORRECAO B3: usa vga_put_char direto para '0' e 'x' evitando
+     * que vga_puts("0x") dispare video_swap_buffers antes dos digitos */
+    vga_put_char('0');
+    vga_put_char('x');
     for (int i = 0; i < 16; i++) {
         vga_put_char(buffer[i]);
+    }
+    if (video_active) {
+        video_swap_buffers();
     }
 }
 
@@ -1463,31 +1526,31 @@ void double_fault_handler(uint64_t rip, uint64_t cs, uint64_t rflags, uint64_t r
     vga_puts("================ KERNEL PANIC: DOUBLE FAULT (INT 0x08) ================\n");
     vga_puts("A pilha de kernel estourou ou ocorreu uma falha grave em Ring 0.\n");
     vga_puts("Estado da CPU no momento da falha:\n");
-    vga_puts("  RIP: "); vga_put_hex(rip); vga_puts("\n");
-    vga_puts("  CS:  "); vga_put_hex(cs);  vga_puts("\n");
-    vga_puts("  RSP: "); vga_put_hex(rsp); vga_puts("\n");
-    vga_puts("  SS:  "); vga_put_hex(ss);  vga_puts("\n");
-    vga_puts("  RFLAGS: "); vga_put_hex(rflags); vga_puts("\n");
-    vga_puts("  Error Code: "); vga_put_hex(error_code); vga_puts("\n");
+    vga_puts("   RIP: "); vga_put_hex(rip); vga_puts("\n");
+    vga_puts("   CS:  "); vga_put_hex(cs);  vga_puts("\n");
+    vga_puts("   RSP: "); vga_put_hex(rsp); vga_puts("\n");
+    vga_puts("   SS:  "); vga_put_hex(ss);  vga_puts("\n");
+    vga_puts("   RFLAGS: "); vga_put_hex(rflags); vga_puts("\n");
+    vga_puts("   Error Code: "); vga_put_hex(error_code); vga_puts("\n");
     vga_puts("\nRegistradores de controle:\n");
-    vga_puts("  CR0: "); vga_put_hex(cr0); vga_puts("\n");
-    vga_puts("  CR2: "); vga_put_hex(cr2); vga_puts("\n");
-    vga_puts("  CR3: "); vga_put_hex(cr3); vga_puts("\n");
-    vga_puts("  CR4: "); vga_put_hex(cr4); vga_puts("\n");
+    vga_puts("   CR0: "); vga_put_hex(cr0); vga_puts("\n");
+    vga_puts("   CR2: "); vga_put_hex(cr2); vga_puts("\n");
+    vga_puts("   CR3: "); vga_put_hex(cr3); vga_puts("\n");
+    vga_puts("   CR4: "); vga_put_hex(cr4); vga_puts("\n");
     vga_puts("========================================================================\n");
 
     klog("\n*** KERNEL PANIC: DOUBLE FAULT (INT 0x08) ***\n");
     klog("Falha grave ou estouro de pilha de kernel detectado.\n");
-    klog("  RIP: "); klog_hex(rip); klog("\n");
-    klog("  CS:  "); klog_hex(cs);  klog("\n");
-    klog("  RSP: "); klog_hex(rsp); klog("\n");
-    klog("  SS:  "); klog_hex(ss);  klog("\n");
-    klog("  RFLAGS: "); klog_hex(rflags); klog("\n");
-    klog("  Error Code: "); klog_hex(error_code); klog("\n");
-    klog("  CR0: "); klog_hex(cr0); klog("\n");
-    klog("  CR2: "); klog_hex(cr2); klog("\n");
-    klog("  CR3: "); klog_hex(cr3); klog("\n");
-    klog("  CR4: "); klog_hex(cr4); klog("\n");
+    klog("   RIP: "); klog_hex(rip); klog("\n");
+    klog("   CS:  "); klog_hex(cs);  klog("\n");
+    klog("   RSP: "); klog_hex(rsp); klog("\n");
+    klog("   SS:  "); klog_hex(ss);  klog("\n");
+    klog("   RFLAGS: "); klog_hex(rflags); klog("\n");
+    klog("   Error Code: "); klog_hex(error_code); klog("\n");
+    klog("   CR0: "); klog_hex(cr0); klog("\n");
+    klog("   CR2: "); klog_hex(cr2); klog("\n");
+    klog("   CR3: "); klog_hex(cr3); klog("\n");
+    klog("   CR4: "); klog_hex(cr4); klog("\n");
     klog("O sistema foi interrompido.\n");
 
     for (;;) {
@@ -1500,6 +1563,7 @@ static void idt_init(void)
     memory_set(idt, 0, sizeof(idt));
     idt_set_gate(IRQ_TIMER_VECTOR, timer_irq_stub);
     idt_set_gate(IRQ_KEYBOARD_VECTOR, keyboard_irq_stub);
+    idt_set_gate(0x2C, mouse_irq_stub); 
     idt_set_gate(8, double_fault_stub);
     idt[8].ist = 1;
     idt_load();
@@ -1527,16 +1591,15 @@ static void pic_init_irqs(void)
     outb(PIC2_DATA, 0x01);
     io_wait();
 
-    outb(PIC1_DATA, 0xFC);
-    outb(PIC2_DATA, 0xFF);
+    outb(PIC1_DATA, 0xF8); 
+    outb(PIC2_DATA, 0xEF); 
 }
 
-static void pic_send_eoi(uint8_t irq)
+void pic_send_eoi(uint8_t irq)
 {
     if (irq >= 8) {
         outb(PIC2_COMMAND, PIC_EOI);
     }
-
     outb(PIC1_COMMAND, PIC_EOI);
 }
 
@@ -1567,14 +1630,12 @@ static task_t *keyboard_foreground_task(void)
         }
         foreground_pid = 0;
     }
-
     return scheduler_current_task();
 }
 
 static void keyboard_send_sigint(void)
 {
     task_t *task = keyboard_foreground_task();
-
     if (task == 0) {
         klog("keyboard_send_sigint: no foreground task\n");
         return;
@@ -1593,31 +1654,25 @@ static void keyboard_handle_scancode(uint8_t scancode)
 
     if (keyboard_extended) {
         keyboard_extended = 0;
-
         if (scancode == 0x38) {
             keyboard_altgr = 1;
             return;
         }
-
         if (scancode == 0xB8) {
             keyboard_altgr = 0;
             return;
         }
-
         return;
     }
 
     if (scancode & 0x80) {
         uint8_t make_code = scancode & 0x7F;
-
         if (make_code == 0x2A || make_code == 0x36) {
             keyboard_shift = 0;
         }
-
         if (make_code == 0x1D) {
             keyboard_ctrl = 0;
         }
-
         return;
     }
 
@@ -1663,7 +1718,6 @@ static void keyboard_flush(void)
         if ((inb(KEYBOARD_STATUS_PORT) & KEYBOARD_OUTPUT_FULL) == 0) {
             break;
         }
-
         (void)inb(KEYBOARD_DATA_PORT);
     }
 }
@@ -1686,7 +1740,6 @@ void keyboard_irq_handler(void)
     if (inb(KEYBOARD_STATUS_PORT) & KEYBOARD_OUTPUT_FULL) {
         keyboard_handle_scancode(inb(KEYBOARD_DATA_PORT));
     }
-
     pic_send_eoi(1);
 }
 
@@ -1697,28 +1750,39 @@ void kmain(void)
     klog("PhotonOS: serial COM1 ativo.\n");
     vga_clear();
     vga_puts("PhotonOS: Kernel em C operando em Long Mode\n");
+    
     pmm_init();
     klog("PMM: inicializado.\n");
     vga_puts("PMM: Gerenciador de memoria fisica ativo. [OK]\n");
     vga_puts("PMM: Memoria livre detectada: ");
     vga_put_u64(pmm_free_memory_mib());
     vga_puts(" MiB\n");
+    
     vmm_init();
     klog("VMM Iniciado.\n");
+    
+    // CORRIGIDO: Força a sincronia limpando os cursores após inicializar o buffer gráfico VBE
+    video_init();
+    vga_clear(); 
+    
     vmm_self_test();
     heap_init();
     klog("Heap: kmalloc/kfree inicializados.\n");
+    
     vfs_init();
     initrd_init();
     if (ata_init()) {
         ata_vfs_init();
     }
+    
     int network_ready = pci_init() == 0;
     console_nodes_init();
     klog("VFS: initrd e armazenamento persistente inicializados.\n");
+    
     tss_init();
     syscall_init();
     klog("Syscall/TSS: estruturas de Ring 3 inicializadas.\n");
+    
     scheduler_init();
     if (network_ready) {
         if (scheduler_create_task(net_kernel_thread) >= 0) {
@@ -1727,6 +1791,7 @@ void kmain(void)
             klog("NET: falha ao registrar thread de rede.\n");
         }
     }
+    
     int shell_pid = elf_load_process("/bin/shell", 0);
     if (shell_pid >= 0) {
         foreground_pid = (uint32_t)shell_pid;
@@ -1738,8 +1803,10 @@ void kmain(void)
     } else {
         klog("ELF: falha ao carregar /bin/shell.\n");
     }
+    
     klog("Scheduler: Round-Robin com shell ELF inicializado.\n");
     keyboard_init();
+    mouse_init();
     interrupts_enable();
 
     for (;;) {
