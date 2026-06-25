@@ -8,12 +8,14 @@
 #define PAGE_USER     (1U << 2)
 #define PAGE_WRITE_THROUGH (1U << 3)
 #define PAGE_CACHE_DISABLE (1U << 4)
+#define PAGE_COW      (1ULL << 9)
 
 #define VMM_PRESENT  (1U << 0)
 #define VMM_WRITABLE (1U << 1)
 #define VMM_USER     (1U << 2)
 #define VMM_WRITE_THROUGH (1U << 3)
 #define VMM_CACHE_DISABLE (1U << 4)
+#define VMM_COW      (1ULL << 9)
 
 #define VMM_PAGE_PRESENT VMM_PRESENT
 #define VMM_PAGE_WRITE   VMM_WRITABLE
@@ -33,6 +35,7 @@ void vmm_map_in_space(uint64_t *pml4, uintptr_t virtual_addr,
 int vmm_is_mapped(uint64_t *pml4, uintptr_t virtual_addr);
 void vmm_switch_address_space(uint64_t *pml4);
 uint64_t *vmm_clone_address_space(uint64_t *parent_pml4);
+void vmm_page_fault_handler(uint64_t error_code, uintptr_t fault_addr, uintptr_t rip);
 
 static inline void vmm_flush_tlb(uintptr_t addr)
 {

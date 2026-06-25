@@ -14,5 +14,7 @@ void spin_unlock(spinlock_t *lock);
 void smp_init(void);
 void smp_boot_ap(uint8_t ap_id);
 void ap_kmain(uint64_t ap_id);
+int smp_ap_booted_count(void);
+void smp_tlb_shootdown_handler(void);
 
 #endif

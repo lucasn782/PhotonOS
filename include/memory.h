@@ -10,6 +10,8 @@
 void pmm_init(void);
 void *pmm_alloc(void);
 void pmm_free(void *ptr);
+void pmm_ref_inc(void *ptr);
+uint32_t pmm_ref_get(void *ptr);
 
 uint64_t pmm_total_blocks(void);
 uint64_t pmm_reserved_blocks(void);

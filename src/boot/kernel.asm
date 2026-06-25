@@ -9,6 +9,8 @@ global switch_to
 global tss_install
 global syscall_entry
 global double_fault_stub
+global page_fault_stub
+global tlb_shootdown_stub
 extern kmain
 extern keyboard_irq_handler
 extern scheduler_tick
@@ -16,6 +18,8 @@ extern syscall_handler
 extern syscall_kernel_rsp0
 extern double_fault_handler
 extern mouse_handler
+extern vmm_page_fault_handler
+extern smp_tlb_shootdown_handler
 
 KERNEL_BASE equ 0x00008000
 
@@ -341,6 +345,98 @@ double_fault_stub:
     ; double_fault_handler never returns (infinite hlt loop), but for safety:
     mov rsp, rbp
     add rsp, 8           ; skip error code
+    iretq
+
+
+page_fault_stub:
+    ; CPU pushed error code at [rsp], RIP at [rsp+8]
+    ; Let's push all registers to preserve them.
+    push rax
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push rbp
+    push r8
+    push r9
+    push r10
+    push r11
+    push r12
+    push r13
+    push r14
+    push r15
+
+    mov rdi, [rsp + 120]    ; arg1: error_code
+    mov rsi, cr2            ; arg2: fault_addr (CR2)
+    mov rdx, [rsp + 128]    ; arg3: faulting RIP
+
+    mov rbp, rsp
+    sub rsp, 8
+    and rsp, -16
+    cld
+    call vmm_page_fault_handler
+    mov rsp, rbp
+
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rbp
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+
+    add rsp, 8              ; skip error code
+    iretq
+
+
+tlb_shootdown_stub:
+    push rax
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push rbp
+    push r8
+    push r9
+    push r10
+    push r11
+    push r12
+    push r13
+    push r14
+    push r15
+
+    mov rbp, rsp
+    sub rsp, 8
+    and rsp, -16
+    cld
+    call smp_tlb_shootdown_handler
+    mov rsp, rbp
+
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rbp
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
     iretq
 
 

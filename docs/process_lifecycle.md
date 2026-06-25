@@ -1,6 +1,6 @@
-# Ciclo de Vida de Processos e IPC no PhotonOS v2.0
+# Ciclo de Vida de Processos e Otimização de Memória via COW no PhotonOS v3.1
 
-Este documento descreve detalhadamente o ciclo de vida dos processos no PhotonOS v2.0, incluindo a implementação do mecanismo de bifurcação de processos (`sys_fork`), clonagem do espaço de endereçamento virtual (VMM/PMM), contexto de execução do filho, consolidação da trindade POSIX (Fork, Exec, Exit) e a especificação de sincronização atômica em IPC (Pipes).
+Este documento descreve detalhadamente o ciclo de vida dos processos no PhotonOS v3.1, incluindo a implementação do mecanismo de bifurcação de processos (`sys_fork`) com **Copy-On-Write (COW)**, clonagem preguiçosa do espaço de endereçamento virtual, contador de referências de frames físicos no PMM, tratamento da exceção `INT 0x0E` e consistncia multicore via TLB Shootdown. Para a documentação completa do mecanismo COW, consulte [`docs/cow_memory_optimization.md`](cow_memory_optimization.md).
 
 ---
 
@@ -35,31 +35,68 @@ O fluxo se inicia no espaço de usuário quando um programa invoca `fork()`. A c
 
 ---
 
-## 3. Clonagem do Espaço de Endereçamento (`vmm_clone_address_space`)
+## 3. Clonagem do Espaço de Endereçamento via Copy-On-Write (`vmm_clone_address_space`)
 
-Para isolar o processo filho e garantir que suas alterações na memória não corrompam o processo pai, a rotina realiza uma clonagem profunda (*deep-copy*) do espaço virtual de endereços.
+A partir da v3.1, a rotina `vmm_clone_address_space` opera sob o paradigma de **Clonagem Preguiçosa** (*Lazy Page Cloning*): em vez de duplicar fisicamente o conteúdo de cada frame de usuário no momento do `fork`, o kernel faz pai e filho compartilharem os **mesmos frames físicos**, postergando a cópia até que uma escrita efetiva ocorra.
 
-O isolamento é dividido em duas grandes regiões da tabela de páginas PML4:
+O isolamento continua dividido em duas grandes regiões da tabela de páginas PML4:
 
-### A. Higher-Half (Kernel) e Identity Map (Boot) - Cópia por Referência
-*   **Entrada 0 (Identity Map de Boot)**: A entrada `0` da PML4 do pai, que cobre o mapeamento direto de estruturas de boot e o MMIO do controlador de rede e1000, é copiada diretamente (por referência) para a entrada `0` do filho:
+### A. Higher-Half (Kernel) e Identity Map (Boot) — Cpia por Referência (inalterado)
+*   **Entrada 0 (Identity Map de Boot)**: Copiada diretamente por referência — cobre estruturas de boot precoce e o MMIO do driver e1000.
     ```c
     child_pml4[0] = parent_pml4[0];
     ```
-*   **Entradas 256 a 511 (Higher-Half)**: Toda a área superior correspondente ao Kernel (heap do kernel, MMIO de dispositivos, APIC, etc.) é compartilhada entre todos os processos. Essas entradas são copiadas por referência direta:
+*   **Entradas 256 a 511 (Higher-Half)**: Compartilhadas por referência direta — cobrem o heap do kernel, o framebuffer gráfico, o LAPIC e todos os mapeamentos Ring 0. Estas entradas **nunca** são submetidas ao protocolo COW.
     ```c
     for (int i = 256; i < 512; i++) {
         child_pml4[i] = parent_pml4[i];
     }
     ```
 
-### B. Lower-Half (Espaço de Usuário) - Deep-Copy por Página
-As entradas de índice `1` a `255` representam o espaço virtual do usuário. O sistema realiza uma varredura hierárquica completa em 4 níveis (PML4 → PDPT → PD → PT) para encontrar todas as páginas físicas mapeadas com o bit de privilégio de usuário (`VMM_USER`).
+### B. Lower-Half (Espaço de Usuário) — Clonagem COW (v3.1)
+As entradas de índice `1` a `255` representam o espaço virtual do usuário. A varredura hierárquica de 4 níveis (PML4 → PDPT → PD → PT) permanece idêntica, mas a semântica de cada PTE válida encontrada é radicalmente diferente:
 
-Quando uma página virtual de usuário válida é encontrada no processo pai:
-1.  **Alocação Física**: O kernel aloca um novo frame físico de 4096 bytes via PMM (`pmm_alloc()`).
-2.  **Cópia de Conteúdo**: O conteúdo do frame do pai é inteiramente copiado para o novo frame físico do filho.
-3.  **Mapeamento**: O novo frame é mapeado na tabela de páginas do filho no mesmo endereço virtual correspondente (`virt`), herdando as flags originais (ex: `PAGE_PRESENT`, `PAGE_WRITABLE`, `PAGE_USER`).
+Para cada PTE de usuário válida encontrada no processo pai:
+1.  **Degradação de Privilégio**: Se a página possui `PAGE_WRITABLE` (bit 1), o kernel remove essa flag e seta `PAGE_COW` (bit 9 = `0x200`) na PTE **do pai**.
+2.  **Mapeamento Compartilhado**: O mesmo endereço físico (`phys_addr`) é mapeado na PML4 do filho com as mesmas flags ajustadas — **nenhum novo frame é alocado**.
+3.  **Invalidao do TLB Local**: `vmm_flush_tlb(virt)` invalida seletivamente a entrada TLB do BSP via `invlpg`.
+4.  **Incremento de Refcount**: `pmm_ref_inc(phys_addr)` incrementa o contador de referências do frame compartilhado no array `pmm_refcounts`.
+
+```c
+/* vmm.c — protocolo COW por PTE */
+if (flags & PAGE_WRITABLE) {
+    flags &= ~PAGE_WRITABLE;      /* Remove escrita */
+    flags |=  PAGE_COW;           /* Seta bit COW (0x200) */
+    parent_pt[pt_i] = phys_addr | flags;   /* Modifica PTE do pai */
+}
+map_in_pml4(child_pml4, virt, phys_addr, (uint32_t)flags);
+vmm_flush_tlb(virt);
+pmm_ref_inc((void *)phys_addr);
+```
+
+Após a conclusão da varredura, se há APs ativos, o kernel emite um **TLB Shootdown IPI** (Vector `0x79`) via LAPIC broadcast para garantir que todos os núcleos descartam entradas TLB obsoletas. Veja a Seção 3B.
+
+---
+
+## 3B. Tratamento de Escrita em Página COW — `vmm_page_fault_handler` (`INT 0x0E`)
+
+Quando um processo (pai ou filho) tenta **escrever** em uma página marcada com `PAGE_COW`, a CPU gera uma exceção de Page Fault (`#PF`, `INT 0x0E`) porque `PAGE_WRITABLE` foi removido. O handler intercepta a falha e executa a separação física das páginas:
+
+### Critérios de Validação COW
+A exceção é tratada como COW apenas se **ambas** as condições forem verdadeiras:
+- `error_code & 0x02` — a falha foi gerada por uma **operação de escrita** (bit 1 do código de erro).
+- `pte & PAGE_COW` — a PTE do endereço em `CR2` possui o bit `0x200` setado.
+
+### Lógica de Divisão de Frame (*Page Splitting*)
+
+| Caso | Condição | Ação |  
+|------|-----------|------|
+| **Frame Compartilhado** | `pmm_ref_get(old_frame) > 1` | Aloca novo frame via PMM, copia 4 KiB, atualiza PTE com `PAGE_WRITABLE` e decrementa refcount do frame antigo via `pmm_free` |
+| **Frame Exclusivo** | `pmm_ref_get(old_frame) == 1` | Restaura `PAGE_WRITABLE` e limpa `PAGE_COW` in-place — sem nova alocação |
+
+Em ambos os casos, `vmm_flush_tlb(fault_addr)` invalida a entrada TLB local antes do retorno ao usuário via `iretq`.
+
+Consulte [`docs/cow_memory_optimization.md §4`](cow_memory_optimization.md) para o detalhamento completo do fluxo assembly e C do handler.
 
 ---
 

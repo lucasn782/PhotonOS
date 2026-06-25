@@ -1,33 +1,68 @@
-# 📚 PhotonOS Keyboard Driver v2 - Documentation Index
+# 📚 Índice de Documentação Técnica do PhotonOS v3.1
 
 ## 🎯 Start Here
 
-**For the quickest overview:**
-→ [IMPLEMENTATION_SUMMARY.md](IMPLEMENTATION_SUMMARY.md) - 5-minute executive summary
+**Para a especificação mais recente do sistema (COW / v3.1):**
+→ [cow_memory_optimization.md](cow_memory_optimization.md) — Especificação técnica completa do Copy-On-Write
 
-**For quick answers:**
-→ [QUICK_REFERENCE_KEYBOARD_V2.md](QUICK_REFERENCE_KEYBOARD_V2.md) - Common commands and troubleshooting
+**Para o ciclo de vida de processos e bifurcação:**
+→ [process_lifecycle.md](process_lifecycle.md) — Fork, COW, IPC e sincronização atômica
 
-**For complete details:**
-→ [README_KEYBOARD_DRIVER_V2.md](README_KEYBOARD_DRIVER_V2.md) - Full implementation guide
+**Para a arquitetura SMP e protocolo APIC/IPI:**
+→ [smp.md](smp.md) — Bootstrap de núcleos AP, LAPIC, TLB Shootdown
+
+**Para a arquitetura núcleo e gráficos:**
+→ [core_and_graphics_architecture.md](core_and_graphics_architecture.md)
+
+**Para resumo executivo do driver de teclado:**
+→ [IMPLEMENTATION_SUMMARY.md](IMPLEMENTATION_SUMMARY.md)
+
+---
+
+## 📖 Documentação Técnica Principal (PhotonOS v3.1)
+
+### 0. cow_memory_optimization.md — `[NOVO — v3.1]`
+**Propósito:** Especificação técnica completa do mecanismo Copy-On-Write  
+**Escopo:** PMM (refcounts), VMM (clone COW), IDT (INT 0x0E), SMP (TLB Shootdown)  
+**Público:** Engenheiros de sistemas operacionais, revisores de código Ring 0  
+**Conteúdo:**
+- Motivação e comparação com deep-copy
+- Array `pmm_refcounts`: estrutura, inicialização, alocação e liberação condicional
+- Protocolo COW em `vmm_clone_address_space`: manipulação de flags de PTE (`PAGE_COW = 0x200`)
+- Fluxo assembly `page_fault_stub` e rotina C `vmm_page_fault_handler`
+- Lógica de page splitting (refcount > 1 vs refcount == 1)
+- TLB Shootdown via LAPIC IPI (Vector `0x79`) em ambientes SMP
+- Tabela de impacto de performance e invariantes Ring 0
+
+**Leia este se:** Você precisa entender a otimização de memória da v3.1 em profundidade.
 
 ---
 
-## 📖 Documentation Overview
+### 1. process_lifecycle.md — `[ATUALIZADO — v3.1]`
+**Propósito:** Ciclo de vida de processos com COW, IPC e sincronização  
+**Conteúdo:**
+- Fluxo de `sys_fork` (Syscall 23) do espaço de usuário até Ring 0
+- Clonagem COW preguiçosa em `vmm_clone_address_space`
+- Handler de Page Fault COW (`INT 0x0E`)
+- Regra de Ouro do Fork (RAX = 0 no filho)
+- `sys_exit` / `sys_wait` e liberação segura de frames compartilhados
+- Sincronização atômica em Pipes (IPC)
 
-### 1. IMPLEMENTATION_SUMMARY.md
-**Purpose:** Executive summary of the entire implementation  
-**Length:** ~3-4 pages  
-**For:** Decision makers, quick overview seekers  
-**Contains:**
-- What was accomplished
-- Key metrics
-- Quick start guide
-- Verification checklist
-
-**Read this if:** You want a 5-minute understanding
+**Leia este se:** Você precisa entender o pipeline completo de bifurcação de processos.
 
 ---
+
+### 2. smp.md
+**Propósito:** Multiprocessamento Simétrico — bootstrap de núcleos AP  
+**Conteúdo:**
+- Protocolo INIT-SIPI via LAPIC ICR
+- Código trampolim em `0x7000`
+- Spinlocks atômicos e `ap_kmain`
+- `smp_tlb_shootdown_handler` (Vector `0x79`) — integração com COW
+
+---
+
+## 📖 Documentação Legada (Keyboard Driver v2)
 
 ### 2. README_KEYBOARD_DRIVER_V2.md
 **Purpose:** Complete implementation and deployment guide  
@@ -205,10 +240,10 @@
 
 ## 📋 Quick Command Reference
 
-### Compilation
+### Compilação (WSL Unificado)
 ```bash
-# See: README_KEYBOARD_DRIVER_V2.md § Build & Compilation
-make clean && make all && make fat16-disk
+# Build completo: limpeza + compilação + imagem de disco FAT16
+make clean; make; make fat16-disk
 ```
 
 ### Testing

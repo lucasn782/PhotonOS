@@ -1,6 +1,6 @@
-# PhotonOS v3.0 🌌
+# PhotonOS v3.1 🌌
 
-O **PhotonOS v3.0** é um sistema operacional monolítico freestanding desenvolvido do zero para a arquitetura **x86_64**, executando em **64-bit Long Mode**. O projeto homologou com sucesso o seu ciclo de suporte nativo a **Multiprocessamento Simétrico (SMP)** na Trilha 8, consolidando um núcleo multi-core resiliente integrado com execução em Ring 3, pipeline gráfico por software, barramento PCI, interface de rede e1000 estável e console interativo no espaço de usuário.
+O **PhotonOS v3.1** é um sistema operacional monolítico freestanding desenvolvido do zero para a arquitetura **x86_64**, executando em **64-bit Long Mode**. O projeto homologou com sucesso o mecanismo de **Copy-On-Write (COW) para `sys_fork`** na Trilha 9, completando o ciclo de otimização do Gerenciador de Memória Virtual (VMM) e consolidando um núcleo multi-core resiliente integrado com execução em Ring 3, pipeline gráfico por software, barramento PCI, interface de rede e1000 estável e console interativo no espaço de usuário.
 
 ---
 
@@ -27,8 +27,17 @@ PhotonOS/
 
 ## 🚀 Funcionalidades Consolidadas
 
-### ⚡ Multiprocessamento Simétrico (SMP) - V3.0 [NOVO]
+### 🧠 Otimização de Memória: Copy-On-Write (COW) — V3.1 [NOVO]
 > [!IMPORTANT]
+> **Copy-On-Write para `sys_fork`:** O PhotonOS v3.1 implementa o mecanismo de COW no Gerenciador de Memória Virtual, eliminando a duplicação física imediata de frames de memória durante o `fork`. Pai e filho compartilham os mesmos frames físicos de 4 KiB até que uma escrita efetiva ocorra, disparando a separação preguiçosa de páginas via exceção de Page Fault (`INT 0x0E`).
+* **Contador de Referências no PMM (`pmm_refcounts`):** Array estático de `uint32_t` indexado pelo número de frame físico (PFN), rastreando o grau de compartilhamento dos 32.768 frames de 4 KiB. `pmm_alloc` inicializa o contador em `1`; `pmm_free` decrementa e só devolve o frame ao pool livre quando o contador atinge zero.
+* **Clonagem Preguiçosa de Páginas (`vmm_clone_address_space`):** Durante o `fork`, em vez de alocar e copiar cada frame de usuário, o kernel modifica as PTEs do pai e cria as PTEs do filho apontando para o **mesmo frame físico**: remove `PAGE_WRITABLE` (bit 1) e seta `PAGE_COW` (bit 9 = `0x200`) em ambas as entradas. Nenhuma alocação de memória extra ocorre.
+* **Tratador de Falha de Página COW (`vmm_page_fault_handler`):** Intercepta exceções `#PF` (`INT 0x0E`) causadas por escrita em páginas COW. Valida o código de erro (bit 1 setado) e o bit `PAGE_COW` na PTE. Se `refcount > 1`: aloca novo frame, copia 4 KiB, atualiza a PTE com `PAGE_WRITABLE` e decrementa o refcount do frame antigo. Se `refcount == 1`: restaura `PAGE_WRITABLE` in-place sem alocação extra.
+* **Consistência Multicore — TLB Shootdown via LAPIC (`Vector 0x79`):** Após a modificação das PTEs do pai no fork, o kernel verifica se há APs ativos (`smp_ap_booted_count()`) e emite um IPI broadcast via ICR do LAPIC. O handler `smp_tlb_shootdown_handler` em cada AP recarrega o CR3 para flush completo do TLB local e emite EOI.
+* **Invariante de Kernel:** Páginas do Higher-Half (entradas 256–511 da PML4) e da identity map de boot (entrada 0) jamais são submetidas ao protocolo COW — somente o espaço de usuário (entradas 1–255) é afetado.
+
+### ⚡ Multiprocessamento Simétrico (SMP) - V3.0
+> [!NOTE]
 > **Arquitetura Multi-Core Nativa:** O PhotonOS v3.0 oferece suporte a multiprocessamento simétrico na arquitetura x86_64. O Bootstrap Processor (BSP) gerencia a descoberta e a inicialização física individual dos Application Processors (APs), possibilitando a execução paralela em Ring 0.
 * **Ecossistema APIC Nativo:** Desativação completa do controlador PIC 8259 legado (mascarando todas as linhas de interrupção nas portas de I/O `0x21` e `0xA1`) e ativação do Local APIC (LAPIC) para permitir o envio de interrupções interprocessador (IPIs) e suporte futuro ao I/O APIC.
 * **Código Trampolim Alocado em `0x7000`:** Copiado dinamicamente como um blob binário de 16 bits para o endereço físico `0x7000` (garantido pelo mapeamento de identidade), servindo como ponto de entrada em Modo Real e guiando os APs na transição segura para o Modo Longo de 64 bits.
@@ -97,10 +106,10 @@ PhotonOS/
 
 ## 📊 Status do Projeto & Ecossistema de Trilhas
 
-O desenvolvimento do PhotonOS é estruturado em trilhas de aprendizado e implementação de engenharia de software de baixo nível. Com a homologação bem-sucedida do multiprocessamento, todas as oito trilhas principais do sistema estão concluídas.
+O desenvolvimento do PhotonOS é estruturado em trilhas de aprendizado e implementação de engenharia de software de baixo nível. Com a homologação bem-sucedida do mecanismo de Copy-On-Write, todas as nove trilhas principais do sistema estão concluídas.
 
 **Progresso Geral do Sistema:**
-`[██████████████████████████████████████████████████]` **100% Concluído (V3.0)**
+`[██████████████████████████████████████████████████]` **100% Concluído (V3.1)**
 
 ### 🛣️ Ecossistema de Trilhas de Engenharia
 
@@ -113,7 +122,8 @@ O desenvolvimento do PhotonOS é estruturado em trilhas de aprendizado e impleme
 | **Trilha 5** | Processos, Escalonamento Preemptivo (Round-Robin) e Espaço de Usuário | 100% | v2.0 |
 | **Trilha 6** | Armazenamento (ATA PIO), Sistema de Arquivos FAT16 e VFS POSIX | 100% | v2.0 |
 | **Trilha 7** | Subsistema Gráfico VBE, Double Buffering e Barramento PCI/Driver e1000 | 100% | v2.0 |
-| **Trilha 8** | **Multiprocessamento Simétrico (SMP): Suporte Multi-Core Nativo** | 100% | v3.0 |
+| **Trilha 8** | Multiprocessamento Simétrico (SMP): Suporte Multi-Core Nativo | 100% | v3.0 |
+| **Trilha 9** | **Otimização de Memória Virtual: Copy-On-Write (COW) para `sys_fork`** | **100%** | **v3.1** |
 
 ---
 
@@ -121,24 +131,22 @@ O desenvolvimento do PhotonOS é estruturado em trilhas de aprendizado e impleme
 
 ### Dependências
 
-* GCC Cross Compiler
-* Binutils
+* GCC Cross Compiler (x86_64-elf-gcc)
+* Binutils (x86_64-elf-ld)
 * NASM
 * Make
 * QEMU
+* WSL (Windows Subsystem for Linux) — recomendado para ambiente Windows
 
-### Build Completo
+### Build Unificado (WSL)
 
-```bash
-make clean
-make
-```
-
-### Geração do Disco FAT16
+O comando unificado abaixo realiza a limpeza completa do ambiente de build, compila todos os componentes do kernel e gera a imagem de disco FAT16:
 
 ```bash
-make fat16-disk
+make clean; make; make fat16-disk
 ```
+
+> **Nota WSL**: Em ambientes Windows, utilize ponto e vírgula (`;`) como separador de comandos no PowerShell. Para shells POSIX (bash/zsh no WSL), `&&` também é aceito.
 
 ---
 
@@ -188,7 +196,14 @@ qemu-system-x86_64 ^
 
 ## 🕒 Changelog / Linha do Tempo
 
-### `v3.0` - The SMP Update 🚀 (Versão Atual)
+### `v3.1` - The COW Memory Optimization Update 🧠 (Versão Atual)
+* **Copy-On-Write (COW) para `sys_fork`:** Implementação completa do mecanismo de compartilhamento preguiçoso de páginas físicas entre processos pai e filho durante a bifurcação.
+* **Contador de Referências no PMM (`pmm_refcounts`):** Array estático de `uint32_t` indexando os 32.768 frames físicos de 4 KiB — integrado a `pmm_alloc` e `pmm_free` com semântica de decremento atômico.
+* **Handler de Page Fault COW (`INT 0x0E`):** Registro de `page_fault_stub` na IDT (vetor 14) e implementação de `vmm_page_fault_handler` com lógica de divisão de frame (*page splitting*) baseada no refcount.
+* **TLB Shootdown via LAPIC (Vector `0x79`):** Sincronização multicore via IPI broadcast após modificação de PTEs no fork, garantindo coerência do TLB em todos os núcleos AP ativos.
+* **Flags de PTE Customizadas:** `PAGE_COW` (`0x200`, bit 9) definido no OS-Available field da PTE x86_64 — compatível com o Intel SDM Vol. 3A §4.5.
+
+### `v3.0` - The SMP Update 🚀
 * **Multiprocessamento Simétrico (SMP):** Suporte nativo a múltiplos núcleos de processamento (BSP + APs) com sincronização e inicialização de hardware avançada.
 * **Ecossistema APIC:** Desativação do PIC 8259 legado (portas `0x21` e `0xA1`) e ativação do Local APIC (LAPIC) no BSP e APs.
 * **Código Trampolim em 0x7000:** Bootstrap de processadores secundários de Modo Real de 16-bit para Modo Longo de 64-bit.

@@ -121,6 +121,8 @@ extern void mouse_irq_stub(void);
 extern void tss_install(struct tss64 *tss);
 extern void syscall_entry(void);
 extern void double_fault_stub(void);
+extern void page_fault_stub(void);
+extern void tlb_shootdown_stub(void);
 
 static size_t cursor_row;
 static size_t cursor_col;
@@ -1572,6 +1574,8 @@ static void idt_init(void)
     idt_set_gate(0x2C, mouse_irq_stub); 
     idt_set_gate(8, double_fault_stub);
     idt[8].ist = 1;
+    idt_set_gate(14, page_fault_stub);
+    idt_set_gate(0x79, tlb_shootdown_stub);
     idt_load();
 }
 

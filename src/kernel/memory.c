@@ -8,6 +8,7 @@
 extern uint8_t __kernel_end[];
 
 static uint64_t pmm_bitmap[PMM_BITMAP_WORDS];
+static uint32_t pmm_refcounts[PMM_MAX_BLOCKS];
 static uint64_t pmm_total_block_count;
 static uint64_t pmm_reserved_block_count;
 
@@ -38,6 +39,9 @@ void pmm_init(void)
     for (uint64_t i = 0; i < PMM_BITMAP_WORDS; i++) {
         pmm_bitmap[i] = 0;
     }
+    for (uint64_t i = 0; i < PMM_MAX_BLOCKS; i++) {
+        pmm_refcounts[i] = 0;
+    }
 
     uint64_t reserved_end = align_up(PMM_RESERVED_END, PMM_PAGE_SIZE);
     uint64_t kernel_end = align_up((uint64_t)__kernel_end, PMM_PAGE_SIZE);
@@ -52,6 +56,7 @@ void pmm_init(void)
 
     for (uint64_t i = 0; i < pmm_reserved_block_count; i++) {
         bitmap_set(i);
+        pmm_refcounts[i] = 1;
     }
 }
 
@@ -60,6 +65,7 @@ void *pmm_alloc(void)
     for (uint64_t i = 0; i < pmm_total_block_count; i++) {
         if (!bitmap_test(i)) {
             bitmap_set(i);
+            pmm_refcounts[i] = 1;
             return (void *)(i * PMM_PAGE_SIZE);
         }
     }
@@ -79,7 +85,42 @@ void pmm_free(void *ptr)
         return;
     }
 
-    bitmap_clear(block);
+    if (pmm_refcounts[block] > 0) {
+        pmm_refcounts[block]--;
+        if (pmm_refcounts[block] == 0) {
+            bitmap_clear(block);
+        }
+    }
+}
+
+void pmm_ref_inc(void *ptr)
+{
+    uint64_t address = (uint64_t)ptr;
+    if ((address % PMM_PAGE_SIZE) != 0) {
+        return;
+    }
+
+    uint64_t block = address / PMM_PAGE_SIZE;
+    if (block >= pmm_total_block_count) {
+        return;
+    }
+
+    pmm_refcounts[block]++;
+}
+
+uint32_t pmm_ref_get(void *ptr)
+{
+    uint64_t address = (uint64_t)ptr;
+    if ((address % PMM_PAGE_SIZE) != 0) {
+        return 0;
+    }
+
+    uint64_t block = address / PMM_PAGE_SIZE;
+    if (block >= pmm_total_block_count) {
+        return 0;
+    }
+
+    return pmm_refcounts[block];
 }
 
 uint64_t pmm_total_blocks(void)

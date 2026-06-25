@@ -3,6 +3,9 @@
 #include <stddef.h>
 
 #include "memory.h"
+#include "smp.h"
+#include "apic.h"
+#include "serial.h"
 
 #define VMM_PAGE_SIZE 4096ULL
 #define VMM_PAGE_MASK (~(VMM_PAGE_SIZE - 1ULL))
@@ -358,7 +361,7 @@ uint64_t *vmm_clone_address_space(uint64_t *parent_pml4)
         child_pml4[i] = parent_pml4[i];
     }
 
-    /* Lower-half de usuario (1-255): deep-copy por pagina. */
+    /* Lower-half de usuario (1-255): compartilhamento via COW. */
     for (uintptr_t pml4_i = 1; pml4_i < 256; pml4_i++) {
         if ((parent_pml4[pml4_i] & VMM_PAGE_PRESENT) == 0 ||
             (parent_pml4[pml4_i] & VMM_USER) == 0 ||
@@ -404,28 +407,119 @@ uint64_t *vmm_clone_address_space(uint64_t *parent_pml4)
                     uintptr_t virt = (pml4_i << 39) | (pdpt_i << 30) |
                                      (pd_i   << 21) | (pt_i   << 12);
 
-                    /* Aloca novo frame fisico para o filho. */
-                    void *child_frame = pmm_alloc();
-                    if (child_frame == NULL) {
-                        /* Falha de memoria: retorna NULL sem destruir parcialmente. */
-                        return NULL;
+                    uint64_t parent_entry = parent_pt[pt_i];
+                    uint64_t phys_addr = parent_entry & VMM_ENTRY_ADDR_MASK;
+                    uint64_t flags = parent_entry & VMM_ENTRY_FLAGS_MASK;
+
+                    /* Se a pagina for gravavel, aplica-se COW */
+                    if (flags & PAGE_WRITABLE) {
+                        flags &= ~PAGE_WRITABLE;
+                        flags |= PAGE_COW;
+                        parent_pt[pt_i] = phys_addr | flags;
                     }
 
-                    /* Copia profunda: 4096 bytes do frame do pai -> frame do filho. */
-                    uint64_t parent_phys = parent_pt[pt_i] & VMM_ENTRY_ADDR_MASK;
-                    uint8_t *src = (uint8_t *)parent_phys;
-                    uint8_t *dst = (uint8_t *)child_frame;
-                    for (uint64_t b = 0; b < VMM_PAGE_SIZE; b++) {
-                        dst[b] = src[b];
-                    }
+                    /* Mapeia a pagina na PML4 do filho com as mesmas flags (modificadas ou nao) */
+                    map_in_pml4(child_pml4, virt, phys_addr, (uint32_t)flags);
 
-                    /* Preserva as mesmas flags de permissao do pai. */
-                    uint32_t flags = (uint32_t)(parent_pt[pt_i] & VMM_ENTRY_FLAGS_MASK);
-                    map_in_pml4(child_pml4, virt, (uintptr_t)child_frame, flags);
+                    /* Invalida a pagina localmente no BSP */
+                    vmm_flush_tlb(virt);
+
+                    /* Incrementa o contador de referencias do frame fisico */
+                    pmm_ref_inc((void *)phys_addr);
                 }
             }
         }
     }
 
+    /* Se houver outros nucleos ativos, envia TLB shootdown via IPI */
+    if (smp_ap_booted_count() > 0) {
+        apic_write(APIC_REG_ICR_HIGH, 0);
+        apic_write(APIC_REG_ICR_LOW, 0x000C4000 | 0x79);
+    }
+
     return child_pml4;
+}
+
+void vmm_page_fault_handler(uint64_t error_code, uintptr_t fault_addr, uintptr_t rip)
+{
+    (void)rip;
+
+    /* 1. Varre as tabelas de paginas para encontrar a PTE correspondente */
+    uintptr_t vaddr = fault_addr;
+    uintptr_t pml4_index = (vaddr >> 39) & 0x1FFULL;
+    uintptr_t pdpt_index = (vaddr >> 30) & 0x1FFULL;
+    uintptr_t pd_index = (vaddr >> 21) & 0x1FFULL;
+    uintptr_t pt_index = (vaddr >> 12) & 0x1FFULL;
+
+    uint64_t *pml4 = (uint64_t *)(read_cr3() & VMM_ENTRY_ADDR_MASK);
+    uint64_t *pdpt = NULL;
+    uint64_t *pd = NULL;
+    uint64_t *pt = NULL;
+    uint64_t pte = 0;
+    int is_cow = 0;
+
+    if (valid_table_pointer(pml4) && (pml4[pml4_index] & VMM_PAGE_PRESENT)) {
+        pdpt = entry_table(pml4[pml4_index]);
+        if (valid_table_pointer(pdpt) && (pdpt[pdpt_index] & VMM_PAGE_PRESENT)) {
+            pd = entry_table(pdpt[pdpt_index]);
+            if (valid_table_pointer(pd) && (pd[pd_index] & VMM_PAGE_PRESENT)) {
+                pt = entry_table(pd[pd_index]);
+                if (valid_table_pointer(pt) && (pt[pt_index] & VMM_PAGE_PRESENT)) {
+                    pte = pt[pt_index];
+                    /* Verifica se e uma escrita (bit 1 do erro) e se a PTE tem PAGE_COW setado */
+                    if ((error_code & 0x02) && (pte & PAGE_COW)) {
+                        is_cow = 1;
+                    }
+                }
+            }
+        }
+    }
+
+    if (is_cow) {
+        uint64_t old_phys_frame = pte & VMM_ENTRY_ADDR_MASK;
+        uint32_t refcount = pmm_ref_get((void *)old_phys_frame);
+
+        if (refcount > 1) {
+            void *new_frame = pmm_alloc();
+            if (new_frame == NULL) {
+                klog("COW: Falha de alocacao fisica no Page Fault.\n");
+                goto panic;
+            }
+
+            /* Copia de dados direta de 4 KiB */
+            uint8_t *src = (uint8_t *)old_phys_frame;
+            uint8_t *dst = (uint8_t *)new_frame;
+            for (int i = 0; i < 4096; i++) {
+                dst[i] = src[i];
+            }
+
+            /* Mapeia PTE para o novo frame fisico, limpa bit COW e ativa bit WRITABLE */
+            uint64_t flags = pte & VMM_ENTRY_FLAGS_MASK;
+            flags &= ~PAGE_COW;
+            flags |= PAGE_WRITABLE;
+            pt[pt_index] = ((uint64_t)new_frame & VMM_ENTRY_ADDR_MASK) | flags;
+
+            /* Decrementa o contador de referencias do frame antigo */
+            pmm_free((void *)old_phys_frame);
+        } else {
+            /* Refcount == 1: apenas ajusta flags na PTE atual */
+            uint64_t flags = pte & VMM_ENTRY_FLAGS_MASK;
+            flags &= ~PAGE_COW;
+            flags |= PAGE_WRITABLE;
+            pt[pt_index] = old_phys_frame | flags;
+        }
+
+        /* Invalida a entrada no TLB local */
+        vmm_flush_tlb(fault_addr);
+        return;
+    }
+
+panic:
+    __asm__ volatile ("cli");
+    klog("\n*** KERNEL PANIC: PAGE FAULT (INT 0x0E) ***\n");
+    klog("Falha de acesso a memoria nao resolvida via Copy-On-Write.\n");
+
+    for (;;) {
+        __asm__ volatile ("hlt");
+    }
 }

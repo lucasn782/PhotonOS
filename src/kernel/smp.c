@@ -338,3 +338,16 @@ void ap_kmain(uint64_t ap_id)
         __asm__ volatile ("cli; hlt" ::: "memory");
     }
 }
+
+int smp_ap_booted_count(void)
+{
+    return ap_booted_count;
+}
+
+void smp_tlb_shootdown_handler(void)
+{
+    uint64_t cr3;
+    __asm__ volatile ("mov %%cr3, %0" : "=r"(cr3));
+    __asm__ volatile ("mov %0, %%cr3" : : "r"(cr3) : "memory");
+    apic_eoi();
+}
