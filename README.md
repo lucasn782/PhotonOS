@@ -1,6 +1,9 @@
-# PhotonOS v3.1 🌌
+# PhotonOS v4.0 🌌
 
-O **PhotonOS v3.1** é um sistema operacional monolítico freestanding desenvolvido do zero para a arquitetura **x86_64**, executando em **64-bit Long Mode**. O projeto homologou com sucesso o mecanismo de **Copy-On-Write (COW) para `sys_fork`** na Trilha 9, completando o ciclo de otimização do Gerenciador de Memória Virtual (VMM) e consolidando um núcleo multi-core resiliente integrado com execução em Ring 3, pipeline gráfico por software, barramento PCI, interface de rede e1000 estável e console interativo no espaço de usuário.
+O **PhotonOS v4.0** é um sistema operacional monolítico freestanding desenvolvido do zero para a arquitetura **x86_64**, executando em **64-bit Long Mode**. O projeto concluiu com sucesso a implementação do **Sistema de Ficheiros Gravável de Alta Performance (EXT2 Nativo)** na Trilha 10, consolidando um núcleo multi-core resiliente com Copy-On-Write, pipeline gráfico por software, barramento PCI, interface de rede e1000 estável, armazenamento persistente dual (FAT16 + EXT2) e console interativo no espaço de usuário.
+
+### 🧱 Marco Histórico de Persistência — PhotonOS v4.0
+O marco v4.0 fecha a trilha de armazenamento com uma pilha de persistência de dados totalmente operacional no kernel Ring 0: o driver ATA/IDE foi blindado por `ata_mutex` para eliminar race conditions sobre os registradores físicos das portas `0x1F0`–`0x1F7`, enquanto o subsistema EXT2 passou a suportar parser do superbloco, validação do mágico `0xEF53`, carregamento da BGDT em RAM, conversão matemática de inodes via `ext2_read_inode()`/`ext2_write_inode()`, lookup recursivo de caminhos via VFS e alocação atômica de blocos e inodes com divisão de entradas de diretório.
 
 ---
 
@@ -17,6 +20,7 @@ PhotonOS/
 ├── src/
 │   ├── boot/          # Bootloader e entrada do Kernel
 │   ├── drivers/       # Drivers ATA, PCI, FAT16, e1000 e Serial
+│   ├── fs/            # Sistemas de ficheiros nativos (EXT2)
 │   ├── kernel/        # Núcleo do sistema
 │   └── user/          # Biblioteca de usuário e aplicações
 ├── Makefile
@@ -27,8 +31,20 @@ PhotonOS/
 
 ## 🚀 Funcionalidades Consolidadas
 
-### 🧠 Otimização de Memória: Copy-On-Write (COW) — V3.1 [NOVO]
+### 📦 Sistema de Ficheiros EXT2 Nativo Gravável — V4.0 [NOVO]
 > [!IMPORTANT]
+> **EXT2 Writable Filesystem:** O PhotonOS v4.0 implementa suporte nativo gravável de alta performance ao **Second Extended Filesystem (EXT2)** em Ring 0, integrado ao Virtual File System (VFS) e operando via driver IDE/ATA PIO com blindagem concorrente SMP.
+* **Blindagem Concorrente no Driver ATA (`ata_mutex`):** Introdução de exclusão mútua (`mutex_t`) no driver de disco `src/drivers/ata.c`, protegendo o acesso aos registradores físicos de comando e controle IDE (Portas `0x1F0`–`0x1F7`) contra race conditions induzidas por múltiplos núcleos SMP ativos. A sequência atômica *setup de registradores → emissão de comando (`0x20`/`0x30`) → transferência via `insw`/`outsw` → cache flush (`0xE7`)* é indivisível.
+* **Parser de Superbloco e Validação de Integridade:** Leitura do Superbloco EXT2 no offset fixo de 1024 bytes (setores LBA+2/LBA+3) com validação estrita do número mágico `0xEF53` no campo `s_magic`. Derivação automática do tamanho de bloco via `1024 << s_log_block_size` e cálculo do número de grupos de blocos.
+* **Tabela de Descritores de Grupos de Blocos (BGDT):** Carregamento integral em RAM da BGDT (array de `struct ext2_group_desc`, 32 bytes/entrada) para localização O(1) dos bitmaps de alocação e tabelas de inodes de qualquer grupo do disco.
+* **Matemática de Inodes (`ext2_read_inode` / `ext2_write_inode`):** Conversão de índices lógicos de inodes para offsets de setor via aritmética modular: `group = (N-1) / s_inodes_per_group`, `index = (N-1) % s_inodes_per_group`. Operações de escrita utilizam protocolo Read-Modify-Write em nível de bloco.
+* **Resolução Recursiva de Caminhos e Diretórios:** Navegação da árvore de diretórios a partir do Inode Raiz (Inode 2), interpretando blocos de dados como arrays dinâmicos de `struct ext2_dir_entry_2` com travessia via `rec_len`. Integração transparente ao VFS via ponteiros de função (`read`, `write`, `readdir`, `open`).
+* **Alocação Atômica de Blocos e Inodes:** Motores de varredura bit-a-bit nos bitmaps de blocos e inodes protegidos por `ext2_mutex`, com persistência síncrona imediata dos descritores de grupo e Superbloco após cada alocação.
+* **Pipeline de Escrita com Ponteiros Diretos e Indiretos:** Suporte a ficheiros extensos via 12 ponteiros diretos (`i_block[0..11]`) e 1 ponteiro simplesmente indireto (`i_block[12]`), com alocação dinâmica do bloco indireto sob demanda.
+* **Divisão de Entradas de Diretório:** Algoritmo de *directory entry splitting* para inserção eficiente de novos nós no disco, reutilizando trailing space de entradas existentes ou alocando novos blocos de diretório conforme necessário.
+
+### 🧠 Otimização de Memória: Copy-On-Write (COW) — V3.1
+> [!NOTE]
 > **Copy-On-Write para `sys_fork`:** O PhotonOS v3.1 implementa o mecanismo de COW no Gerenciador de Memória Virtual, eliminando a duplicação física imediata de frames de memória durante o `fork`. Pai e filho compartilham os mesmos frames físicos de 4 KiB até que uma escrita efetiva ocorra, disparando a separação preguiçosa de páginas via exceção de Page Fault (`INT 0x0E`).
 * **Contador de Referências no PMM (`pmm_refcounts`):** Array estático de `uint32_t` indexado pelo número de frame físico (PFN), rastreando o grau de compartilhamento dos 32.768 frames de 4 KiB. `pmm_alloc` inicializa o contador em `1`; `pmm_free` decrementa e só devolve o frame ao pool livre quando o contador atinge zero.
 * **Clonagem Preguiçosa de Páginas (`vmm_clone_address_space`):** Durante o `fork`, em vez de alocar e copiar cada frame de usuário, o kernel modifica as PTEs do pai e cria as PTEs do filho apontando para o **mesmo frame físico**: remove `PAGE_WRITABLE` (bit 1) e seta `PAGE_COW` (bit 9 = `0x200`) em ambas as entradas. Nenhuma alocação de memória extra ocorre.
@@ -74,9 +90,10 @@ PhotonOS/
 * **Gerenciamento Dinâmico de Processos**: Suporte nativo a `sys_fork` (Syscall 23) e estabelecimento da trindade POSIX de processos (Fork, Exec, Exit).
 
 ### Sistema de Arquivos
-* Driver ATA PIO e Sistema de Arquivos FAT16.
-* Integração com Virtual File System (VFS) com suporte completo a subdiretórios recursivos e navegação de caminhos.
-* Operações de leitura (`sys_read`) e escrita (`sys_write`) persistentes através de alocação dinâmica de novos clusters na tabela FAT.
+* Driver ATA PIO com blindagem de concorrência SMP (`ata_mutex`) e Sistemas de Arquivos FAT16 e **EXT2 Nativo Gravável**.
+* Integração com Virtual File System (VFS) com suporte completo a subdiretórios recursivos, navegação de caminhos e detecção automática de tipo de sistema de ficheiros (FAT16 → EXT2 fallback).
+* Operações de leitura (`sys_read`) e escrita (`sys_write`) persistentes através de alocação dinâmica de clusters (FAT16) e blocos com ponteiros diretos/indiretos (EXT2).
+* Parser de Superbloco EXT2 com validação de integridade (`0xEF53`), alocação atômica de inodes e blocos via bitmaps protegidos por mutex, e algoritmo de divisão de entradas de diretório.
 
 ### Segurança e Robustez (Ring 0 / Ring 3)
 * Hardening de chamadas de sistema de I/O (`sys_read`, `sys_write`, `sys_execve`) com validação de buffers do espaço de usuário (`vmm_is_mapped`) e cópia de segurança em buffers do kernel (`kmalloc`).
@@ -106,10 +123,10 @@ PhotonOS/
 
 ## 📊 Status do Projeto & Ecossistema de Trilhas
 
-O desenvolvimento do PhotonOS é estruturado em trilhas de aprendizado e implementação de engenharia de software de baixo nível. Com a homologação bem-sucedida do mecanismo de Copy-On-Write, todas as nove trilhas principais do sistema estão concluídas.
+O desenvolvimento do PhotonOS é estruturado em trilhas de aprendizado e implementação de engenharia de software de baixo nível. Com a conclusão do subsistema de armazenamento EXT2 gravável, todas as dez trilhas principais do sistema estão concluídas.
 
 **Progresso Geral do Sistema:**
-`[██████████████████████████████████████████████████]` **100% Concluído (V3.1)**
+`[██████████████████████████████████████████████████]` **100% Concluído (V4.0)**
 
 ### 🛣️ Ecossistema de Trilhas de Engenharia
 
@@ -123,7 +140,8 @@ O desenvolvimento do PhotonOS é estruturado em trilhas de aprendizado e impleme
 | **Trilha 6** | Armazenamento (ATA PIO), Sistema de Arquivos FAT16 e VFS POSIX | 100% | v2.0 |
 | **Trilha 7** | Subsistema Gráfico VBE, Double Buffering e Barramento PCI/Driver e1000 | 100% | v2.0 |
 | **Trilha 8** | Multiprocessamento Simétrico (SMP): Suporte Multi-Core Nativo | 100% | v3.0 |
-| **Trilha 9** | **Otimização de Memória Virtual: Copy-On-Write (COW) para `sys_fork`** | **100%** | **v3.1** |
+| **Trilha 9** | Otimização de Memória Virtual: Copy-On-Write (COW) para `sys_fork` | 100% | v3.1 |
+| **Trilha 10** | **Sistema de Ficheiros EXT2 Nativo Gravável e Blindagem Concorrente ATA** | **100%** | **v4.0** |
 
 ---
 
@@ -196,7 +214,17 @@ qemu-system-x86_64 ^
 
 ## 🕒 Changelog / Linha do Tempo
 
-### `v3.1` - The COW Memory Optimization Update 🧠 (Versão Atual)
+### `v4.0` - The EXT2 Persistent Storage Update 📦 (Versão Atual)
+* **Sistema de Ficheiros EXT2 Nativo Gravável:** Implementação completa do driver EXT2 em Ring 0 (`src/fs/ext2.c`, `include/fs/ext2.h`) com suporte a leitura, escrita, criação de ficheiros e listagem de diretórios.
+* **Blindagem Concorrente no Driver ATA (`ata_mutex`):** Introdução de exclusão mútua no driver IDE/ATA protegendo a sequência atômica de acesso aos registradores de I/O `0x1F0`–`0x1F7` contra race conditions SMP.
+* **Parser de Superbloco com Validação de Integridade:** Leitura e validação do número mágico `0xEF53` no offset fixo de 1024 bytes, com derivação automática do tamanho de bloco e carregamento integral da Tabela de Descritores de Grupos de Blocos em RAM.
+* **Matemática de Inodes e Resolução de Caminhos:** Aritmética modular de conversão `inode_num → (grupo, índice, bloco, offset)` e navegação recursiva de diretórios a partir do Inode Raiz 2, interpretando `struct ext2_dir_entry_2` com travessia via `rec_len`.
+* **Alocação Atômica de Blocos e Inodes:** Motores de varredura bit-a-bit em bitmaps de blocos e inodes protegidos por `ext2_mutex`, com persistência síncrona do Superbloco e descritores de grupo após cada alocação.
+* **Pipeline de Escrita Extenso:** Suporte a ponteiros diretos (`i_block[0..11]`) e simplesmente indiretos (`i_block[12]`) com alocação dinâmica sob demanda e protocolo Read-Modify-Write para escritas parciais em blocos.
+* **Algoritmo de Divisão de Entradas de Diretório:** Inserção de novos ficheiros via reutilização de trailing space, divisão de `rec_len` ou alocação de novos blocos de diretório.
+* **Detecção Automática FAT16 → EXT2:** Fallback transparente em `ata_vfs_init()` — tenta FAT16 primeiro; se falhar, monta como EXT2.
+
+### `v3.1` - The COW Memory Optimization Update 🧠
 * **Copy-On-Write (COW) para `sys_fork`:** Implementação completa do mecanismo de compartilhamento preguiçoso de páginas físicas entre processos pai e filho durante a bifurcação.
 * **Contador de Referências no PMM (`pmm_refcounts`):** Array estático de `uint32_t` indexando os 32.768 frames físicos de 4 KiB — integrado a `pmm_alloc` e `pmm_free` com semântica de decremento atômico.
 * **Handler de Page Fault COW (`INT 0x0E`):** Registro de `page_fault_stub` na IDT (vetor 14) e implementação de `vmm_page_fault_handler` com lógica de divisão de frame (*page splitting*) baseada no refcount.

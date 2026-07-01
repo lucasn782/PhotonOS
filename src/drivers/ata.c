@@ -4,8 +4,10 @@
 #include <stdint.h>
 
 #include "fat16.h"
+#include "mutex.h"
 #include "serial.h"
 #include "vfs.h"
+#include "fs/ext2.h"
 
 #define ATA_DATA 0x1F0
 #define ATA_SECTOR_COUNT 0x1F2
@@ -27,6 +29,7 @@
 #define ATA_CMD_CACHE_FLUSH 0xE7
 
 static int ata_present;
+static mutex_t ata_mutex;
 
 static uint8_t inb(uint16_t port)
 {
@@ -95,6 +98,8 @@ int ata_init(void)
 {
     uint16_t identify[256];
 
+    mutex_init(&ata_mutex);
+
     outb(ATA_CONTROL, 0);
     outb(ATA_DRIVE, 0xE0);
     ata_delay_400ns();
@@ -131,7 +136,10 @@ int ata_read_sectors(uint32_t lba, uint8_t sector_count, uint8_t *buffer)
         return 0;
     }
 
+    mutex_lock(&ata_mutex);
+
     if (!ata_wait_ready()) {
+        mutex_unlock(&ata_mutex);
         return 0;
     }
 
@@ -144,12 +152,14 @@ int ata_read_sectors(uint32_t lba, uint8_t sector_count, uint8_t *buffer)
 
     for (uint8_t sector = 0; sector < sector_count; sector++) {
         if (!ata_wait_drq()) {
+            mutex_unlock(&ata_mutex);
             return 0;
         }
         insw(ATA_DATA, buffer + ((uint32_t)sector * 512U), 256);
         ata_delay_400ns();
     }
 
+    mutex_unlock(&ata_mutex);
     return 1;
 }
 
@@ -161,7 +171,10 @@ int ata_write_sectors(uint32_t lba, uint8_t sector_count,
         return 0;
     }
 
+    mutex_lock(&ata_mutex);
+
     if (!ata_wait_ready()) {
+        mutex_unlock(&ata_mutex);
         return 0;
     }
 
@@ -174,6 +187,7 @@ int ata_write_sectors(uint32_t lba, uint8_t sector_count,
 
     for (uint8_t sector = 0; sector < sector_count; sector++) {
         if (!ata_wait_drq()) {
+            mutex_unlock(&ata_mutex);
             return 0;
         }
         outsw(ATA_DATA, buffer + ((uint32_t)sector * 512U), 256);
@@ -181,7 +195,9 @@ int ata_write_sectors(uint32_t lba, uint8_t sector_count,
     }
 
     outb(ATA_COMMAND, ATA_CMD_CACHE_FLUSH);
-    return ata_wait_ready();
+    int res = ata_wait_ready();
+    mutex_unlock(&ata_mutex);
+    return res;
 }
 
 static int ata_block_read(vfs_node_t *node, uint64_t offset, uint32_t size,
@@ -236,10 +252,16 @@ void ata_vfs_init(void)
         hda->write = ata_block_write;
     }
 
-    (void)fat16_mount(0);
+    if (!fat16_mount(0)) {
+        (void)ext2_mount(0);
+    }
 }
 
 int ata_vfs_create(const char *path)
 {
-    return fat16_vfs_create(path);
+    int ret = fat16_vfs_create(path);
+    if (ret < 0) {
+        return ext2_vfs_create(path);
+    }
+    return ret;
 }

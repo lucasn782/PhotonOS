@@ -1,8 +1,11 @@
-# 📚 Índice de Documentação Técnica do PhotonOS v3.1
+# 📚 Índice de Documentação Técnica do PhotonOS v4.0
 
 ## 🎯 Start Here
 
-**Para a especificação mais recente do sistema (COW / v3.1):**
+**Para a especificação mais recente do sistema (EXT2 / v4.0):**
+→ [ext2_filesystem.md](ext2_filesystem.md) — Especificação técnica completa do Sistema de Ficheiros EXT2 Nativo Gravável, incluindo o marco histórico de persistência do PhotonOS v4.0
+
+**Para a especificação de COW / v3.1:**
 → [cow_memory_optimization.md](cow_memory_optimization.md) — Especificação técnica completa do Copy-On-Write
 
 **Para o ciclo de vida de processos e bifurcação:**
@@ -19,9 +22,32 @@
 
 ---
 
-## 📖 Documentação Técnica Principal (PhotonOS v3.1)
+## 📖 Documentação Técnica Principal (PhotonOS v4.0)
 
-### 0. cow_memory_optimization.md — `[NOVO — v3.1]`
+### 0. ext2_filesystem.md — `[NOVO — v4.0]`
+**Propósito:** Especificação técnica completa do Sistema de Ficheiros EXT2 Nativo Gravável e do marco histórico de persistência do PhotonOS v4.0  
+**Escopo:** Driver ATA (mutex), Parser de Superbloco, Matemática de Inodes, Alocação Atômica de Blocos, Pipeline de Escrita, Integração VFS, lookup recursivo de diretórios e divisão de entradas de diretório  
+**Público:** Engenheiros de sistemas operacionais, revisores de código Ring 0, especialistas em sistemas de ficheiros  
+**Conteúdo:**
+- Arquitetura em camadas do subsistema EXT2 (hardware → ATA → EXT2 → VFS → userspace)
+- Blindagem concorrente no driver ATA (`ata_mutex`) contra race conditions SMP
+- Parser do Superbloco com validação do número mágico `0xEF53`
+- Tabela de Descritores de Grupos de Blocos carregada em RAM
+- Aritmética modular de conversão inode → (grupo, índice, bloco, offset)
+- Protocolo Read-Modify-Write para `ext2_write_inode()`
+- Navegação recursiva de diretórios a partir do Inode Raiz 2
+- Motores de varredura atômica de bitmaps de blocos e inodes
+- Suporte a ponteiros diretos (`i_block[0..11]`) e simplesmente indiretos (`i_block[12]`)
+- Algoritmo de divisão de entradas de diretório (*directory entry splitting*)
+- Detecção automática FAT16 → EXT2 fallback
+- Regras de Ring 0 e conformidade `klog` (sem especificadores de formato)
+- Referência de estruturas on-disk (`ext2_superblock`, `ext2_inode`, `ext2_dir_entry_2`)
+
+**Leia este se:** Você precisa entender o subsistema de armazenamento persistente EXT2 do v4.0 em profundidade.
+
+---
+
+### 1. cow_memory_optimization.md — `[v3.1]`
 **Propósito:** Especificação técnica completa do mecanismo Copy-On-Write  
 **Escopo:** PMM (refcounts), VMM (clone COW), IDT (INT 0x0E), SMP (TLB Shootdown)  
 **Público:** Engenheiros de sistemas operacionais, revisores de código Ring 0  
@@ -34,11 +60,11 @@
 - TLB Shootdown via LAPIC IPI (Vector `0x79`) em ambientes SMP
 - Tabela de impacto de performance e invariantes Ring 0
 
-**Leia este se:** Você precisa entender a otimização de memória da v3.1 em profundidade.
+**Leia este se:** Você precisa entender a otimização de memória do v3.1 em profundidade.
 
 ---
 
-### 1. process_lifecycle.md — `[ATUALIZADO — v3.1]`
+### 2. process_lifecycle.md — `[ATUALIZADO — v3.1]`
 **Propósito:** Ciclo de vida de processos com COW, IPC e sincronização  
 **Conteúdo:**
 - Fluxo de `sys_fork` (Syscall 23) do espaço de usuário até Ring 0
@@ -52,7 +78,7 @@
 
 ---
 
-### 2. smp.md
+### 3. smp.md
 **Propósito:** Multiprocessamento Simétrico — bootstrap de núcleos AP  
 **Conteúdo:**
 - Protocolo INIT-SIPI via LAPIC ICR
@@ -64,7 +90,7 @@
 
 ## 📖 Documentação Legada (Keyboard Driver v2)
 
-### 2. README_KEYBOARD_DRIVER_V2.md
+### 4. README_KEYBOARD_DRIVER_V2.md
 **Purpose:** Complete implementation and deployment guide  
 **Length:** ~8-10 pages  
 **For:** Developers, implementation teams  
@@ -79,7 +105,7 @@
 
 ---
 
-### 3. QUICK_REFERENCE_KEYBOARD_V2.md
+### 5. QUICK_REFERENCE_KEYBOARD_V2.md
 **Purpose:** Quick reference for common tasks  
 **Length:** ~4-5 pages  
 **For:** Daily reference, quick lookups  
@@ -94,7 +120,7 @@
 
 ---
 
-### 4. KEYBOARD_DRIVER_IMPROVEMENTS.md
+### 6. KEYBOARD_DRIVER_IMPROVEMENTS.md
 **Purpose:** Comprehensive technical specification  
 **Length:** ~15-20 pages  
 **For:** Technical architects, deep understanding  
@@ -112,7 +138,7 @@
 
 ---
 
-### 5. KEYBOARD_CHANGELOG.md
+### 7. KEYBOARD_CHANGELOG.md
 **Purpose:** Version history and feature documentation  
 **Length:** ~10-12 pages  
 **For:** Project tracking, feature verification  
@@ -130,7 +156,7 @@
 
 ---
 
-### 6. KEYBOARD_DIFF_DETAILED.md
+### 8. KEYBOARD_DIFF_DETAILED.md
 **Purpose:** Exact before/after code diff with explanations  
 **Length:** ~12-15 pages  
 **For:** Code reviewers, implementation verification  
@@ -145,7 +171,7 @@
 
 ---
 
-### 7. test_keyboard_special_chars.sh
+### 9. test_keyboard_special_chars.sh
 **Purpose:** Automated test script for special characters  
 **Length:** ~200 lines  
 **For:** Validation, automated testing  
@@ -412,7 +438,7 @@ You have access to comprehensive documentation covering:
 ---
 
 **Documentation Status:** ✅ Complete  
-**Last Updated:** 2026-05-29  
-**Version:** 2.0  
+**Last Updated:** 2026-07-01  
+**Version:** 3.0  
 
 Happy hacking! 🚀

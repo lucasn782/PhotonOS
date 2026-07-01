@@ -32,7 +32,8 @@ KERNEL_OBJS := build/boot/kernel_asm.o build/user/shell_blob.o build/user/hello_
                build/drivers/serial.o build/drivers/video.o build/drivers/mouse.o build/kernel/scheduler.o build/kernel/mutex.o build/kernel/heap.o \
                build/kernel/vfs.o build/kernel/initrd.o build/kernel/elf.o build/kernel/net.o build/drivers/fat16.o \
                build/drivers/ata.o build/drivers/pci.o build/drivers/e1000.o \
-               build/kernel/apic.o build/kernel/smp.o build/kernel/trampoline_blob.o
+               build/kernel/apic.o build/kernel/smp.o build/kernel/trampoline_blob.o \
+               build/fs/ext2.o
 
 CFLAGS := -ffreestanding -m64 -nostdlib -mno-red-zone -fno-pic -fno-pie \
           -fno-stack-protector -Wall -Wextra -Iinclude
@@ -47,7 +48,7 @@ USER_LDFLAGS := -nostdlib -s -N --no-warn-rwx-segments -z max-page-size=0x1000 \
 all: directories $(IMG)
 
 directories:
-	@mkdir -p build/boot build/kernel build/drivers build/user
+	@mkdir -p build/boot build/kernel build/drivers build/user build/fs
 
 $(BOOT_BIN): src/boot/boot.asm
 	@mkdir -p $(dir $@) && $(NASM) -f bin $< -o $@
@@ -109,7 +110,10 @@ build/kernel/net.o: src/kernel/net.c include/net.h include/e1000.h include/sched
 build/drivers/fat16.o: src/drivers/fat16.c include/fat16.h include/ata.h include/heap.h include/serial.h include/vfs.h
 	@mkdir -p $(dir $@) && $(CC) $(CFLAGS) -c $< -o $@
 
-build/drivers/ata.o: src/drivers/ata.c include/ata.h include/fat16.h include/serial.h include/vfs.h
+build/drivers/ata.o: src/drivers/ata.c include/ata.h include/fat16.h include/serial.h include/vfs.h include/fs/ext2.h
+	@mkdir -p $(dir $@) && $(CC) $(CFLAGS) -c $< -o $@
+
+build/fs/ext2.o: src/fs/ext2.c include/fs/ext2.h include/ata.h include/heap.h include/serial.h include/vfs.h
 	@mkdir -p $(dir $@) && $(CC) $(CFLAGS) -c $< -o $@
 
 build/drivers/pci.o: src/drivers/pci.c include/pci.h include/e1000.h include/serial.h
