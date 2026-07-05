@@ -8,6 +8,7 @@
 #include "vfs.h"
 #include "vmm.h"
 #include "heap.h"
+#include "apic.h"
 
 extern volatile uint64_t kernel_ticks;
 
@@ -182,6 +183,9 @@ static void map_user_page(uint64_t address)
 static void pic_send_eoi(void)
 {
     outb(PIC1_COMMAND, PIC_EOI);
+    if (apic_is_enabled()) {
+        apic_eoi();
+    }
 }
 
 static void scheduler_idle_thread(void)

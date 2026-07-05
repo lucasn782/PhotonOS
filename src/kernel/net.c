@@ -1009,6 +1009,7 @@ void net_poll_packets(void)
                         sock->rx_tail = (tail + 1) % SOCKET_RX_BUF_SIZE;
                         sock->rx_count++;
 
+                        scheduler_wake_socket(sock);
                         scheduler_wake_socket_receivers(sock->protocol);
                     }
                 }

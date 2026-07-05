@@ -25,5 +25,12 @@ int apic_is_enabled(void);
 void apic_eoi(void);
 uint32_t apic_read(uint32_t reg);
 void apic_write(uint32_t reg, uint32_t value);
+static inline uint32_t lapic_read(uint32_t reg) {
+    return apic_read(reg);
+}
+
+static inline void lapic_write(uint32_t reg, uint32_t value) {
+    apic_write(reg, value);
+}
 
 #endif

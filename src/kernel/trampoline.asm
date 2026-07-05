@@ -93,8 +93,9 @@ long_mode_entry:
     ; Pass ap_id as the first parameter (RDI in SysV AMD64) from offset 0x7020
     mov rdi, [0x7020]
 
-    ; Notify BSP that this AP is ready by setting ready to 1 (offset 0x7028)
-    mov qword [0x7028], 1
+    ; NOTE: ready flag (0x7028) is now set by ap_kmain() in C after full
+    ; GDT/IDT/APIC initialization.  Do NOT set it here — doing so would
+    ; create a race where the BSP proceeds before this AP can handle IPIs.
 
     ; Indirect jump to the kernel's C entry function (offset 0x7030)
     mov rax, [0x7030]

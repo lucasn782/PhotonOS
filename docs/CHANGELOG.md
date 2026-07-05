@@ -1,0 +1,195 @@
+# 📝 PhotonOS — Changelog
+
+Histórico completo de mudanças do sistema operacional, organizado por versão.
+Convenções: cada entrada lista data, commit (quando aplicável), resumo, arquivos alterados, bugs corrigidos, novas funcionalidades, breaking changes e impacto arquitetural.
+
+---
+
+## `v4.1-dev` — ulibc Refactor & POSIX Hardening (Em Desenvolvimento)
+**Data:** 2026-07-05
+**Status:** Uncommitted (11 arquivos modificados, 2 novos)
+
+### Novas Funcionalidades
+- **Printf Bufferizado:** Reescrita completa do `printf()` userspace com buffer interno de 2048 bytes (`struct printf_buffer`), reduzindo chamadas de sistema de N (uma por caractere) para ⌈N/2048⌉ (uma por flush). Ganho de performance estimado: 100-500x em strings longas.
+- **APIs POSIX Padronizadas:** Novas funções `open()`, `read()`, `write()`, `close()`, `fork()` com assinaturas compatíveis POSIX usando `_syscall` de 6 argumentos.
+- **Headers `string.h` e `stdio.h`:** Criação de headers separados para funções de string (`memcpy`, `memset`, `strlen`, `strcmp`) e I/O (`printf`), seguindo convenção POSIX.
+- **Wrapper Syscall Unificado:** `_syscall()` inline com 6 argumentos via registradores SysV ABI (rdi, rsi, rdx, r10, r8, r9).
+
+### Arquivos Alterados
+| Arquivo | Tipo | Resumo |
+|---------|------|--------|
+| `src/user/ulibc.c` | Refatorado | Printf bufferizado, novas APIs POSIX |
+| `include/ulibc.h` | Atualizado | Novas declarações open/read/write/close/fork, includes string.h/stdio.h |
+| `include/stdio.h` | **Novo** | Declaração de `printf()` |
+| `include/string.h` | **Novo** | Declarações de `memcpy/memset/strlen/strcmp` |
+| `include/apic.h` | Atualizado | Novos registradores APIC (LVT_PERF, LVT_LINT0/1, LVT_ERR) |
+| `include/smp.h` | Atualizado | Exportação de `tlb_acknowledge_count` e `tlb_shootdown_addr` |
+| `src/kernel/smp.c` | Melhorado | Melhorias no bootstrap AP |
+| `src/kernel/vmm.c` | Melhorado | Ajustes no COW clone |
+| `src/kernel/kernel.c` | Ajustado | Integração com novos headers |
+| `src/kernel/net.c` | Ajustado | Include adicional |
+| `src/kernel/scheduler.c` | Ajustado | Integração APIC |
+| `src/kernel/trampoline.asm` | Ajustado | Melhorias no boot AP |
+| `Makefile` | Atualizado | Ajustes de dependências |
+
+### Breaking Changes
+- ⚠️ Assinatura de `read()` e `write()` mudou de `size_t count` para `int count` no header público `ulibc.h`
+- ⚠️ As funções legadas `syscall0`–`syscall4` agora são wrappers sobre `_syscall` (sem impacto funcional)
+
+### Impacto Arquitetural
+- A ulibc agora segue uma arquitetura em camadas: `_syscall` → wrappers POSIX → funções de conveniência → printf bufferizado
+- Separação de concerns: string operations (`string.h`), I/O (`stdio.h`), system calls (`ulibc.h`)
+
+---
+
+## `v4.0` — The EXT2 Persistent Storage Update 📦
+**Data:** 2026-07-01
+**Commit:** `06a1d22`
+
+### Novas Funcionalidades
+- Sistema de Ficheiros EXT2 Nativo Gravável em Ring 0
+- Blindagem concorrente no driver ATA (`ata_mutex`)
+- Parser de Superbloco com validação do mágico `0xEF53`
+- Carregamento da BGDT em RAM
+- Conversão matemática de inodes via `ext2_read_inode()`/`ext2_write_inode()`
+- Lookup recursivo de caminhos via VFS
+- Alocação atômica de blocos e inodes
+- Pipeline de escrita com ponteiros diretos e indiretos
+- Divisão de entradas de diretório
+- Detecção automática FAT16 → EXT2 fallback
+
+### Arquivos Alterados
+- `src/fs/ext2.c` (792 linhas adicionadas)
+- `include/fs/ext2.h` (126 linhas adicionadas)
+- `src/drivers/ata.c` (28 linhas modificadas)
+- `Makefile` (10 linhas modificadas)
+- `README.md` (48 linhas modificadas)
+- `docs/DOCUMENTATION_INDEX.md` (56 linhas modificadas)
+- `docs/ext2_filesystem.md` (336 linhas adicionadas)
+
+### Impacto Arquitetural
+- Novo subsistema de filesystem em `src/fs/` com driver EXT2 completo
+- Driver ATA agora protegido por mutex para SMP safety
+- VFS expandido com fallback automático de detecção de filesystem
+
+---
+
+## `v3.1` — The COW Memory Optimization Update 🧠
+**Data:** 2026-06-24
+**Commit:** `59739f0`
+
+### Novas Funcionalidades
+- Copy-On-Write (COW) para `sys_fork`
+- Contador de referências no PMM (`pmm_refcounts`)
+- Handler de Page Fault COW (`INT 0x0E`)
+- TLB Shootdown via LAPIC (Vector `0x79`)
+- Flags de PTE customizadas (`PAGE_COW = 0x200`)
+
+### Bugs Corrigidos
+- Eliminação de duplicação física desnecessária durante fork
+- Correção de memory leaks em processos que fazem fork sem escrever
+
+### Arquivos Alterados
+- `src/kernel/vmm.c` (126 linhas adicionadas)
+- `include/vmm.h` (3 linhas adicionadas)
+- `src/kernel/memory.c` (43 linhas adicionadas)
+- `include/memory.h` (2 linhas adicionadas)
+- `src/boot/kernel.asm` (96 linhas adicionadas)
+- `docs/cow_memory_optimization.md` (439 linhas adicionadas)
+
+### Impacto Arquitetural
+- VMM agora é stateful com rastreamento de referências por frame
+- Page fault handler expandido com lógica COW
+- SMP impactado: TLB shootdown obrigatório após modificação de PTEs
+
+---
+
+## `v3.0` — The SMP Update 🚀
+**Data:** 2026-06-24
+**Commit:** `6e052ea`
+
+### Novas Funcionalidades
+- Multiprocessamento Simétrico (SMP) com suporte a 4 cores
+- Ecossistema APIC nativo (desativação do PIC 8259)
+- Código trampolim em `0x7000` para bootstrap de APs
+- Spinlocks atômicos via `__sync_lock_test_and_set`
+- Pilhas isoladas por núcleo
+- TLB Shootdown handler (Vector `0x79`)
+- Socket BSD API (`sys_socket`, `sys_bind`, `sys_connect`)
+
+### Arquivos Alterados
+- `src/kernel/smp.c` (340 linhas adicionadas)
+- `src/kernel/apic.c` (66 linhas adicionadas)
+- `src/kernel/trampoline.asm` (135 linhas adicionadas)
+- `src/kernel/net.c` (665 linhas adicionadas)
+- `include/smp.h`, `include/apic.h` (criados)
+- `docs/smp.md` (202 linhas adicionadas)
+
+### Impacto Arquitetural
+- Kernel agora é multi-core: todo estado compartilhado precisa de proteção
+- APIC substitui PIC como controlador primário de interrupções
+- Novo vetor de interrupção `0x79` para TLB shootdown
+
+---
+
+## `v2.0` — The Graphics & Networking Update 🌌
+**Data:** 2026-06-24
+**Commit:** `fdceee4`
+
+### Novas Funcionalidades
+- Pipeline gráfico VBE (1024x768x32bpp) com Double Buffering
+- Driver e1000 PCI de rede com DMA
+- Sockets UDP e ICMP (ping)
+- Mouse driver com sprite de seta
+- Console adaptativo gráfico
+- `sys_fork` com deep-copy PML4
+
+### Arquivos Alterados
+- 22 arquivos, 1837 inserções, 336 deleções
+
+### Impacto Arquitetural
+- Novo subsistema gráfico com framebuffer mapeado em high memory
+- Stack de rede completa (Ethernet → IP → ICMP/UDP)
+- PCI bus scanning e driver model
+
+---
+
+## `v1.1` — Socket Hardening & FAT16 Write
+**Data:** 2026-06-16
+**Commit:** `8a5b7de`
+
+### Novas Funcionalidades
+- Thread-safe ring buffers com cli/sti
+- Validação de checksums IPv4, ICMP e UDP
+- Socket reads não-bloqueantes (`-EAGAIN`)
+- Resolução de colisões de headers (net.h vs sys/socket.h)
+- FAT16 cluster writing e `sys_write` hardening
+
+### Bugs Corrigidos
+- Colisão de macros de endianness entre `net.h` e `sys/socket.h`
+- Race conditions em ring buffers de sockets
+
+---
+
+## `v1.0` — The Core 64-bit Update ⚙️
+**Data:** 2026-06-01
+**Commit:** `6ce60d0`
+
+### Novas Funcionalidades
+- Bootloader x86 Assembly (Real Mode → Protected Mode → Long Mode)
+- Tabelas de paginação PML4
+- GDT/IDT/TSS
+- PMM bitmap-based
+- VMM com 4-level page tables
+- Kernel Heap (`kmalloc`/`kfree`)
+- VFS com FAT16 e initrd
+- Escalonador Round-Robin preemptivo (PIT)
+- Processos em Ring 3 com `syscall`/`sysret`
+- ELF loader de 64-bit
+- Driver ATA PIO
+- Driver Serial COM1
+- Shell interativo
+
+### Impacto Arquitetural
+- Fundação completa do sistema operacional
+- Arquitetura monolítica com subsistemas modulares

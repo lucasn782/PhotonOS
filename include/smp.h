@@ -17,4 +17,7 @@ void ap_kmain(uint64_t ap_id);
 int smp_ap_booted_count(void);
 void smp_tlb_shootdown_handler(void);
 
+extern volatile uint64_t tlb_acknowledge_count;
+extern volatile uintptr_t tlb_shootdown_addr;
+
 #endif

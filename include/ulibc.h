@@ -5,6 +5,8 @@
 #include <stdint.h>
 
 #include "proc.h"
+#include "string.h"
+#include "stdio.h"
 
 #define SIGINT 2
 #define SIGKILL 9
@@ -20,22 +22,24 @@ typedef struct vfs_dir_entry {
     uint32_t size;
 } vfs_dir_entry_t;
 
+// Local Heap memory allocations
 void *malloc(size_t size);
 void free(void *ptr);
-size_t strlen(const char *str);
-void *memcpy(void *dest, const void *src, size_t size);
-int printf(const char *format, ...);
+
+// Core system wrappers
+int open(const char *path, int flags);
+int read(int fd, void *buf, int count);
+int write(int fd, const void *buf, int count);
+int close(int fd);
+int fork(void);
 void exit(int status);
 void yield(void);
+
 sighandler_t signal(int signum, sighandler_t handler);
 int kill(int pid, int signum);
 void sigreturn(void);
 int getprocs(proc_info_t *buffer, size_t max_size);
 uint64_t get_ticks(void);
 int readdir(int fd, vfs_dir_entry_t *buf, uint32_t count);
-int read(int fd, void *buf, size_t count);
-int write(int fd, const void *buf, size_t count);
-int close(int fd);
 
 #endif
-

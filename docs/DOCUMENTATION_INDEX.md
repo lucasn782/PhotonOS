@@ -1,8 +1,17 @@
-# 📚 Índice de Documentação Técnica do PhotonOS v4.0
+# 📚 Índice de Documentação Técnica do PhotonOS v4.1
 
 ## 🎯 Start Here
 
-**Para a especificação mais recente do sistema (EXT2 / v4.0):**
+**Para o histórico técnico de decisões arquiteturais:**
+→ [ARCHITECTURAL_DECISIONS.md](ARCHITECTURAL_DECISIONS.md) — Registro oficial das decisões técnicas críticas do Kernel (COW, SMP, ATA mutex, Buffered Printf).
+
+**Para o planejamento e evolução do sistema:**
+→ [ROADMAP.md](ROADMAP.md) — Status atual, débitos técnicos, problemas conhecidos e novas trilhas.
+
+**Para o histórico detalhado de alterações:**
+→ [CHANGELOG.md](CHANGELOG.md) — Log completo de modificações de código e marcos históricos de entrega.
+
+**Para a especificação recente do sistema (EXT2 / v4.0):**
 → [ext2_filesystem.md](ext2_filesystem.md) — Especificação técnica completa do Sistema de Ficheiros EXT2 Nativo Gravável, incluindo o marco histórico de persistência do PhotonOS v4.0
 
 **Para a especificação de COW / v3.1:**
@@ -22,7 +31,7 @@
 
 ---
 
-## 📖 Documentação Técnica Principal (PhotonOS v4.0)
+## 📖 Documentação Técnica Principal (PhotonOS v4.1)
 
 ### 0. ext2_filesystem.md — `[NOVO — v4.0]`
 **Propósito:** Especificação técnica completa do Sistema de Ficheiros EXT2 Nativo Gravável e do marco histórico de persistência do PhotonOS v4.0  

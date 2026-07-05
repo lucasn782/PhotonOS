@@ -1474,7 +1474,7 @@ static void idt_set_gate(uint8_t vector, void (*handler)(void))
     idt[vector].zero = 0;
 }
 
-static void idt_load(void)
+void idt_load(void)
 {
     struct idt_pointer idtr;
     idtr.limit = sizeof(idt) - 1;
@@ -1611,6 +1611,9 @@ void pic_send_eoi(uint8_t irq)
         outb(PIC2_COMMAND, PIC_EOI);
     }
     outb(PIC1_COMMAND, PIC_EOI);
+    if (apic_is_enabled()) {
+        apic_eoi();
+    }
 }
 
 static char keyboard_char_from_scancode(uint8_t scancode)

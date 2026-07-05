@@ -200,13 +200,13 @@ $(IMG): $(BOOT_BIN) $(KERNEL_BIN)
 	truncate -s $(FLOPPY_BYTES) $@
 
 run: $(IMG)
-	qemu-system-x86_64 -serial stdio -drive format=raw,file=$(IMG)
+	qemu-system-x86_64 -smp 4 -serial stdio -drive format=raw,file=$(IMG)
 
 fat16-disk: $(USER_SHELL_ELF) $(USER_HELLO_ELF) $(USER_UPPER_ELF) $(USER_REV_ELF) $(USER_HANG_ELF) $(USER_SPIN_ELF) $(USER_PING_ELF)
 	DISK_IMG=$(DISK_IMG) USER_DIR=build/user bash scripts/create_fat16_disk.sh
 
 run-fat16: $(IMG) fat16-disk
-	qemu-system-x86_64 -drive format=raw,file=$(IMG),if=floppy -drive format=raw,file=build/disk.img,if=ide,index=0,media=disk -boot a -serial stdio
+	qemu-system-x86_64 -smp 4 -drive format=raw,file=$(IMG),if=floppy -drive format=raw,file=build/disk.img,if=ide,index=0,media=disk -boot a -serial stdio
 
 background-test:
 	bash scripts/background_test.sh

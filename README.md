@@ -1,9 +1,9 @@
-# PhotonOS v4.0 🌌
+# PhotonOS v4.1 🌌
 
-O **PhotonOS v4.0** é um sistema operacional monolítico freestanding desenvolvido do zero para a arquitetura **x86_64**, executando em **64-bit Long Mode**. O projeto concluiu com sucesso a implementação do **Sistema de Ficheiros Gravável de Alta Performance (EXT2 Nativo)** na Trilha 10, consolidando um núcleo multi-core resiliente com Copy-On-Write, pipeline gráfico por software, barramento PCI, interface de rede e1000 estável, armazenamento persistente dual (FAT16 + EXT2) e console interativo no espaço de usuário.
+O **PhotonOS v4.1** é um sistema operacional monolítico freestanding desenvolvido do zero para a arquitetura **x86_64**, executando em **64-bit Long Mode**. O projeto concluiu com sucesso a implementação de **printf bufferizado** e **hardening de APIs POSIX em espaço de usuário**, consolidando um núcleo multi-core resiliente com Copy-On-Write, pipeline gráfico por software, barramento PCI, interface de rede e1000 estável, armazenamento persistente dual (FAT16 + EXT2), e um console interativo otimizado no espaço de usuário.
 
-### 🧱 Marco Histórico de Persistência — PhotonOS v4.0
-O marco v4.0 fecha a trilha de armazenamento com uma pilha de persistência de dados totalmente operacional no kernel Ring 0: o driver ATA/IDE foi blindado por `ata_mutex` para eliminar race conditions sobre os registradores físicos das portas `0x1F0`–`0x1F7`, enquanto o subsistema EXT2 passou a suportar parser do superbloco, validação do mágico `0xEF53`, carregamento da BGDT em RAM, conversão matemática de inodes via `ext2_read_inode()`/`ext2_write_inode()`, lookup recursivo de caminhos via VFS e alocação atômica de blocos e inodes com divisão de entradas de diretório.
+### 🧱 Marco Histórico de Otimização e POSIX — PhotonOS v4.1
+O marco v4.1 foca na eficiência da biblioteca de usuário (`ulibc`) e do console. Introduzindo buffered E/S para a saída padrão (stdout) no `printf()`, o sistema minimiza o custo de transição de privilégio (Ring 3 -> Ring 0). Além disso, a biblioteca foi reorganizada com a introdução dos headers standard `<stdio.h>` e `<string.h>`, e a unificação das chamadas de sistema POSIX (`open`, `read`, `write`, `close`, `fork`).
 
 ---
 
@@ -31,7 +31,14 @@ PhotonOS/
 
 ## 🚀 Funcionalidades Consolidadas
 
-### 📦 Sistema de Ficheiros EXT2 Nativo Gravável — V4.0 [NOVO]
+### ⚡ Otimização do Espaço de Usuário (ulibc) & APIs POSIX — V4.1 [NOVO]
+> [!IMPORTANT]
+> **Buffered Output e Hardening:** O PhotonOS v4.1 introduz uma infraestrutura padrão de biblioteca (`ulibc`) altamente otimizada, isolando a lógica de formatação de texto e operações de string em cabeçalhos standard e minimizando a sobrecarga de transição de privilégio Ring 0/Ring 3.
+* **Buffered Printf (2048 bytes):** Implementação de um buffer local (`struct printf_buffer`) na pilha do processo de usuário no `printf()`. Em vez de disparar uma chamada de sistema `SYS_WRITE` por caractere, os dados são acumulados e descarregados em lotes (batching), reduzindo drasticamente o overhead de chaveamento de privilégio.
+* **Cabeçalhos Standard Separados:** Criação de `include/stdio.h` (contendo declarações de I/O) e `include/string.h` (contendo implementações padrão de `memcpy`, `memset`, `strlen`, `strcmp`).
+* **Hardening e Unificação de Syscalls POSIX:** Substituição de wrappers de syscalls embutidos por chamadas uniformizadas baseadas no helper inline assembler `_syscall()` de 6 argumentos, compatibilizando as assinaturas de `open`, `read`, `write`, `close` e `fork` com os padrões UNIX/POSIX.
+
+### 📦 Sistema de Ficheiros EXT2 Nativo Gravável — V4.0
 > [!IMPORTANT]
 > **EXT2 Writable Filesystem:** O PhotonOS v4.0 implementa suporte nativo gravável de alta performance ao **Second Extended Filesystem (EXT2)** em Ring 0, integrado ao Virtual File System (VFS) e operando via driver IDE/ATA PIO com blindagem concorrente SMP.
 * **Blindagem Concorrente no Driver ATA (`ata_mutex`):** Introdução de exclusão mútua (`mutex_t`) no driver de disco `src/drivers/ata.c`, protegendo o acesso aos registradores físicos de comando e controle IDE (Portas `0x1F0`–`0x1F7`) contra race conditions induzidas por múltiplos núcleos SMP ativos. A sequência atômica *setup de registradores → emissão de comando (`0x20`/`0x30`) → transferência via `insw`/`outsw` → cache flush (`0xE7`)* é indivisível.
@@ -214,7 +221,12 @@ qemu-system-x86_64 ^
 
 ## 🕒 Changelog / Linha do Tempo
 
-### `v4.0` - The EXT2 Persistent Storage Update 📦 (Versão Atual)
+### `v4.1` - The ulibc Buffered Printf & POSIX Hardening Update ⚡ (Versão Atual)
+* **Buffered Output no Userspace:** Introdução da estrutura `struct printf_buffer` e acumulação de caracteres em lotes de 2048 bytes para `printf()`, melhorando expressivamente o desempenho do terminal.
+* **Headers Padrão `<stdio.h>` e `<string.h>`:** Reorganização e segregação das APIs de biblioteca do espaço de usuário.
+* **Hardening de Syscalls:** Unificação com protótipo `_syscall` padrão de 6 argumentos, com adequação formal das assinaturas de `open`, `read`, `write`, `close` e `fork`.
+
+### `v4.0` - The EXT2 Persistent Storage Update 📦
 * **Sistema de Ficheiros EXT2 Nativo Gravável:** Implementação completa do driver EXT2 em Ring 0 (`src/fs/ext2.c`, `include/fs/ext2.h`) com suporte a leitura, escrita, criação de ficheiros e listagem de diretórios.
 * **Blindagem Concorrente no Driver ATA (`ata_mutex`):** Introdução de exclusão mútua no driver IDE/ATA protegendo a sequência atômica de acesso aos registradores de I/O `0x1F0`–`0x1F7` contra race conditions SMP.
 * **Parser de Superbloco com Validação de Integridade:** Leitura e validação do número mágico `0xEF53` no offset fixo de 1024 bytes, com derivação automática do tamanho de bloco e carregamento integral da Tabela de Descritores de Grupos de Blocos em RAM.

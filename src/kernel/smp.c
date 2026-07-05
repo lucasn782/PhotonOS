@@ -55,6 +55,10 @@ static spinlock_t smp_lock;
 /* ── Number of APs that have completed boot ── */
 static volatile int ap_booted_count = 0;
 
+/* ── TLB shootdown synchronization variables ── */
+volatile uint64_t tlb_acknowledge_count = 0;
+volatile uintptr_t tlb_shootdown_addr = 0;
+
 /* ════════════════════════════════════════════════════════════════════════════
  * Spinlock primitives — thin wrappers over GCC built-in atomics.
  * ════════════════════════════════════════════════════════════════════════════ */
@@ -267,6 +271,9 @@ void smp_boot_ap(uint8_t ap_id)
  *   RDI = ap_id (first argument per SysV AMD64 ABI).
  * ════════════════════════════════════════════════════════════════════════════ */
 
+/* Forward declaration — idt_load() is defined in kernel.c (non-static). */
+extern void idt_load(void);
+
 void ap_kmain(uint64_t ap_id)
 {
     (void)ap_id; /* suppress warning if unused below */
@@ -316,7 +323,17 @@ void ap_kmain(uint64_t ap_id)
     apic_init_ap();
 
     /*
-     * Step 3 — Serialized log output.
+     * Step 3 — Load the global Interrupt Descriptor Table.
+     *
+     * Without this, the AP cannot handle ANY interrupt — including the
+     * TLB shootdown IPI on vector 0x79.  If the BSP fires a shootdown
+     * while this AP has no IDT, the CPU triple-faults (best case) or
+     * the BSP busy-waits on tlb_acknowledge_count forever (deadlock).
+     */
+    idt_load();
+
+    /*
+     * Step 4 — Serialized log output.
      *
      * Multiple APs may reach this point concurrently.  We acquire the SMP
      * spinlock to avoid interleaved serial output.
@@ -329,13 +346,27 @@ void ap_kmain(uint64_t ap_id)
     spin_unlock(&smp_lock);
 
     /*
-     * Step 4 — Safe idle loop.
+     * Step 5 — Signal readiness to BSP.
      *
-     * The AP has no scheduler context yet.  Disable interrupts and halt
-     * until the future SMP-aware scheduler assigns work to this core.
+     * The BSP polls TRAMPOLINE_PHYS_BASE + TRAMP_OFFSET_READY (0x7028).
+     * We set it to 1 ONLY now — after GDT, IDT, and APIC are fully live.
+     * This guarantees that by the time the BSP exits its polling loop,
+     * this AP is capable of servicing TLB shootdown IPIs.
+     */
+    volatile uint64_t *ready_flag =
+        (volatile uint64_t *)(TRAMPOLINE_PHYS_BASE + TRAMP_OFFSET_READY);
+    *ready_flag = 1;
+
+    /*
+     * Step 6 — Safe idle loop with interrupts ENABLED.
+     *
+     * The AP has no scheduler context yet, but it MUST have interrupts
+     * enabled so that TLB shootdown IPIs (vector 0x79) from the BSP's
+     * vmm_clone_address_space are actually delivered and acknowledged.
+     * Using cli;hlt here would deadlock the BSP on the first fork().
      */
     for (;;) {
-        __asm__ volatile ("cli; hlt" ::: "memory");
+        __asm__ volatile ("sti; hlt" ::: "memory");
     }
 }
 
@@ -346,8 +377,8 @@ int smp_ap_booted_count(void)
 
 void smp_tlb_shootdown_handler(void)
 {
-    uint64_t cr3;
-    __asm__ volatile ("mov %%cr3, %0" : "=r"(cr3));
-    __asm__ volatile ("mov %0, %%cr3" : : "r"(cr3) : "memory");
-    apic_eoi();
+    uintptr_t addr = tlb_shootdown_addr;
+    __asm__ volatile ("invlpg (%0)" : : "r"(addr) : "memory");
+    __sync_fetch_and_add(&tlb_acknowledge_count, 1);
+    lapic_write(0xB0, 0); // Envia EOI para o Local APIC do AP atual
 }

@@ -424,17 +424,26 @@ uint64_t *vmm_clone_address_space(uint64_t *parent_pml4)
                     /* Invalida a pagina localmente no BSP */
                     vmm_flush_tlb(virt);
 
+                    /* Se houver outros nucleos ativos, envia TLB shootdown via IPI */
+                    uint64_t active_aps = smp_ap_booted_count();
+                    if (active_aps > 0) {
+                        tlb_acknowledge_count = 0;
+                        tlb_shootdown_addr = virt;
+                        __asm__ volatile("" : : : "memory");
+
+                        while (lapic_read(0x300) & (1 << 12)); // Aguarda o bit Delivery Status limpar
+                        lapic_write(0x300, 0x000C0079); // Destination Shorthand: All Excluding Self | Vector 0x79
+
+                        while (tlb_acknowledge_count < active_aps) {
+                            __asm__ volatile("" : : : "memory");
+                        }
+                    }
+
                     /* Incrementa o contador de referencias do frame fisico */
                     pmm_ref_inc((void *)phys_addr);
                 }
             }
         }
-    }
-
-    /* Se houver outros nucleos ativos, envia TLB shootdown via IPI */
-    if (smp_ap_booted_count() > 0) {
-        apic_write(APIC_REG_ICR_HIGH, 0);
-        apic_write(APIC_REG_ICR_LOW, 0x000C4000 | 0x79);
     }
 
     return child_pml4;
