@@ -9,6 +9,7 @@
 #include "vmm.h"
 #include "heap.h"
 #include "apic.h"
+#include "smp.h"
 
 extern volatile uint64_t kernel_ticks;
 
@@ -37,7 +38,8 @@ static uint32_t task_count;
 static int current_task_index;
 static int idle_task_index;
 static struct task_control_block *current_task;
-static mutex_t task_table_mutex;
+static spinlock_t task_table_lock;
+static volatile uint64_t task_table_flags[256];
 
 struct interrupt_task_frame {
     uint64_t r15;
@@ -262,7 +264,7 @@ void scheduler_init(void)
     current_task_index = -1;
     idle_task_index = -1;
     current_task = NULL;
-    mutex_init(&task_table_mutex);
+    spin_init(&task_table_lock);
     pit_init();
 
     int idle_pid = scheduler_create_task(scheduler_idle_thread);
@@ -274,11 +276,11 @@ void scheduler_init(void)
 
 static int scheduler_create_task_with_mode(task_entry_t entry, int user_mode)
 {
-    mutex_lock(&task_table_mutex);
+    uint64_t flags = spin_lock_irqsave(&task_table_lock);
 
     int slot = allocate_task_slot();
     if (slot < 0) {
-        mutex_unlock(&task_table_mutex);
+        spin_unlock_irqrestore(&task_table_lock, flags);
         return -1;
     }
 
@@ -317,7 +319,7 @@ static int scheduler_create_task_with_mode(task_entry_t entry, int user_mode)
     inherit_fds(task, current_task);
     int pid = (int)task->pid;
 
-    mutex_unlock(&task_table_mutex);
+    spin_unlock_irqrestore(&task_table_lock, flags);
     return pid;
 }
 
@@ -338,11 +340,11 @@ int scheduler_add_user_process(uint64_t entry, uint64_t user_rsp,
         return -1;
     }
 
-    mutex_lock(&task_table_mutex);
+    uint64_t flags = spin_lock_irqsave(&task_table_lock);
 
     int slot = allocate_task_slot();
     if (slot < 0) {
-        mutex_unlock(&task_table_mutex);
+        spin_unlock_irqrestore(&task_table_lock, flags);
         return -1;
     }
 
@@ -373,7 +375,7 @@ int scheduler_add_user_process(uint64_t entry, uint64_t user_rsp,
 
     int pid = (int)task->pid;
 
-    mutex_unlock(&task_table_mutex);
+    spin_unlock_irqrestore(&task_table_lock, flags);
     return pid;
 }
 
@@ -384,23 +386,27 @@ task_t *scheduler_current_task(void)
 
 task_t *scheduler_find_task(uint32_t pid)
 {
+    uint64_t flags = spin_lock_irqsave(&task_table_lock);
     for (uint32_t i = 0; i < task_count; i++) {
-        if (tasks[i].pid == pid && tasks[i].state != TASK_ZOMBIE) {
+        if (tasks[i].pid == pid) {
+            spin_unlock_irqrestore(&task_table_lock, flags);
             return &tasks[i];
         }
     }
-
+    spin_unlock_irqrestore(&task_table_lock, flags);
     return 0;
 }
 
 void scheduler_task_table_lock(void)
 {
-    mutex_lock(&task_table_mutex);
+    uint32_t cpu_id = apic_read(0x20) >> 24;
+    task_table_flags[cpu_id] = spin_lock_irqsave(&task_table_lock);
 }
 
 void scheduler_task_table_unlock(void)
 {
-    mutex_unlock(&task_table_mutex);
+    uint32_t cpu_id = apic_read(0x20) >> 24;
+    spin_unlock_irqrestore(&task_table_lock, task_table_flags[cpu_id]);
 }
 
 uint32_t scheduler_task_count(void)
@@ -428,10 +434,16 @@ int scheduler_send_signal(uint32_t pid, int signum)
         return -1;
     }
 
-    mutex_lock(&task_table_mutex);
-    task_t *task = scheduler_find_task(pid);
+    uint64_t flags = spin_lock_irqsave(&task_table_lock);
+    task_t *task = 0;
+    for (uint32_t i = 0; i < task_count; i++) {
+        if (tasks[i].pid == pid) {
+            task = &tasks[i];
+            break;
+        }
+    }
     if (task == 0) {
-        mutex_unlock(&task_table_mutex);
+        spin_unlock_irqrestore(&task_table_lock, flags);
         return -1;
     }
 
@@ -443,7 +455,7 @@ int scheduler_send_signal(uint32_t pid, int signum)
         task->wait_target = 0;
     }
 
-    mutex_unlock(&task_table_mutex);
+    spin_unlock_irqrestore(&task_table_lock, flags);
     return 0;
 }
 
@@ -537,7 +549,7 @@ int scheduler_wait_current(uint32_t pid)
         return -1;
     }
 
-    mutex_lock(&task_table_mutex);
+    uint64_t flags = spin_lock_irqsave(&task_table_lock);
 
     for (uint32_t i = 0; i < task_count; i++) {
         if (tasks[i].pid == pid) {
@@ -547,17 +559,17 @@ int scheduler_wait_current(uint32_t pid)
     }
 
     if (child == 0 || child->parent_pid != current_task->pid) {
-        mutex_unlock(&task_table_mutex);
+        spin_unlock_irqrestore(&task_table_lock, flags);
         return -1;
     }
 
     if (child->state == TASK_ZOMBIE) {
-        mutex_unlock(&task_table_mutex);
+        spin_unlock_irqrestore(&task_table_lock, flags);
         return 0;
     }
 
     scheduler_sleep_current(TASK_WAIT_CHILD, pid);
-    mutex_unlock(&task_table_mutex);
+    spin_unlock_irqrestore(&task_table_lock, flags);
     return 1;
 }
 
@@ -575,16 +587,9 @@ static void wake_parent_waiters(uint32_t exited_pid)
     }
 }
 
-void scheduler_terminate_task(task_t *task, int status)
+static void scheduler_terminate_task_unlocked(task_t *task, int status)
 {
     if (task == 0 || task->state == TASK_ZOMBIE) {
-        return;
-    }
-
-    mutex_lock(&task_table_mutex);
-
-    if (task->state == TASK_ZOMBIE) {
-        mutex_unlock(&task_table_mutex);
         return;
     }
 
@@ -615,8 +620,24 @@ void scheduler_terminate_task(task_t *task, int status)
     if (restore_cr3 != 0) {
         vmm_switch_address_space((uint64_t *)restore_cr3);
     }
+}
 
-    mutex_unlock(&task_table_mutex);
+void scheduler_terminate_task(task_t *task, int status)
+{
+    if (task == 0 || task->state == TASK_ZOMBIE) {
+        return;
+    }
+
+    uint64_t flags = spin_lock_irqsave(&task_table_lock);
+
+    if (task->state == TASK_ZOMBIE) {
+        spin_unlock_irqrestore(&task_table_lock, flags);
+        return;
+    }
+
+    scheduler_terminate_task_unlocked(task, status);
+
+    spin_unlock_irqrestore(&task_table_lock, flags);
 }
 
 void scheduler_exit_current(int status)
@@ -671,7 +692,7 @@ static uint64_t signal_handler_stack(uint64_t user_rsp)
     return aligned_rsp - sizeof(uint64_t);
 }
 
-static int deliver_pending_signal(task_t *task)
+static int deliver_pending_signal_unlocked(task_t *task)
 {
     if (task == 0 || task->active_signal != 0) {
         return 1;
@@ -686,7 +707,7 @@ static int deliver_pending_signal(task_t *task)
     if (handler == 0 || handler == (uintptr_t)-1) {
         // Forçar terminação padrão se o handler for inválido
         task->pending_signals &= ~signal_bit(signum);
-        scheduler_terminate_task(task, -1);
+        scheduler_terminate_task_unlocked(task, -1);
         return 0;
     }
 
@@ -706,7 +727,7 @@ static int deliver_pending_signal(task_t *task)
             if (physical != 0) {
                 pmm_free(physical);
             }
-            scheduler_terminate_task(task, -1);
+            scheduler_terminate_task_unlocked(task, -1);
             return 0;
         }
 
@@ -739,7 +760,10 @@ uint64_t scheduler_tick(uint64_t current_rsp)
 {
     kernel_ticks++;
 
+    uint64_t flags = spin_lock_irqsave(&task_table_lock);
+
     if (task_count == 0) {
+        spin_unlock_irqrestore(&task_table_lock, flags);
         pic_send_eoi();
         return current_rsp;
     }
@@ -778,7 +802,7 @@ uint64_t scheduler_tick(uint64_t current_rsp)
 
                     vmm_switch_address_space((uint64_t *)candidate->cr3);
                     
-                    if (!deliver_pending_signal(candidate)) {
+                    if (!deliver_pending_signal_unlocked(candidate)) {
                         /* Se a tarefa foi abortada/destruída pelo sinal, precisamos
                          * restaurar o espaço de endereçamento seguro imediatamente 
                          * antes de continuar varrendo a tabela! */
@@ -795,6 +819,7 @@ uint64_t scheduler_tick(uint64_t current_rsp)
             tss_set_rsp0(current_task->kernel_stack_top);
             vmm_switch_address_space((uint64_t *)current_task->cr3);
             
+            spin_unlock_irqrestore(&task_table_lock, flags);
             pic_send_eoi();
             return current_task->rsp;
         }
@@ -809,11 +834,13 @@ uint64_t scheduler_tick(uint64_t current_rsp)
             current_task->state = TASK_RUNNING;
             tss_set_rsp0(current_task->kernel_stack_top);
             vmm_switch_address_space((uint64_t *)current_task->cr3);
+            spin_unlock_irqrestore(&task_table_lock, flags);
             pic_send_eoi();
             return current_task->rsp;
         }
     }
 
+    spin_unlock_irqrestore(&task_table_lock, flags);
     pic_send_eoi();
     return current_rsp;
 }
@@ -879,12 +906,12 @@ int scheduler_fork_current(uint64_t syscall_frame_addr)
         return -1;
     }
 
-    mutex_lock(&task_table_mutex);
+    uint64_t flags = spin_lock_irqsave(&task_table_lock);
 
     /* 3. Obtem slot na tabela de tarefas. */
     int slot = allocate_task_slot();
     if (slot < 0) {
-        mutex_unlock(&task_table_mutex);
+        spin_unlock_irqrestore(&task_table_lock, flags);
         klog("fork: tabela de tarefas cheia\n");
         kfree(child_kstack);
         vmm_destroy_address_space(child_pml4);
@@ -951,7 +978,7 @@ int scheduler_fork_current(uint64_t syscall_frame_addr)
 
     int child_pid = (int)child->pid;
 
-    mutex_unlock(&task_table_mutex);
+    spin_unlock_irqrestore(&task_table_lock, flags);
 
     klog("fork: filho inserido no escalonador\n");
     return child_pid;

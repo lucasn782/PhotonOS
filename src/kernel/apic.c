@@ -48,6 +48,10 @@ void apic_init(void) {
     uint32_t sivr = apic_read(APIC_REG_SIVR);
     apic_write(APIC_REG_SIVR, sivr | 0x100 | 0xFF);
 
+    // 5. Configure LINT0 as ExtINT (0x700) and LINT1 as NMI (0x400)
+    apic_write(APIC_REG_LVT_LINT0, 0x700);
+    apic_write(APIC_REG_LVT_LINT1, 0x400);
+
     apic_enabled_flag = 1;
 }
 
@@ -55,6 +59,10 @@ void apic_init_ap(void) {
     // Enable APIC on secondary cores
     uint32_t sivr = apic_read(APIC_REG_SIVR);
     apic_write(APIC_REG_SIVR, sivr | 0x100 | 0xFF);
+
+    // Configure LINT0 and LINT1 on secondary cores
+    apic_write(APIC_REG_LVT_LINT0, 0x700);
+    apic_write(APIC_REG_LVT_LINT1, 0x400);
 }
 
 int apic_is_enabled(void) {

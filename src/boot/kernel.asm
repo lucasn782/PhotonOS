@@ -11,6 +11,9 @@ global syscall_entry
 global double_fault_stub
 global page_fault_stub
 global tlb_shootdown_stub
+global gpf_stub
+global spurious_irq_stub
+
 extern kmain
 extern keyboard_irq_handler
 extern scheduler_tick
@@ -20,6 +23,8 @@ extern double_fault_handler
 extern mouse_handler
 extern vmm_page_fault_handler
 extern smp_tlb_shootdown_handler
+extern gpf_handler
+
 
 KERNEL_BASE equ 0x00008000
 
@@ -370,6 +375,8 @@ page_fault_stub:
     mov rdi, [rsp + 120]    ; arg1: error_code
     mov rsi, cr2            ; arg2: fault_addr (CR2)
     mov rdx, [rsp + 128]    ; arg3: faulting RIP
+    mov rcx, [rsp + 136]    ; arg4: CS
+
 
     mov rbp, rsp
     sub rsp, 8
@@ -396,6 +403,58 @@ page_fault_stub:
 
     add rsp, 8              ; skip error code
     iretq
+
+
+gpf_stub:
+    push rax
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push rbp
+    push r8
+    push r9
+    push r10
+    push r11
+    push r12
+    push r13
+    push r14
+    push r15
+
+    mov rdi, [rsp + 120]    ; arg1: error_code
+    mov rsi, [rsp + 128]    ; arg2: faulting RIP
+    mov rdx, [rsp + 136]    ; arg3: CS
+
+    mov rbp, rsp
+    sub rsp, 8
+    and rsp, -16
+    cld
+    call gpf_handler
+    mov rsp, rbp
+
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rbp
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+    add rsp, 8              ; skip error code
+    iretq
+
+
+spurious_irq_stub:
+    iretq
+
 
 
 tlb_shootdown_stub:

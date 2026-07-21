@@ -40,14 +40,20 @@ Este documento descreve o estado atual do desenvolvimento do PhotonOS, dividindo
 - **Filesystem EXT2 Nativo Gravável:** Suporte a leitura, escrita e criação de caminhos recursivos.
 - **Blindagem do Driver ATA:** Adição de exclusão mútua (`ata_mutex`) para acesso concorrente SMP seguro ao hardware de disco.
 
+### Trilha 11 — ulibc Refactor & POSIX Hardening (v4.1)
+- **Refatoração da Biblioteca de Usuário (ulibc):** Printf bufferizado (buffer de 2048 bytes), cabeçalhos `<stdio.h>` e `<string.h>`, e wrappers POSIX de system calls.
+- **Descoberta Dinâmica de CPU via ACPI MADT**: Parsing das tabelas RSDP, RSDT e MADT no boot para identificar cores de CPU habilitados.
+- **Isolamento de Falhas Ring 3**: Terminação limpa de processos usuários causadores de exceções (#GP / #PF) em vez de Kernel Panic.
+- **Sincronização de Documentação**: Auditoria completa do código-fonte e reorganização da pasta `docs/`.
+
 ---
 
-## 🟡 Em Desenvolvimento (v4.1-dev)
+## 🟡 Em Desenvolvimento (v4.2-dev)
 
-### Refatoração da Biblioteca de Usuário (ulibc)
-- **Buffered Printf:** Reescrita do `printf` utilizando buffer de 2048 bytes para minimizar transições de contexto Ring 0 / Ring 3.
-- **Interface C Standard:** Criação dos cabeçalhos `<stdio.h>` e `<string.h>` para organização de protótipos.
-- **Hardening de Syscalls:** Wrappers POSIX unificados sobre chamadas de sistema.
+### Subsistemas de Arquivos & Rede
+- **Links Simbólicos (Symlinks):** Resolução e suporte a caminhos com symlinks no VFS.
+- **Pilha TCP Stream Transmissão/Recepção:** Implementação completa da transmissão de dados confiável (VFS read/write) para sockets TCP.
+- **Sincronização de Sockets e Teclado**: Proteção concorrente do ring buffer do teclado via spinlocks e polimento da fila de rede.
 
 ---
 
@@ -56,7 +62,6 @@ Este documento descreve o estado atual do desenvolvimento do PhotonOS, dividindo
 ### Sistema de Arquivos & VFS
 - **Permissões de Arquivos:** Suporte a permissões Unix (Read/Write/Execute) no VFS.
 - **Montagem Dinâmica:** Suporte à montagem de múltiplos volumes em diferentes nós do VFS.
-- **Links Simbólicos:** Resolução de caminhos com suporte a links simbólicos (symlinks).
 
 ### Rede e Usuário
 - **Pilha TCP no Espaço de Usuário:** Implementação completa de transmissão de fluxo confiável com controle de fluxo.

@@ -10,6 +10,9 @@ typedef struct spinlock {
 void spin_init(spinlock_t *lock);
 void spin_lock(spinlock_t *lock);
 void spin_unlock(spinlock_t *lock);
+uint64_t spin_lock_irqsave(spinlock_t *lock);
+void spin_unlock_irqrestore(spinlock_t *lock, uint64_t flags);
+
 
 void smp_init(void);
 void smp_boot_ap(uint8_t ap_id);
@@ -20,4 +23,7 @@ void smp_tlb_shootdown_handler(void);
 extern volatile uint64_t tlb_acknowledge_count;
 extern volatile uintptr_t tlb_shootdown_addr;
 
+int smp_discover_cpus(uint8_t *apic_ids, int max_cpus);
+
 #endif
+

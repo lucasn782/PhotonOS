@@ -1,453 +1,259 @@
-# 📚 Índice de Documentação Técnica do PhotonOS v4.1
+# 📚 Índice Geral de Documentação Técnica do PhotonOS
 
-## 🎯 Start Here
-
-**Para o histórico técnico de decisões arquiteturais:**
-→ [ARCHITECTURAL_DECISIONS.md](ARCHITECTURAL_DECISIONS.md) — Registro oficial das decisões técnicas críticas do Kernel (COW, SMP, ATA mutex, Buffered Printf).
-
-**Para o planejamento e evolução do sistema:**
-→ [ROADMAP.md](ROADMAP.md) — Status atual, débitos técnicos, problemas conhecidos e novas trilhas.
-
-**Para o histórico detalhado de alterações:**
-→ [CHANGELOG.md](CHANGELOG.md) — Log completo de modificações de código e marcos históricos de entrega.
-
-**Para a especificação recente do sistema (EXT2 / v4.0):**
-→ [ext2_filesystem.md](ext2_filesystem.md) — Especificação técnica completa do Sistema de Ficheiros EXT2 Nativo Gravável, incluindo o marco histórico de persistência do PhotonOS v4.0
-
-**Para a especificação de COW / v3.1:**
-→ [cow_memory_optimization.md](cow_memory_optimization.md) — Especificação técnica completa do Copy-On-Write
-
-**Para o ciclo de vida de processos e bifurcação:**
-→ [process_lifecycle.md](process_lifecycle.md) — Fork, COW, IPC e sincronização atômica
-
-**Para a arquitetura SMP e protocolo APIC/IPI:**
-→ [smp.md](smp.md) — Bootstrap de núcleos AP, LAPIC, TLB Shootdown
-
-**Para a arquitetura núcleo e gráficos:**
-→ [core_and_graphics_architecture.md](core_and_graphics_architecture.md)
-
-**Para resumo executivo do driver de teclado:**
-→ [IMPLEMENTATION_SUMMARY.md](IMPLEMENTATION_SUMMARY.md)
+Este documento serve como o mapa central da documentação técnica do PhotonOS v4.1, categorizando cada arquivo explicativo e especificações técnicas de acordo com seu assunto e subsistema.
 
 ---
 
-## 📖 Documentação Técnica Principal (PhotonOS v4.1)
+## 🎯 Arquivos de Controle e Gerenciamento
 
-### 0. ext2_filesystem.md — `[NOVO — v4.0]`
-**Propósito:** Especificação técnica completa do Sistema de Ficheiros EXT2 Nativo Gravável e do marco histórico de persistência do PhotonOS v4.0  
-**Escopo:** Driver ATA (mutex), Parser de Superbloco, Matemática de Inodes, Alocação Atômica de Blocos, Pipeline de Escrita, Integração VFS, lookup recursivo de diretórios e divisão de entradas de diretório  
-**Público:** Engenheiros de sistemas operacionais, revisores de código Ring 0, especialistas em sistemas de ficheiros  
-**Conteúdo:**
-- Arquitetura em camadas do subsistema EXT2 (hardware → ATA → EXT2 → VFS → userspace)
-- Blindagem concorrente no driver ATA (`ata_mutex`) contra race conditions SMP
-- Parser do Superbloco com validação do número mágico `0xEF53`
-- Tabela de Descritores de Grupos de Blocos carregada em RAM
-- Aritmética modular de conversão inode → (grupo, índice, bloco, offset)
-- Protocolo Read-Modify-Write para `ext2_write_inode()`
-- Navegação recursiva de diretórios a partir do Inode Raiz 2
-- Motores de varredura atômica de bitmaps de blocos e inodes
-- Suporte a ponteiros diretos (`i_block[0..11]`) e simplesmente indiretos (`i_block[12]`)
-- Algoritmo de divisão de entradas de diretório (*directory entry splitting*)
-- Detecção automática FAT16 → EXT2 fallback
-- Regras de Ring 0 e conformidade `klog` (sem especificadores de formato)
-- Referência de estruturas on-disk (`ext2_superblock`, `ext2_inode`, `ext2_dir_entry_2`)
+### 1. [ARCHITECTURAL_DECISIONS.md](ARCHITECTURAL_DECISIONS.md)
+*   **Descrição**: Registro de decisões de design técnico críticas tomadas no projeto.
+*   **Objetivo**: Justificar as escolhas arquiteturais (ex: por que usar Copy-On-Write, mutexes atômicos, spinlocks seguros para interrupções e printf bufferizado).
+*   **Dependências**: Nenhuma.
+*   **Público-Alvo**: Arquitetos de software, revisores de código e novos desenvolvedores.
 
-**Leia este se:** Você precisa entender o subsistema de armazenamento persistente EXT2 do v4.0 em profundidade.
+### 2. [CHANGELOG.md](CHANGELOG.md)
+*   **Descrição**: Histórico completo de alterações no PhotonOS por versão.
+*   **Objetivo**: Rastrear novos recursos, correções de bugs, breaking changes e impactos arquiteturais em cada release.
+*   **Dependências**: Nenhuma.
+*   **Público-Alvo**: Todos os desenvolvedores e usuários do PhotonOS.
 
----
+### 3. [ROADMAP.md](ROADMAP.md)
+*   **Descrição**: Planejamento e visão futura do desenvolvimento do PhotonOS.
+*   **Objetivo**: Dividir o status entre tarefas concluídas, em andamento, planejadas e débitos técnicos prioritários.
+*   **Dependências**: Nenhuma.
+*   **Público-Alvo**: Desenvolvedores e engenheiros interessados em contribuir para o sistema.
 
-### 1. cow_memory_optimization.md — `[v3.1]`
-**Propósito:** Especificação técnica completa do mecanismo Copy-On-Write  
-**Escopo:** PMM (refcounts), VMM (clone COW), IDT (INT 0x0E), SMP (TLB Shootdown)  
-**Público:** Engenheiros de sistemas operacionais, revisores de código Ring 0  
-**Conteúdo:**
-- Motivação e comparação com deep-copy
-- Array `pmm_refcounts`: estrutura, inicialização, alocação e liberação condicional
-- Protocolo COW em `vmm_clone_address_space`: manipulação de flags de PTE (`PAGE_COW = 0x200`)
-- Fluxo assembly `page_fault_stub` e rotina C `vmm_page_fault_handler`
-- Lógica de page splitting (refcount > 1 vs refcount == 1)
-- TLB Shootdown via LAPIC IPI (Vector `0x79`) em ambientes SMP
-- Tabela de impacto de performance e invariantes Ring 0
-
-**Leia este se:** Você precisa entender a otimização de memória do v3.1 em profundidade.
+### 4. [KNOWN_ISSUES.md](KNOWN_ISSUES.md)
+*   **Descrição**: Catálogo de limitações, bugs conhecidos e débitos técnicos.
+*   **Objetivo**: Documentar de forma transparente os limites atuais do kernel (ex: TCP sem fluxo de dados, fila de teclado em SMP e screen tearing).
+*   **Dependências**: Nenhuma.
+*   **Público-Alvo**: Desenvolvedores e engenheiros de integração.
 
 ---
 
-### 2. process_lifecycle.md — `[ATUALIZADO — v3.1]`
-**Propósito:** Ciclo de vida de processos com COW, IPC e sincronização  
-**Conteúdo:**
-- Fluxo de `sys_fork` (Syscall 23) do espaço de usuário até Ring 0
-- Clonagem COW preguiçosa em `vmm_clone_address_space`
-- Handler de Page Fault COW (`INT 0x0E`)
-- Regra de Ouro do Fork (RAX = 0 no filho)
-- `sys_exit` / `sys_wait` e liberação segura de frames compartilhados
-- Sincronização atômica em Pipes (IPC)
+## 🏗️ 1. Arquitetura do Núcleo (architecture/)
 
-**Leia este se:** Você precisa entender o pipeline completo de bifurcação de processos.
+### 1.1. [architecture.md](architecture/architecture.md)
+*   **Descrição**: Design de privilégios de hardware e segmentação da GDT/TSS.
+*   **Objetivo**: Explicar a separação Ring 0 / Ring 3, os seletores da GDT, e a prevenção de Triple Faults via pilhas IST.
+*   **Dependências**: GDT e TSS do kernel.
+*   **Público-Alvo**: Engenheiros de kernel.
 
----
+### 1.2. [boot_process.md](architecture/boot_process.md)
+*   **Descrição**: Fluxo de boot e inicialização multiestágio.
+*   **Objetivo**: Detalhar a transição do processador de Modo Real (16-bit) → Modo Protegido (32-bit) → Modo Longo (64-bit) com paginação ativa.
+*   **Dependências**: Bootloader assembly (`boot.asm` / `kernel.asm`).
+*   **Público-Alvo**: Especialistas em boot e assembly x86.
 
-### 3. smp.md
-**Propósito:** Multiprocessamento Simétrico — bootstrap de núcleos AP  
-**Conteúdo:**
-- Protocolo INIT-SIPI via LAPIC ICR
-- Código trampolim em `0x7000`
-- Spinlocks atômicos e `ap_kmain`
-- `smp_tlb_shootdown_handler` (Vector `0x79`) — integração com COW
+### 1.3. [process_lifecycle.md](architecture/process_lifecycle.md)
+*   **Descrição**: Mecanismos de criação e destruição de tarefas.
+*   **Objetivo**: Explicar chamadas de sistema `sys_fork`, `sys_execve`, `sys_exit` e `sys_wait`, e liberação de recursos.
+*   **Dependências**: Memória virtual (VMM) e Escalonador.
+*   **Público-Alvo**: Engenheiros de sistemas operacionais.
 
----
+### 1.4. [scheduler.md](architecture/scheduler.md)
+*   **Descrição**: Escalonador preemptivo e exclusão mútua em tabelas críticas.
+*   **Objetivo**: Detalhar a fila Round-Robin, estados de tarefas, preempção por timer e spinlocks seguros contra interrupções (`task_table_lock`).
+*   **Dependências**: APIC / PIT Timer, interrupções.
+*   **Público-Alvo**: Engenheiros de sistemas operacionais.
 
-## 📖 Documentação Legada (Keyboard Driver v2)
+### 1.5. [smp.md](architecture/smp.md)
+*   **Descrição**: Protocolo de bootstrap multi-core (Symmetric Multiprocessing).
+*   **Objetivo**: Descrever a varredura ACPI MADT, inicialização de Application Processors (APs), IPIs de controle e TLB Shootdown.
+*   **Dependências**: Local APIC (LAPIC), ACPI.
+*   **Público-Alvo**: Especialistas em multiprocessamento.
 
-### 4. README_KEYBOARD_DRIVER_V2.md
-**Purpose:** Complete implementation and deployment guide  
-**Length:** ~8-10 pages  
-**For:** Developers, implementation teams  
-**Contains:**
-- Full architecture
-- Build instructions
-- Test procedures
-- Performance analysis
-- Troubleshooting guide
+### 1.6. [apic.md](architecture/apic.md)
+*   **Descrição**: Registradores e operações do Local APIC.
+*   **Objetivo**: Detalhar o mapeamento MMIO base, inicialização, desativação de PIC legado e interrupções locais.
+*   **Dependências**: MSRs do processador.
+*   **Público-Alvo**: Programadores de hardware.
 
-**Read this if:** You need to compile and test the driver
+### 1.7. [ioapic.md](architecture/ioapic.md)
+*   **Descrição**: Roteamento físico de IRQs pelo chip I/O APIC.
+*   **Objetivo**: Explicar o endereçamento de interrupções de hardware para núcleos de CPU por meio da tabela de redirecionamento.
+*   **Dependências**: Local APIC, IDT.
+*   **Público-Alvo**: Engenheiros de drivers.
 
----
+### 1.8. [interrupts.md](architecture/interrupts.md)
+*   **Descrição**: Tabela de Descritores de Interrupção (IDT).
+*   **Objetivo**: Detalhar stubs assembly de tratamento, alinhamento de pilhas para a ABI, e isolamento de falhas do Ring 3.
+*   **Dependências**: Arquitetura x86_64.
+*   **Público-Alvo**: Engenheiros de kernel.
 
-### 5. QUICK_REFERENCE_KEYBOARD_V2.md
-**Purpose:** Quick reference for common tasks  
-**Length:** ~4-5 pages  
-**For:** Daily reference, quick lookups  
-**Contains:**
-- Critical characters table
-- Build & test quick commands
-- Debug commands
-- Troubleshooting quick fixes
-- Scancode reference table
-
-**Read this if:** You need quick answers while working
-
----
-
-### 6. KEYBOARD_DRIVER_IMPROVEMENTS.md
-**Purpose:** Comprehensive technical specification  
-**Length:** ~15-20 pages  
-**For:** Technical architects, deep understanding  
-**Contains:**
-- Complete technical specification
-- Detailed flow diagrams
-- Character mapping tables
-- Hardware-to-software flow
-- Extended scancode support
-- Shell integration details
-- Compilation steps
-- Troubleshooting procedures
-
-**Read this if:** You want complete technical details
+### 1.9. [syscall_flow.md](architecture/syscall_flow.md)
+*   **Descrição**: Roteador e manipulação de System Calls de 64 bits.
+*   **Objetivo**: Descrever o funcionamento das instruções `syscall`/`sysret` via MSRs e passagem de parâmetros.
+*   **Dependências**: IDT/GDT, ulibc.
+*   **Público-Alvo**: Engenheiros de compiladores e ulibc.
 
 ---
 
-### 7. KEYBOARD_CHANGELOG.md
-**Purpose:** Version history and feature documentation  
-**Length:** ~10-12 pages  
-**For:** Project tracking, feature verification  
-**Contains:**
-- Changelog entry
-- What was implemented
-- Files modified
-- How to compile and test
-- Structure of code
-- Validation procedures
-- Compatibility matrix
-- Future enhancements
+## 🧠 2. Gerenciamento de Memória (memory/)
 
-**Read this if:** You need version history and feature list
+### 2.1. [pmm.md](memory/pmm.md)
+*   **Descrição**: Alocador de Memória Física baseada em Bitmap.
+*   **Objetivo**: Descrever o bitmap que rastreia páginas físicas de 4 KiB e as funções `pmm_alloc` / `pmm_free`.
+*   **Dependências**: Memória física disponível.
+*   **Público-Alvo**: Engenheiros de memória.
 
----
+### 2.2. [vmm.md](memory/vmm.md)
+*   **Descrição**: Mapeamento Virtual Hierárquico de 4 níveis.
+*   **Objetivo**: Detalhar travessia PML4 → PDPT → PD → PT, isolamento de áreas kernel/usuário e `vmm_lock`.
+*   **Dependências**: PMM.
+*   **Público-Alvo**: Engenheiros de memória virtual.
 
-### 8. KEYBOARD_DIFF_DETAILED.md
-**Purpose:** Exact before/after code diff with explanations  
-**Length:** ~12-15 pages  
-**For:** Code reviewers, implementation verification  
-**Contains:**
-- Detailed diff for each change
-- Line-by-line explanations
-- Benefits of each change
-- Impact analysis
-- Verification checklist
+### 2.3. [paging.md](memory/paging.md)
+*   **Descrição**: Configurações de paginação de hardware.
+*   **Objetivo**: Mapear as flags da tabela de páginas (Present, Writable, User, Cache Disable, Write Through).
+*   **Dependências**: VMM.
+*   **Público-Alvo**: Programadores de baixo nível.
 
-**Read this if:** You need to review exact code changes
+### 2.4. [cow.md](memory/cow.md)
+*   **Descrição**: Otimização Copy-On-Write (COW).
+*   **Objetivo**: Detalhar contadores de referência (`pmm_refcounts`), interceptação de falha por escrita no Page Fault, divisão de frames compartilhados e invalidação de TLB.
+*   **Dependências**: PMM, VMM, IPIs.
+*   **Público-Alvo**: Desenvolvedores de alta performance.
 
----
+### 2.5. [heap.md](memory/heap.md)
+*   **Descrição**: Alocador dinâmico do Kernel (Heap).
+*   **Objetivo**: Descrever o alocador First-Fit com lista ligada (`struct heap_block`), divisão/fusão de blocos e `heap_lock`.
+*   **Dependências**: VMM, PMM.
+*   **Público-Alvo**: Desenvolvedores de Ring 0.
 
-### 9. test_keyboard_special_chars.sh
-**Purpose:** Automated test script for special characters  
-**Length:** ~200 lines  
-**For:** Validation, automated testing  
-**Contains:**
-- Automated keyboard input sequences
-- QEMU integration
-- Result analysis
-- Serial log parsing
-- Pass/fail reporting
-
-**Run this if:** You want automated test verification
+### 2.6. [tlb.md](memory/tlb.md)
+*   **Descrição**: Coerência de caches de tradução de endereços.
+*   **Objetivo**: Explicar a invalidação de TLB local por instruções `invlpg` e por recarga do registrador `CR3`.
+*   **Dependências**: VMM.
+*   **Público-Alvo**: Especialistas em arquitetura de processador.
 
 ---
 
-## 🗺️ Navigation by Purpose
+## 🗄️ 3. Sistemas de Arquivos (filesystem/)
 
-### "I need to understand the project quickly"
-1. IMPLEMENTATION_SUMMARY.md (5 min)
-2. QUICK_REFERENCE_KEYBOARD_V2.md (10 min)
-3. README_KEYBOARD_DRIVER_V2.md (20 min)
+### 3.1. [vfs.md](filesystem/vfs.md)
+*   **Descrição**: Camada de Abstração do Virtual File System (VFS).
+*   **Objetivo**: Detalhar as estruturas de nós e a interface abstrata comum para montagem e acesso a arquivos.
+*   **Dependências**: Nenhuma.
+*   **Público-Alvo**: Desenvolvedores de arquivos e E/S.
 
-### "I need to compile and test"
-1. README_KEYBOARD_DRIVER_V2.md → Build section
-2. test_keyboard_special_chars.sh
-3. QUICK_REFERENCE_KEYBOARD_V2.md → Debug section
+### 3.2. [fat16.md](filesystem/fat16.md)
+*   **Descrição**: Driver do Sistema de Arquivos FAT16 gravável.
+*   **Objetivo**: Explicar a validação do BPB, navegação em diretório 8.3, redimensionamento de cadeias de clusters e controle por `fat16_mutex`.
+*   **Dependências**: VFS, Driver ATA.
+*   **Público-Alvo**: Engenheiros de armazenamento.
 
-### "I need to understand the code"
-1. KEYBOARD_DIFF_DETAILED.md (exact changes)
-2. KEYBOARD_DRIVER_IMPROVEMENTS.md (technical details)
-3. Review kernel.c directly (lines 155-205, 1150-1170, 1195-1320)
-
-### "I need to verify everything"
-1. KEYBOARD_CHANGELOG.md → Verification checklist
-2. KEYBOARD_DIFF_DETAILED.md → Verification section
-3. test_keyboard_special_chars.sh
-
-### "I need to troubleshoot an issue"
-1. QUICK_REFERENCE_KEYBOARD_V2.md → Troubleshooting section
-2. README_KEYBOARD_DRIVER_V2.md → Troubleshooting section
-3. KEYBOARD_DRIVER_IMPROVEMENTS.md → Detailed troubleshooting
+### 3.3. [ext2.md](filesystem/ext2.md)
+*   **Descrição**: Driver do Sistema de Arquivos EXT2 nativo gravável.
+*   **Objetivo**: Detalhar superblocos, descritores de grupo, leitura/escrita de inodes, ponteiros indiretos, bitmaps e divisão de entradas de diretório.
+*   **Dependências**: VFS, Driver ATA.
+*   **Público-Alvo**: Engenheiros de armazenamento e file systems.
 
 ---
 
-## 📊 Document Sizes
+## 🌐 4. Pilha de Rede (networking/)
 
-| Document | Pages | Words | Purpose |
-|----------|-------|-------|---------|
-| IMPLEMENTATION_SUMMARY.md | 4 | ~1,500 | Executive overview |
-| QUICK_REFERENCE_KEYBOARD_V2.md | 5 | ~1,800 | Quick reference |
-| README_KEYBOARD_DRIVER_V2.md | 10 | ~3,500 | Complete guide |
-| KEYBOARD_DRIVER_IMPROVEMENTS.md | 20 | ~6,000 | Technical spec |
-| KEYBOARD_CHANGELOG.md | 12 | ~3,500 | Version history |
-| KEYBOARD_DIFF_DETAILED.md | 15 | ~4,000 | Code diff |
-| test_keyboard_special_chars.sh | 1 | ~500 | Test script |
-| **TOTAL** | **67** | **~21,300** | **Complete documentation** |
+### 4.1. [network_architecture.md](networking/network_architecture.md)
+*   **Descrição**: Topologia e pipeline das camadas de rede.
+*   **Objetivo**: Explicar a comunicação entre o driver de rede, a thread de rede do kernel e os buffers de sockets.
+*   **Dependências**: e1000 Driver.
+*   **Público-Alvo**: Engenheiros de rede.
 
----
+### 4.2. [e1000.md](networking/e1000.md)
+*   **Descrição**: Driver para a placa Ethernet Intel e1000 (PCI).
+*   **Objetivo**: Explicar o endereçamento base MMIO, anéis de buffers de descritores DMA de transmissão (TX) e recepção (RX), e IRQ 11.
+*   **Dependências**: PCI Bus, DMA.
+*   **Público-Alvo**: Desenvolvedores de drivers de rede.
 
-## 🔑 Key Sections by Topic
+### 4.3. [arp.md](networking/arp.md)
+*   **Descrição**: Protocolo de Resolução de Endereços (ARP).
+*   **Objetivo**: Detalhar o cache do ARP, requisições por broadcast e resolução lógica de endereços MAC.
+*   **Dependências**: Ethernet, IP.
+*   **Público-Alvo**: Engenheiros de rede de baixo nível.
 
-### Character Mappings
-- KEYBOARD_DRIVER_IMPROVEMENTS.md § 5 - Mapeamento de Caracteres Especiais
-- KEYBOARD_DIFF_DETAILED.md § Change 1-2 - Keymap expansions
-- QUICK_REFERENCE_KEYBOARD_V2.md § Critical Characters
+### 4.4. [ipv4.md](networking/ipv4.md)
+*   **Descrição**: Protocolo de Internet Versão 4.
+*   **Objetivo**: Descrever validações de cabeçalhos, cálculo de checksums IP e despacho de datagramas.
+*   **Dependências**: Ethernet.
+*   **Público-Alvo**: Engenheiros de rede.
 
-### Scancode Information
-- KEYBOARD_DRIVER_IMPROVEMENTS.md § 5.1 - Tabela de Referência
-- QUICK_REFERENCE_KEYBOARD_V2.md § Keyboard Scancode Reference
-- KEYBOARD_DRIVER_IMPROVEMENTS.md § 12 - Referências Técnicas
+### 4.5. [icmp.md](networking/icmp.md)
+*   **Descrição**: Tratamento de Echo Request/Reply (Ping).
+*   **Objetivo**: Explicar o encapsulamento, checksums ICMP e suporte a sockets raw (`SOCK_RAW`).
+*   **Dependências**: IPv4, Sockets.
+*   **Público-Alvo**: Engenheiros de diagnóstico.
 
-### Implementation Details
-- KEYBOARD_DIFF_DETAILED.md - Detailed before/after diffs
-- README_KEYBOARD_DRIVER_V2.md § Architecture - System flow
-- KEYBOARD_DRIVER_IMPROVEMENTS.md § 4 - Fluxo Completo de Entrada
+### 4.6. [udp.md](networking/udp.md)
+*   **Descrição**: Protocolo de Datagramas de Usuário (UDP).
+*   **Objetivo**: Detalhar a montagem de cabeçalhos, checksums com pseudo-cabeçalho IP e filas de recepção do socket.
+*   **Dependências**: IPv4, Sockets.
+*   **Público-Alvo**: Engenheiros de rede.
 
-### Debug & Troubleshooting
-- README_KEYBOARD_DRIVER_V2.md § Debug & Troubleshooting
-- KEYBOARD_DRIVER_IMPROVEMENTS.md § 11 - Troubleshooting
-- QUICK_REFERENCE_KEYBOARD_V2.md § Troubleshooting Quick Fix
-
-### Build & Compilation
-- README_KEYBOARD_DRIVER_V2.md § Build & Compilation
-- KEYBOARD_CHANGELOG.md § Como compilar e testar
-- QUICK_REFERENCE_KEYBOARD_V2.md § Build & Test (Quick)
-
-### Testing
-- test_keyboard_special_chars.sh - Automated test script
-- README_KEYBOARD_DRIVER_V2.md § Run & Test
-- KEYBOARD_CHANGELOG.md § Testes
+### 4.7. [tcp.md](networking/tcp.md)
+*   **Descrição**: Protocolo de Controle de Transmissão (Handshake).
+*   **Objetivo**: Detalhar o estabelecimento de conexão (Three-Way Handshake SYN → SYN-ACK → ACK), o TCB local e as limitações de envio de dados.
+*   **Dependências**: IPv4, Sockets.
+*   **Público-Alvo**: Engenheiros de rede e arquitetos.
 
 ---
 
-## 📋 Quick Command Reference
+## 🔌 5. Drivers de Hardware (drivers/)
 
-### Compilação (WSL Unificado)
-```bash
-# Build completo: limpeza + compilação + imagem de disco FAT16
-make clean; make; make fat16-disk
-```
+### 5.1. [framebuffer.md](drivers/framebuffer.md)
+*   **Descrição**: Driver de Vídeo VBE (VESA Bios Extensions).
+*   **Objetivo**: Explicar o mapeamento LFB em alta memória com cache write-through, double-buffering e desenho do cursor por software.
+*   **Dependências**: Parâmetros do bootloader.
+*   **Público-Alvo**: Engenheiros de interface e vídeo.
 
-### Testing
-```bash
-# See: QUICK_REFERENCE_KEYBOARD_V2.md § Build & Test
-make run-fat16
-```
+### 5.2. [keyboard.md](drivers/keyboard.md)
+*   **Descrição**: Driver de Teclado PS/2 (IRQ 1).
+*   **Objetivo**: Detalhar tabelas US-QWERTY, códigos Make e Break, buffers de entrada e interceptação Ctrl+C para sinal SIGINT.
+*   **Dependências**: IDT, Escalonador.
+*   **Público-Alvo**: Engenheiros de drivers de entrada.
 
-### Debug
-```bash
-# See: README_KEYBOARD_DRIVER_V2.md § Debug & Troubleshooting
-qemu-system-x86_64 -drive file=photon.img -serial file:debug.log
-```
+### 5.3. [mouse.md](drivers/mouse.md)
+*   **Descrição**: Driver de Mouse PS/2 (IRQ 12).
+*   **Objetivo**: Detalhar a inicialização do chip 8042, parsing de pacotes de dados de 3 bytes e limites de coordenadas gráficas.
+*   **Dependências**: IDT, Vídeo Framebuffer.
+*   **Público-Alvo**: Engenheiros de drivers.
 
-### Test Script
-```bash
-# See: test_keyboard_special_chars.sh
-bash test_keyboard_special_chars.sh
-```
+### 5.4. [ata.md](drivers/ata.md)
+*   **Descrição**: Driver de Disco ATA (PIO Mode).
+*   **Objetivo**: Explicar leitura/escrita LBA de 28 bits por portas de E/S de 16 bits e segurança contra concorrência via `ata_mutex`.
+*   **Dependências**: VFS, barramento IDE.
+*   **Público-Alvo**: Desenvolvedores de drivers de armazenamento.
 
----
-
-## ✅ Verification Checklist
-
-### Code Changes
-- [ ] Review KEYBOARD_DIFF_DETAILED.md for exact changes
-- [ ] Verify kernel.c lines 155-205 (keymaps)
-- [ ] Verify kernel.c lines 1150-1170 (conversion)
-- [ ] Verify kernel.c lines 1195-1320 (handler)
-
-### Implementation
-- [ ] Build: `make clean && make all`
-- [ ] Disk: `make fat16-disk`
-- [ ] Test: `make run-fat16`
-- [ ] Debug: Capture serial log
-
-### Functionality
-- [ ] Pipe works: `echo "test" | upper`
-- [ ] Quotes work: `echo 'test'` and `echo "test"`
-- [ ] Backslash works: Path and escape
-- [ ] Forward slash works: File paths
-
-### Documentation
-- [ ] Read IMPLEMENTATION_SUMMARY.md
-- [ ] Review KEYBOARD_DRIVER_IMPROVEMENTS.md
-- [ ] Check KEYBOARD_DIFF_DETAILED.md
-- [ ] Verify with QUICK_REFERENCE_KEYBOARD_V2.md
+### 5.5. [pci.md](drivers/pci.md)
+*   **Descrição**: Varredura ativa do barramento PCI.
+*   **Objetivo**: Descrever o acesso ao espaço de configuração pelas portas `0xCF8`/`0xCFC`, leitura de BARs de 32/64 bits e ativação de barramento DMA.
+*   **Dependências**: Hardware PCI.
+*   **Público-Alvo**: Desenvolvedores de barramento e drivers.
 
 ---
 
-## 🎓 Learning Path
+## 👥 6. Espaço de Usuário e ulibc (userspace/)
 
-### Beginner (30 minutes)
-1. IMPLEMENTATION_SUMMARY.md (5 min)
-2. QUICK_REFERENCE_KEYBOARD_V2.md (10 min)
-3. README_KEYBOARD_DRIVER_V2.md § Architecture (15 min)
+### 6.1. [shell.md](userspace/shell.md)
+*   **Descrição**: Console de comandos interativo.
+*   **Objetivo**: Descrever os comandos embutidos, pipelines de pipes (`|`) e redirecionamentos de arquivos (`>`) via `dup2`.
+*   **Dependências**: ulibc, VFS.
+*   **Público-Alvo**: Desenvolvedores de aplicações.
 
-### Intermediate (1-2 hours)
-1. README_KEYBOARD_DRIVER_V2.md (30 min)
-2. KEYBOARD_CHANGELOG.md (30 min)
-3. KEYBOARD_DRIVER_IMPROVEMENTS.md § 4, 5 (30 min)
+### 6.2. [libc.md](userspace/libc.md)
+*   **Descrição**: Biblioteca padrão de espaço de usuário (ulibc).
+*   **Objetivo**: Descrever o gateway central de system calls `_syscall()`, o alocador dinâmico malloc/free do heap de Ring 3 e o printf bufferizado de 2 KiB.
+*   **Dependências**: Interface de syscalls do kernel.
+*   **Público-Alvo**: Desenvolvedores C no PhotonOS.
 
-### Advanced (2-4 hours)
-1. KEYBOARD_DIFF_DETAILED.md (1 hour)
-2. KEYBOARD_DRIVER_IMPROVEMENTS.md (full) (1.5 hours)
-3. Review kernel.c source directly (1 hour)
-4. Run test script and debug (0.5 hour)
+### 6.3. [elf_loader.md](userspace/elf_loader.md)
+*   **Descrição**: Motor de carregamento de executáveis ELF64.
+*   **Objetivo**: Explicar a validação de cabeçalhos, mapeamento de segmentos PT_LOAD na PML4, stack de usuário, trampolim de sinais e compactação `-N` (OMAGIC).
+*   **Dependências**: VMM, PMM, VFS.
+*   **Público-Alvo**: Engenheiros de kernel e compiladores.
 
----
-
-## 📞 Getting Help
-
-### "What was changed?"
-→ KEYBOARD_DIFF_DETAILED.md - Exact diffs with explanations
-
-### "How do I build it?"
-→ README_KEYBOARD_DRIVER_V2.md § Build & Compilation
-
-### "How do I test it?"
-→ QUICK_REFERENCE_KEYBOARD_V2.md § Build & Test (Quick)
-
-### "Why does my test fail?"
-→ QUICK_REFERENCE_KEYBOARD_V2.md § Troubleshooting Quick Fix
-
-### "What's the complete specification?"
-→ KEYBOARD_DRIVER_IMPROVEMENTS.md - 20+ pages of details
-
-### "What features are included?"
-→ KEYBOARD_CHANGELOG.md - Complete feature list
-
-### "What were the changes exactly?"
-→ KEYBOARD_DIFF_DETAILED.md - Line-by-line diff
-
----
-
-## 🔗 Cross-References
-
-### Special Characters
-**Pipe (|)**
-- Def: KEYBOARD_DRIVER_IMPROVEMENTS.md § 5.2
-- Impl: KEYBOARD_DIFF_DETAILED.md § Change 2
-- Ref: QUICK_REFERENCE_KEYBOARD_V2.md § Pipe
-
-**Quotes (' and ")**
-- Def: KEYBOARD_DRIVER_IMPROVEMENTS.md § 1
-- Impl: KEYBOARD_DIFF_DETAILED.md § Changes 1-2
-- Ref: QUICK_REFERENCE_KEYBOARD_V2.md § Quotes
-
-**Backslash (\)**
-- Def: KEYBOARD_DRIVER_IMPROVEMENTS.md § 1.1
-- Impl: KEYBOARD_DIFF_DETAILED.md § Change 1
-- Ref: QUICK_REFERENCE_KEYBOARD_V2.md § Backslash
-
-### Code Sections
-**keymap_normal[128]**
-- Location: kernel.c lines ~155-205
-- Details: KEYBOARD_DIFF_DETAILED.md § Change 1
-- Docs: KEYBOARD_DRIVER_IMPROVEMENTS.md § 1.1
-
-**keymap_shift[128]**
-- Location: kernel.c lines ~208-260
-- Details: KEYBOARD_DIFF_DETAILED.md § Change 2
-- Docs: KEYBOARD_DRIVER_IMPROVEMENTS.md § 1.2
-
-**keyboard_char_from_scancode()**
-- Location: kernel.c lines ~1150-1170
-- Details: KEYBOARD_DIFF_DETAILED.md § Change 3
-- Docs: KEYBOARD_DRIVER_IMPROVEMENTS.md § 2.1
-
-**keyboard_handle_scancode()**
-- Location: kernel.c lines ~1195-1320
-- Details: KEYBOARD_DIFF_DETAILED.md § Change 4
-- Docs: KEYBOARD_DRIVER_IMPROVEMENTS.md § 3
-
----
-
-## 📈 Statistics
-
-- **Total Documentation:** 67 pages
-- **Total Words:** 21,300+
-- **Diagrams & Tables:** 20+
-- **Code Examples:** 50+
-- **Commands & Checklists:** 30+
-- **Implementation Time:** Complete
-- **Testing Readiness:** Full
-
----
-
-## 🎉 Summary
-
-You have access to comprehensive documentation covering:
-- ✅ Executive summaries
-- ✅ Quick reference guides
-- ✅ Complete technical specifications
-- ✅ Exact code diffs
-- ✅ Build instructions
-- ✅ Testing procedures
-- ✅ Troubleshooting guides
-- ✅ Automated test scripts
-
-**Start with:** IMPLEMENTATION_SUMMARY.md (5 minutes)  
-**Then read:** README_KEYBOARD_DRIVER_V2.md (20 minutes)  
-**Then build:** make clean && make all  
-**Then test:** make run-fat16  
-
----
-
-**Documentation Status:** ✅ Complete  
-**Last Updated:** 2026-07-01  
-**Version:** 3.0  
-
-Happy hacking! 🚀
+### 6.4. [programs.md](userspace/programs.md)
+*   **Descrição**: Catálogo de programas Ring 3 em disco.
+*   **Objetivo**: Catalogar os binários `shell`, `ping`, `hello`, `hang`, `upper`, `rev` e `spin`, detalhando seu código de teste e casos de validação.
+*   **Dependências**: ulibc.
+*   **Público-Alvo**: Desenvolvedores e usuários finais.

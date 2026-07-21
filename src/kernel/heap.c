@@ -4,6 +4,10 @@
 
 #include "memory.h"
 #include "vmm.h"
+#include "smp.h"
+
+static spinlock_t heap_lock;
+
 
 #define KERNEL_HEAP_BASE 0xFFFFFFFF90000000ULL
 #define KERNEL_HEAP_INITIAL_PAGES 4ULL
@@ -127,6 +131,7 @@ static void heap_coalesce(struct heap_block *block)
 
 void heap_init(void)
 {
+    spin_init(&heap_lock);
     heap_start = KERNEL_HEAP_BASE;
     heap_end = KERNEL_HEAP_BASE;
     heap_limit = KERNEL_HEAP_BASE + (KERNEL_HEAP_MAX_PAGES * PMM_PAGE_SIZE);
@@ -143,16 +148,20 @@ void *kmalloc(size_t size)
 
     size = align_up_size(size, 16);
 
+    uint64_t flags = spin_lock_irqsave(&heap_lock);
+
     for (;;) {
         for (struct heap_block *block = heap_head; block != 0; block = block->next) {
             if (block->magic == HEAP_MAGIC && block->free && block->size >= size) {
                 heap_split_block(block, size);
                 block->free = 0;
+                spin_unlock_irqrestore(&heap_lock, flags);
                 return block + 1;
             }
         }
 
         if (!heap_expand(size + sizeof(struct heap_block))) {
+            spin_unlock_irqrestore(&heap_lock, flags);
             return 0;
         }
     }
@@ -164,11 +173,16 @@ void kfree(void *ptr)
         return;
     }
 
+    uint64_t flags = spin_lock_irqsave(&heap_lock);
+
     struct heap_block *block = ((struct heap_block *)ptr) - 1;
     if (block->magic != HEAP_MAGIC) {
+        spin_unlock_irqrestore(&heap_lock, flags);
         return;
     }
 
     block->free = 1;
     heap_coalesce(block);
+
+    spin_unlock_irqrestore(&heap_lock, flags);
 }

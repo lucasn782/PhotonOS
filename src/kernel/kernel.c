@@ -123,6 +123,8 @@ extern void syscall_entry(void);
 extern void double_fault_stub(void);
 extern void page_fault_stub(void);
 extern void tlb_shootdown_stub(void);
+extern void gpf_stub(void);
+extern void spurious_irq_stub(void);
 
 static size_t cursor_row;
 static size_t cursor_col;
@@ -1566,6 +1568,29 @@ void double_fault_handler(uint64_t rip, uint64_t cs, uint64_t rflags, uint64_t r
     }
 }
 
+void gpf_handler(uint64_t error_code, uint64_t rip, uint64_t cs)
+{
+    /* If the fault originated from Ring 3 (user mode), terminate the process
+     * instead of crashing the entire kernel. */
+    if ((cs & 0x3ULL) == 0x3ULL) {
+        klog("kernel: gpf from userspace, terminating task\n");
+        scheduler_exit_current(-1);
+        for (;;) {
+            __asm__ volatile ("sti; hlt");
+        }
+    }
+
+    /* Ring 0 GPF is unrecoverable — kernel panic. */
+    __asm__ volatile ("cli");
+    klog("\n*** KERNEL PANIC: GENERAL PROTECTION FAULT (INT 0x0D) ***\n");
+    (void)error_code;
+    (void)rip;
+
+    for (;;) {
+        __asm__ volatile ("hlt");
+    }
+}
+
 static void idt_init(void)
 {
     memory_set(idt, 0, sizeof(idt));
@@ -1574,8 +1599,10 @@ static void idt_init(void)
     idt_set_gate(0x2C, mouse_irq_stub); 
     idt_set_gate(8, double_fault_stub);
     idt[8].ist = 1;
+    idt_set_gate(13, gpf_stub);
     idt_set_gate(14, page_fault_stub);
     idt_set_gate(0x79, tlb_shootdown_stub);
+    idt_set_gate(0xFF, spurious_irq_stub);
     idt_load();
 }
 
@@ -1800,9 +1827,23 @@ void kmain(void)
 
     smp_init();
     klog("SMP: trampolim instalado. Inicializando APs...\n");
-    smp_boot_ap(1);
-    smp_boot_ap(2);
-    smp_boot_ap(3);
+
+    uint8_t apic_ids[4];
+    int cpus = smp_discover_cpus(apic_ids, 4);
+    if (cpus > 0) {
+        uint32_t bsp_apic_id = apic_read(0x20) >> 24; // APIC_REG_ID is 0x20
+        for (int i = 0; i < cpus; i++) {
+            if (apic_ids[i] != bsp_apic_id) {
+                smp_boot_ap(apic_ids[i]);
+            }
+        }
+    } else {
+        /* Fallback: tenta iniciar APs de ID 1, 2, 3 se ACPI MADT falhar */
+        smp_boot_ap(1);
+        smp_boot_ap(2);
+        smp_boot_ap(3);
+    }
+
     
     tss_init();
     syscall_init();

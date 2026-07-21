@@ -6,6 +6,7 @@
 #include "smp.h"
 #include "apic.h"
 #include "serial.h"
+#include "scheduler.h"
 
 #define VMM_PAGE_SIZE 4096ULL
 #define VMM_PAGE_MASK (~(VMM_PAGE_SIZE - 1ULL))
@@ -14,6 +15,7 @@
 #define VMM_TABLE_ENTRIES 512
 
 static uint64_t *kernel_pml4;
+static spinlock_t vmm_lock;
 
 static uint64_t read_cr3(void)
 {
@@ -145,6 +147,7 @@ static void map_in_pml4(uint64_t *pml4, uintptr_t virtual_addr,
 
 void vmm_init(void)
 {
+    spin_init(&vmm_lock);
     kernel_pml4 = (uint64_t *)(read_cr3() & VMM_ENTRY_ADDR_MASK);
 }
 
@@ -159,8 +162,10 @@ void vmm_map(uintptr_t virtual_addr, uintptr_t physical_addr, uint32_t flags)
         vmm_init();
     }
 
+    uint64_t lock_flags = spin_lock_irqsave(&vmm_lock);
     map_in_pml4(kernel_pml4, virtual_addr, physical_addr, flags);
     vmm_flush(virtual_addr & VMM_PAGE_MASK);
+    spin_unlock_irqrestore(&vmm_lock, lock_flags);
 }
 
 uintptr_t vmm_virt_to_phys(uintptr_t virtual_addr)
@@ -218,6 +223,8 @@ uint64_t *vmm_create_address_space(void)
 
     clear_page(pml4);
 
+    uint64_t lock_flags = spin_lock_irqsave(&vmm_lock);
+
     uint64_t *kernel = vmm_kernel_pml4();
 
     /* Clone the low identity mapping (covers e1000 MMIO at 0xF0000000 and
@@ -231,6 +238,7 @@ uint64_t *vmm_create_address_space(void)
         pml4[i] = kernel[i];
     }
 
+    spin_unlock_irqrestore(&vmm_lock, lock_flags);
     return pml4;
 }
 
@@ -239,6 +247,8 @@ void vmm_destroy_address_space(uint64_t *pml4)
     if (pml4 == NULL || pml4 == vmm_kernel_pml4()) {
         return;
     }
+
+    uint64_t lock_flags = spin_lock_irqsave(&vmm_lock);
 
     for (uint64_t pml4_i = 0; pml4_i < VMM_TABLE_ENTRIES; pml4_i++) {
         if ((pml4[pml4_i] & VMM_PAGE_PRESENT) == 0 ||
@@ -270,6 +280,8 @@ void vmm_destroy_address_space(uint64_t *pml4)
     }
 
     pmm_free(pml4);
+
+    spin_unlock_irqrestore(&vmm_lock, lock_flags);
 }
 
 void vmm_map_in_space(uint64_t *pml4, uintptr_t virtual_addr,
@@ -279,7 +291,9 @@ void vmm_map_in_space(uint64_t *pml4, uintptr_t virtual_addr,
         return;
     }
 
+    uint64_t lock_flags = spin_lock_irqsave(&vmm_lock);
     map_in_pml4(pml4, virtual_addr, physical_addr, flags);
+    spin_unlock_irqrestore(&vmm_lock, lock_flags);
 }
 
 int vmm_is_mapped(uint64_t *pml4, uintptr_t virtual_addr)
@@ -352,6 +366,8 @@ uint64_t *vmm_clone_address_space(uint64_t *parent_pml4)
         return NULL;
     }
     clear_page(child_pml4);
+
+    uint64_t lock_flags = spin_lock_irqsave(&vmm_lock);
 
     /* Entrada 0: identity-map de boot (MMIO, early structures). */
     child_pml4[0] = parent_pml4[0];
@@ -446,10 +462,11 @@ uint64_t *vmm_clone_address_space(uint64_t *parent_pml4)
         }
     }
 
+    spin_unlock_irqrestore(&vmm_lock, lock_flags);
     return child_pml4;
 }
 
-void vmm_page_fault_handler(uint64_t error_code, uintptr_t fault_addr, uintptr_t rip)
+void vmm_page_fault_handler(uint64_t error_code, uintptr_t fault_addr, uintptr_t rip, uint64_t cs)
 {
     (void)rip;
 
@@ -492,7 +509,7 @@ void vmm_page_fault_handler(uint64_t error_code, uintptr_t fault_addr, uintptr_t
             void *new_frame = pmm_alloc();
             if (new_frame == NULL) {
                 klog("COW: Falha de alocacao fisica no Page Fault.\n");
-                goto panic;
+                goto fault_unresolved;
             }
 
             /* Copia de dados direta de 4 KiB */
@@ -523,7 +540,17 @@ void vmm_page_fault_handler(uint64_t error_code, uintptr_t fault_addr, uintptr_t
         return;
     }
 
-panic:
+fault_unresolved:
+    /* If the fault originated from Ring 3 (user mode), terminate the
+     * offending process instead of panicking the entire kernel. */
+    if ((cs & 0x3ULL) == 0x3ULL) {
+        klog("kernel: page fault from userspace, terminating task\n");
+        scheduler_exit_current(-1);
+        for (;;) {
+            __asm__ volatile ("sti; hlt");
+        }
+    }
+
     __asm__ volatile ("cli");
     klog("\n*** KERNEL PANIC: PAGE FAULT (INT 0x0E) ***\n");
     klog("Falha de acesso a memoria nao resolvida via Copy-On-Write.\n");
@@ -532,3 +559,4 @@ panic:
         __asm__ volatile ("hlt");
     }
 }
+

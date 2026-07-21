@@ -1,6 +1,6 @@
 # Ciclo de Vida de Processos e Otimização de Memória via COW no PhotonOS v3.1
 
-Este documento descreve detalhadamente o ciclo de vida dos processos no PhotonOS v3.1, incluindo a implementação do mecanismo de bifurcação de processos (`sys_fork`) com **Copy-On-Write (COW)**, clonagem preguiçosa do espaço de endereçamento virtual, contador de referências de frames físicos no PMM, tratamento da exceção `INT 0x0E` e consistncia multicore via TLB Shootdown. Para a documentação completa do mecanismo COW, consulte [`docs/cow_memory_optimization.md`](cow_memory_optimization.md).
+Este documento descreve detalhadamente o ciclo de vida dos processos no PhotonOS v3.1, incluindo a implementação do mecanismo de bifurcação de processos (`sys_fork`) com **Copy-On-Write (COW)**, clonagem preguiçosa do espaço de endereçamento virtual, contador de referências de frames físicos no PMM, tratamento da exceção `INT 0x0E` e consistncia multicore via TLB Shootdown. Para a documentação completa do mecanismo COW, consulte [`docs/memory/cow.md`](../memory/cow.md).
 
 ---
 
@@ -96,7 +96,7 @@ A exceção é tratada como COW apenas se **ambas** as condições forem verdade
 
 Em ambos os casos, `vmm_flush_tlb(fault_addr)` invalida a entrada TLB local antes do retorno ao usuário via `iretq`.
 
-Consulte [`docs/cow_memory_optimization.md §4`](cow_memory_optimization.md) para o detalhamento completo do fluxo assembly e C do handler.
+Consulte [`docs/memory/cow.md §4`](../memory/cow.md) para o detalhamento completo do fluxo assembly e C do handler.
 
 ---
 

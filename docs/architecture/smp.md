@@ -1,12 +1,12 @@
-# Inicialização de Multiprocessamento Simétrico (SMP) e Boot de Cores Secundários (v3.0)
+# Inicialização de Multiprocessamento Simétrico (SMP) e Boot de Cores Secundários (v4.1)
 
-Este documento descreve detalhadamente o design arquitetural, o protocolo de hardware e o fluxo de inicialização dos processadores secundários (**Application Processors - APs**) sob coordenação do processador primário (**Bootstrap Processor - BSP**) no **PhotonOS v3.0**.
+Este documento descreve detalhadamente o design arquitetural, o protocolo de hardware e o fluxo de inicialização dos processadores secundários (**Application Processors - APs**) sob coordenação do processador primário (**Bootstrap Processor - BSP**) no **PhotonOS v4.1**.
 
 ---
 
 ## 1. Visão Geral do Modelo SMP no PhotonOS
 
-O PhotonOS v3.0 implementa o modelo de **Multiprocessamento Simétrico (SMP)** para arquiteturas de 64 bits (`x86_64`). No instante de boot, apenas um único processador é ativado pelo firmware (BIOS/UEFI): o **Bootstrap Processor (BSP)**. Cabe ao BSP inicializar os serviços básicos do sistema de arquivos, console gráfico e memória, para em seguida acordar fisicamente os demais processadores do sistema, denominados **Application Processors (APs)**.
+O PhotonOS v4.1 implementa o modelo de **Multiprocessamento Simétrico (SMP)** para arquiteturas de 64 bits (`x86_64`). No instante de boot, apenas um único processador é ativado pelo firmware (BIOS/UEFI): o **Bootstrap Processor (BSP)**. Cabe ao BSP inicializar os serviços básicos do sistema de arquivos, console gráfico e memória, para em seguida acordar fisicamente os demais processadores do sistema, denominados **Application Processors (APs)**.
 
 A comunicação de baixo nível para controle de energia e execução dos núcleos é mediada pelo **Local APIC (LAPIC)** através do envio de **Interrupções Interprocessador (IPIs - Inter-Processor Interrupts)**.
 
@@ -56,7 +56,49 @@ sequenceDiagram
 
 ---
 
-## 2. Fase BSP (Bootstrap Processor)
+## 2. Descoberta Dinâmica de CPUs via ACPI MADT (v4.1)
+
+A partir da v4.1, o PhotonOS utiliza a tabela **MADT (Multiple APIC Description Table)** do padrão ACPI para descobrir dinamicamente os núcleos de CPU disponíveis no hardware, em vez de usar IDs fixos.
+
+### A. Localização do RSDP
+A função `find_rsdp()` busca a assinatura `"RSD PTR "` em duas regiões padronizadas pela especificação ACPI:
+1.  **EBDA** (Extended BIOS Data Area): Primeiro 1 KiB a partir do segmento apontado por `[0x40E]`.
+2.  **Área ROM do BIOS**: Região de somente leitura entre `0xE0000` e `0xFFFFF`, verificando a cada 16 bytes.
+
+### B. Travessia RSDT → MADT
+Com o RSDP localizado, o kernel lê o campo `rsdt_addr` para acessar a **RSDT** (Root System Description Table). A RSDT contém um array de ponteiros para tabelas de descrição do sistema. O kernel itera sobre todas as entradas procurando a assinatura `"APIC"`, que identifica a MADT.
+
+### C. Parsing de Entradas LAPIC
+A MADT contém um array de registros variáveis. O kernel filtra entradas do tipo `0` (Processor Local APIC) e verifica o bit de habilitação (`flags & 1`). Os APIC IDs dos processadores habilitados são coletados no array `apic_ids[]` até o limite de `MAX_CORES` (4):
+
+```c
+int smp_discover_cpus(uint8_t *apic_ids, int max_cpus) {
+    // Localiza RSDP → RSDT → MADT
+    // Para cada entrada tipo 0 (LAPIC) com flags & 1 (habilitado):
+    //   apic_ids[cpus_found++] = lapic->apic_id;
+    return cpus_found;
+}
+```
+
+### D. Fallback para IDs Fixos
+Se a tabela MADT não for encontrada (por exemplo, em emuladores sem ACPI completo), o BSP utiliza um **fallback** de IDs fixos `{1, 2, 3}`, tentando iniciar até 3 APs de forma especulativa:
+
+```c
+if (cpus > 0) {
+    for (int i = 0; i < cpus; i++) {
+        if (apic_ids[i] != bsp_apic_id)
+            smp_boot_ap(apic_ids[i]);
+    }
+} else {
+    smp_boot_ap(1);
+    smp_boot_ap(2);
+    smp_boot_ap(3);
+}
+```
+
+---
+
+## 3. Fase BSP (Bootstrap Processor)
 
 A fase do BSP compreende toda a preparação do ambiente do kernel e a transmissão dos sinais de controle de hardware para colocar os processadores secundários em execução. Esse fluxo está centralizado nas funções de inicialização do kernel.
 
@@ -83,7 +125,7 @@ A base do LAPIC (tipicamente `0xFEE00000`) é mapeada nas tabelas de páginas do
 ### C. Alocação do Trampolim
 Os processadores x86_64, ao receberem o sinal de inicialização de hardware, iniciam obrigatoriamente no modo real de 16 bits. A especificação de boot do processador exige que o ponto de entrada deste código de bootstrap esteja alinhado em uma fronteira de página de 4 KiB nos primeiros 1 MiB de memória física (Região Baixa / *Conventional Memory*).
 
-No PhotonOS v3.0, o endereço físico fixo escolhido é **`0x7000`**. A rotina [smp_init()](file:///c:/Users/lucas/OneDrive/Documentos/PhotonOS/src/kernel/smp.c#L145-L169) copia o blob binário bruto gerado a partir do código assembly [trampoline.asm](file:///c:/Users/lucas/OneDrive/Documentos/PhotonOS/src/kernel/trampoline.asm) para essa região:
+No PhotonOS v4.1, o endereço físico fixo escolhido é **`0x7000`**. A rotina [smp_init()](file:///c:/Users/lucas/OneDrive/Documentos/PhotonOS/src/kernel/smp.c#L297-L321) copia o blob binário bruto gerado a partir do código assembly [trampoline.asm](file:///c:/Users/lucas/OneDrive/Documentos/PhotonOS/src/kernel/trampoline.asm) para essa região:
 
 ```c
 extern const uint8_t _binary_trampoline_bin_start[];
@@ -170,7 +212,7 @@ Executando nativamente em 64 bits, o AP assume sua própria infraestrutura de me
 ```
 
 ### D. Execução do Ponto de Entrada C (`ap_kmain`)
-Após saltar do trampolim de assembly, o AP executa a rotina [ap_kmain()](file:///c:/Users/lucas/OneDrive/Documentos/PhotonOS/src/kernel/smp.c#L270-L340) em Ring 0:
+Após saltar do trampolim de assembly, o AP executa a rotina [ap_kmain()](file:///c:/Users/lucas/OneDrive/Documentos/PhotonOS/src/kernel/smp.c#L425-L526) em Ring 0:
 
 1.  **GDT do Kernel:** A GDT básica usada no trampolim serviu apenas para a transição. O AP agora lê a variável global `bsp_gdtr` e recarrega os limites e base da GDT oficial do kernel:
     ```c
@@ -188,15 +230,22 @@ Após saltar do trampolim de assembly, o AP executa a rotina [ap_kmain()](file:/
     );
     ```
 3.  **Segmentos de Dados:** Recarrega os registradores de segmento de dados (`DS`, `ES`, `SS`) com o seletor de dados do kernel (`0x10`).
-4.  **Ativação do LAPIC Local:** O processador ativa o Local APIC de sua própria CPU definindo o bit 8 do registrador de vetor de interrupção espúria (SIVR - *Spurious Interrupt Vector Register* em `0xF0`) para habilitar o tratamento local de interrupções físicas e lógicas:
+4.  **Carregamento do Task Register (TR):** O AP carrega o seletor do TSS (`0x30`) no registrador de tarefa usando a instrução `ltr`. Isso é essencial para que o hardware consiga comutar corretamente a pilha do kernel (RSP0) durante transições Ring 3 → Ring 0 neste núcleo:
+    ```c
+    __asm__ volatile ("movw $0x30, %%ax\n\t" "ltr %%ax\n\t" ::: "rax", "memory");
+    ```
+5.  **Ativação do LAPIC Local:** O processador ativa o Local APIC de sua própria CPU definindo o bit 8 do registrador de vetor de interrupção espúria (SIVR - *Spurious Interrupt Vector Register* em `0xF0`) para habilitar o tratamento local de interrupções físicas e lógicas:
     ```c
     apic_init_ap();
     ```
-5.  **Exclusão Mútua de Log:** Para evitar corrupções ou intercalamento de strings no logger de barramento serial (uma vez que múltiplos APs podem estar entrando neste ponto concorrentemente), o AP adquire a primitiva atômica `smp_lock` (Spinlock baseado em `__sync_lock_test_and_set`). Sob posse do lock, registra a mensagem de sucesso no `klog`, incrementa o contador global de núcleos ativos e libera o lock.
-6.  **Repouso Seguro (Idle Loop):** Uma vez inicializado, o AP desativa interrupções de hardware locais e entra em estado de economia de energia através da instrução de interrupção e parada do processador (`cli; hlt`):
+6.  **Carregamento da IDT Global:** O AP executa `idt_load()` para instalar a Tabela de Descritores de Interrupção do kernel. Sem este passo, o AP não poderia tratar **nenhuma** interrupção, incluindo a IPI de TLB Shootdown (vetor `0x79`). Um shootdown disparado pelo BSP enquanto este AP não possuísse IDT causaria um triple fault ou deadlock.
+7.  **Exclusão Mútua de Log:** Para evitar corrupções ou intercalamento de strings no logger de barramento serial (uma vez que múltiplos APs podem estar entrando neste ponto concorrentemente), o AP adquire a primitiva atômica `smp_lock` (Spinlock baseado em `__sync_lock_test_and_set`). Sob posse do lock, registra a mensagem de sucesso no `klog`, incrementa o contador global de núcleos ativos e libera o lock.
+8.  **Idle Loop com Interrupções Habilitadas:** Uma vez inicializado, o AP entra em um loop de economia de energia com **interrupções habilitadas** (`sti; hlt`):
     ```c
     for (;;) {
-        __asm__ volatile ("cli; hlt" ::: "memory");
+        __asm__ volatile ("sti; hlt" ::: "memory");
     }
     ```
-    Este núcleo permanecerá em repouso absoluto até que o escalonador multiprocessador do kernel atribua a ele tarefas ou filas de execução locais em Ring 3.
+
+> [!IMPORTANT]
+> **Mudança Crítica v3.0 → v4.1:** Na v3.0, o idle loop utilizava `cli; hlt`, desabilitando interrupções. Isso causava **deadlock** no BSP: ao executar `vmm_clone_address_space` (durante `fork`), o BSP envia uma IPI de TLB Shootdown para todos os APs e aguarda `tlb_acknowledge_count`. Com interrupções desabilitadas, o AP nunca entregaria a IPI, bloqueando o BSP indefinidamente. Na v4.1, os APs mantêm interrupções habilitadas para permitir a entrega de IPIs de TLB Shootdown.

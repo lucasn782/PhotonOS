@@ -4,6 +4,10 @@
 #include "memory.h"
 #include "serial.h"
 #include "font_8x16.h"
+#include "smp.h"
+
+static spinlock_t video_lock;
+
 
 #define LFB_VIRTUAL_BASE 0xFFFFFFFFC0000000ULL
 #define BACKBUFFER_VIRTUAL_BASE 0xFFFFFFFFC1000000ULL
@@ -150,6 +154,7 @@ static void video_fill_rect(uint32_t x0, uint32_t y0, uint32_t width,
 
 void video_init(void)
 {
+    spin_init(&video_lock);
     video_active = 0;
     video_reset_geometry();
 
@@ -227,8 +232,10 @@ void video_put_pixel(int x, int y, uint32_t color)
     if (!video_active) return;
     if (x < 0 || x >= (int)framebuffer_width || y < 0 || y >= (int)framebuffer_height) return;
 
+    uint64_t flags = spin_lock_irqsave(&video_lock);
     uint32_t *backbuffer = (uint32_t *)BACKBUFFER_VIRTUAL_BASE;
     backbuffer[(uint32_t)y * framebuffer_stride_pixels + (uint32_t)x] = color;
+    spin_unlock_irqrestore(&video_lock, flags);
 }
 
 void video_draw_char(int x, int y, char c, uint32_t fg_color, uint32_t bg_color)
@@ -238,6 +245,7 @@ void video_draw_char(int x, int y, char c, uint32_t fg_color, uint32_t bg_color)
     if (x + (int)VIDEO_FONT_WIDTH <= 0 ||
         y + (int)VIDEO_FONT_HEIGHT <= 0) return;
 
+    uint64_t flags = spin_lock_irqsave(&video_lock);
     uint32_t *backbuffer = (uint32_t *)BACKBUFFER_VIRTUAL_BASE;
     const uint8_t *glyph = font_8x16[(uint8_t)c];
 
@@ -259,24 +267,32 @@ void video_draw_char(int x, int y, char c, uint32_t fg_color, uint32_t bg_color)
             dest[(uint32_t)px] = pixel_on ? fg_color : bg_color;
         }
     }
+    spin_unlock_irqrestore(&video_lock, flags);
 }
 
 void video_clear(uint32_t color)
 {
     if (!video_active) return;
 
+    uint64_t flags = spin_lock_irqsave(&video_lock);
     video_fill_rect(0, 0, framebuffer_stride_pixels, framebuffer_height, color);
+    spin_unlock_irqrestore(&video_lock, flags);
 }
 
 void video_scroll(void)
 {
     if (!video_active) return;
 
+    uint64_t flags = spin_lock_irqsave(&video_lock);
+
     uint32_t *backbuffer = (uint32_t *)BACKBUFFER_VIRTUAL_BASE;
     uint32_t width = text_area_width();
     uint32_t height = text_area_height();
 
-    if (width == 0 || height <= VIDEO_FONT_HEIGHT) return;
+    if (width == 0 || height <= VIDEO_FONT_HEIGHT) {
+        spin_unlock_irqrestore(&video_lock, flags);
+        return;
+    }
 
     uint32_t scroll_lines = height - VIDEO_FONT_HEIGHT;
     for (uint32_t y = 0; y < scroll_lines; y++) {
@@ -289,22 +305,15 @@ void video_scroll(void)
     }
 
     video_fill_rect(0, scroll_lines, width, VIDEO_FONT_HEIGHT, 0x00000000);
+    spin_unlock_irqrestore(&video_lock, flags);
 }
 
 void video_swap_buffers(void)
 {
     if (!video_active) return;
 
-    uint64_t rflags;
-    // CORREÇÃO: Utiliza instruções explicitamente de 64-bit (pushfq/popfq) para evitar desalinhamento da stack do Kernel
-    __asm__ volatile (
-        "pushfq\n\t"
-        "popq %0\n\t"
-        "cli"
-        : "=r"(rflags)
-        :
-        : "memory"
-    );
+    uint64_t flags = spin_lock_irqsave(&video_lock);
+
 
     uint32_t saved_pixels[MOUSE_HEIGHT * MOUSE_WIDTH];
     uint32_t saved_text_cursor[TEXT_CURSOR_HEIGHT * TEXT_CURSOR_WIDTH];
@@ -413,12 +422,5 @@ void video_swap_buffers(void)
         }
     }
 
-    // CORREÇÃO: Restaura usando o tamanho correto nativo do Long Mode
-    __asm__ volatile (
-        "pushq %0\n\t"
-        "popfq"
-        :
-        : "r"(rflags)
-        : "memory"
-    );
+    spin_unlock_irqrestore(&video_lock, flags);
 }

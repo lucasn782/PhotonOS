@@ -82,6 +82,24 @@ void spin_unlock(spinlock_t *lock)
     __sync_lock_release(&lock->locked);
 }
 
+uint64_t spin_lock_irqsave(spinlock_t *lock)
+{
+    uint64_t flags;
+    __asm__ volatile ("pushfq; popq %0" : "=r"(flags) :: "memory");
+    __asm__ volatile ("cli" ::: "memory");
+    spin_lock(lock);
+    return flags;
+}
+
+void spin_unlock_irqrestore(spinlock_t *lock, uint64_t flags)
+{
+    spin_unlock(lock);
+    if (flags & (1ULL << 9)) {
+        __asm__ volatile ("sti" ::: "memory");
+    }
+}
+
+
 /* ════════════════════════════════════════════════════════════════════════════
  * Internal helpers
  * ════════════════════════════════════════════════════════════════════════════ */
@@ -140,6 +158,136 @@ static void delay_rdtsc_approx_10ms(void)
     while ((rdtsc() - start) < TICKS_10MS) {
         __asm__ volatile ("pause" ::: "memory");
     }
+}
+
+struct acpi_rsdp {
+    char signature[8];
+    uint8_t checksum;
+    char oem_id[6];
+    uint8_t revision;
+    uint32_t rsdt_addr;
+} __attribute__((packed));
+
+struct acpi_sdt_header {
+    char signature[4];
+    uint32_t length;
+    uint8_t revision;
+    uint8_t checksum;
+    char oem_id[6];
+    char oem_table_id[8];
+    uint32_t oem_revision;
+    uint32_t creator_id;
+    uint32_t creator_revision;
+} __attribute__((packed));
+
+struct acpi_rsdt {
+    struct acpi_sdt_header header;
+    uint32_t entry[];
+} __attribute__((packed));
+
+struct acpi_madt {
+    struct acpi_sdt_header header;
+    uint32_t local_apic_addr;
+    uint32_t flags;
+    uint8_t entries[];
+} __attribute__((packed));
+
+struct acpi_madt_entry {
+    uint8_t type;
+    uint8_t length;
+} __attribute__((packed));
+
+struct acpi_madt_lapic {
+    struct acpi_madt_entry header;
+    uint8_t processor_id;
+    uint8_t apic_id;
+    uint32_t flags;
+} __attribute__((packed));
+
+static int mem_compare(const void *s1, const void *s2, uint64_t n)
+{
+    const uint8_t *p1 = (const uint8_t *)s1;
+    const uint8_t *p2 = (const uint8_t *)s2;
+    for (uint64_t i = 0; i < n; i++) {
+        if (p1[i] != p2[i]) {
+            return (int)p1[i] - (int)p2[i];
+        }
+    }
+    return 0;
+}
+
+static struct acpi_rsdp *find_rsdp(void)
+{
+    /* 1. Look in EBDA (first 1 KiB) */
+    uint16_t ebda_seg = *(volatile uint16_t *)0x40E;
+    uintptr_t ebda_phys = (uintptr_t)ebda_seg << 4;
+    if (ebda_phys >= 0x80000ULL && ebda_phys < 0xA0000ULL) {
+        for (uintptr_t addr = ebda_phys; addr < ebda_phys + 1024ULL; addr += 16ULL) {
+            if (mem_compare((const void *)addr, "RSD PTR ", 8) == 0) {
+                return (struct acpi_rsdp *)addr;
+            }
+        }
+    }
+
+    /* 2. Look in BIOS read-only space 0xE0000 - 0xFFFFF */
+    for (uintptr_t addr = 0xE0000ULL; addr < 0x100000ULL; addr += 16ULL) {
+        if (mem_compare((const void *)addr, "RSD PTR ", 8) == 0) {
+            return (struct acpi_rsdp *)addr;
+        }
+    }
+
+    return (void *)0;
+}
+
+int smp_discover_cpus(uint8_t *apic_ids, int max_cpus)
+{
+    struct acpi_rsdp *rsdp = find_rsdp();
+    if (rsdp == (void *)0) {
+        return 0;
+    }
+
+    struct acpi_rsdt *rsdt = (struct acpi_rsdt *)(uintptr_t)rsdp->rsdt_addr;
+    if (rsdt == (void *)0 || mem_compare(rsdt->header.signature, "RSDT", 4) != 0) {
+        return 0;
+    }
+
+    int entries = (int)((rsdt->header.length - sizeof(struct acpi_sdt_header)) / 4U);
+    struct acpi_madt *madt = (void *)0;
+
+    for (int i = 0; i < entries; i++) {
+        struct acpi_sdt_header *header = (struct acpi_sdt_header *)(uintptr_t)rsdt->entry[i];
+        if (header != (void *)0 && mem_compare(header->signature, "APIC", 4) == 0) {
+            madt = (struct acpi_madt *)header;
+            break;
+        }
+    }
+
+    if (madt == (void *)0) {
+        return 0;
+    }
+
+    int cpus_found = 0;
+    uintptr_t offset = 0;
+    uintptr_t madt_limit = (uintptr_t)madt->header.length - sizeof(struct acpi_sdt_header) - 8ULL;
+
+    while (offset < madt_limit) {
+        struct acpi_madt_entry *entry = (struct acpi_madt_entry *)&madt->entries[offset];
+        if (entry->length == 0) {
+            break; /* Avoid infinite loop on malformed entries */
+        }
+
+        if (entry->type == 0) { /* Processor Local APIC */
+            struct acpi_madt_lapic *lapic = (struct acpi_madt_lapic *)entry;
+            if (lapic->flags & 1) { /* Enabled */
+                if (cpus_found < max_cpus) {
+                    apic_ids[cpus_found++] = lapic->apic_id;
+                }
+            }
+        }
+        offset += entry->length;
+    }
+
+    return cpus_found;
 }
 
 /* ════════════════════════════════════════════════════════════════════════════
@@ -205,7 +353,7 @@ void smp_boot_ap(uint8_t ap_id)
 
     /* Full memory barrier — Intel SDM §10.12.1 requires all prior stores
      * to be globally visible before writing ICR. */
-    __asm__ volatile ("" ::: "memory");
+    __sync_synchronize();
 
     /* ── Vector C: Transmit INIT-SIPI-SIPI sequence via BSP LAPIC ICR. ── */
 
@@ -313,6 +461,13 @@ void ap_kmain(uint64_t ap_id)
         "movw %%ax, %%ds\n\t"
         "movw %%ax, %%es\n\t"
         "movw %%ax, %%ss\n\t"
+        ::: "rax", "memory"
+    );
+
+    /* Load the Task Register (TR) selector (0x30) to configure the TSS. */
+    __asm__ volatile (
+        "movw $0x30, %%ax\n\t"
+        "ltr  %%ax\n\t"
         ::: "rax", "memory"
     );
 

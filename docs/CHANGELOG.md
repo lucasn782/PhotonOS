@@ -5,15 +5,18 @@ Convenções: cada entrada lista data, commit (quando aplicável), resumo, arqui
 
 ---
 
-## `v4.1-dev` — ulibc Refactor & POSIX Hardening (Em Desenvolvimento)
-**Data:** 2026-07-05
-**Status:** Uncommitted (11 arquivos modificados, 2 novos)
+## `v4.1` — The ulibc Refactor, POSIX Hardening & Documentation Sync Update 📝
+**Data:** 2026-07-21
+**Status:** Released
 
 ### Novas Funcionalidades
 - **Printf Bufferizado:** Reescrita completa do `printf()` userspace com buffer interno de 2048 bytes (`struct printf_buffer`), reduzindo chamadas de sistema de N (uma por caractere) para ⌈N/2048⌉ (uma por flush). Ganho de performance estimado: 100-500x em strings longas.
 - **APIs POSIX Padronizadas:** Novas funções `open()`, `read()`, `write()`, `close()`, `fork()` com assinaturas compatíveis POSIX usando `_syscall` de 6 argumentos.
 - **Headers `string.h` e `stdio.h`:** Criação de headers separados para funções de string (`memcpy`, `memset`, `strlen`, `strcmp`) e I/O (`printf`), seguindo convenção POSIX.
 - **Wrapper Syscall Unificado:** `_syscall()` inline com 6 argumentos via registradores SysV ABI (rdi, rsi, rdx, r10, r8, r9).
+- **Descoberta Dinâmica de CPU via ACPI MADT**: O kernel agora busca o RSDP no BIOS ou EBDA para localizar a tabela MADT do ACPI, descobrindo as CPUs dinamicamente.
+- **Isolamento de Falhas Ring 3**: Exceções GPF (#GP) ou Page Fault (#PF) geradas em Ring 3 agora finalizam o processo ofensivo via `scheduler_exit_current(-1)` de forma limpa em vez de causar pânico geral no kernel.
+- **Auditoria e Sincronização Completa de Documentação**: Reorganização integral da pasta `docs/` dividida por subsistemas (`architecture/`, `memory/`, `filesystem/`, `networking/`, `drivers/`, `userspace/`), remoção de arquivos duplicados/obsoletos, criação de novos índices de controle e atualização de todos os links relativos.
 
 ### Arquivos Alterados
 | Arquivo | Tipo | Resumo |
@@ -24,13 +27,14 @@ Convenções: cada entrada lista data, commit (quando aplicável), resumo, arqui
 | `include/string.h` | **Novo** | Declarações de `memcpy/memset/strlen/strcmp` |
 | `include/apic.h` | Atualizado | Novos registradores APIC (LVT_PERF, LVT_LINT0/1, LVT_ERR) |
 | `include/smp.h` | Atualizado | Exportação de `tlb_acknowledge_count` e `tlb_shootdown_addr` |
-| `src/kernel/smp.c` | Melhorado | Melhorias no bootstrap AP |
-| `src/kernel/vmm.c` | Melhorado | Ajustes no COW clone |
-| `src/kernel/kernel.c` | Ajustado | Integração com novos headers |
+| `src/kernel/smp.c` | Melhorado | Melhorias no bootstrap AP, suporte a ACPI MADT e carregamento TR/IDT |
+| `src/kernel/vmm.c` | Melhorado | Ajustes no COW clone, isolamento de falhas do Ring 3 |
+| `src/kernel/kernel.c` | Ajustado | Integração com novos headers e inicialização ACPI |
 | `src/kernel/net.c` | Ajustado | Include adicional |
 | `src/kernel/scheduler.c` | Ajustado | Integração APIC |
 | `src/kernel/trampoline.asm` | Ajustado | Melhorias no boot AP |
 | `Makefile` | Atualizado | Ajustes de dependências |
+| `docs/` | Reorganizado / Novo | Reorganização geral de toda a documentação do projeto |
 
 ### Breaking Changes
 - ⚠️ Assinatura de `read()` e `write()` mudou de `size_t count` para `int count` no header público `ulibc.h`
@@ -39,6 +43,8 @@ Convenções: cada entrada lista data, commit (quando aplicável), resumo, arqui
 ### Impacto Arquitetural
 - A ulibc agora segue uma arquitetura em camadas: `_syscall` → wrappers POSIX → funções de conveniência → printf bufferizado
 - Separação de concerns: string operations (`string.h`), I/O (`stdio.h`), system calls (`ulibc.h`)
+- O bootstrap de APs agora carrega IDT e TR para garantir tratamento de interrupções e integridade de transições de privilégios.
+- Os APs agora mantêm interrupções ativas (`sti; hlt`) no loop ocioso, prevenindo deadlocks durante TLB Shootdowns do BSP.
 
 ---
 

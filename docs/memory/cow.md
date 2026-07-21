@@ -318,21 +318,31 @@ vmm_flush_tlb(fault_addr);   /* → invlpg (%rdi) */
       page_fault_stub (ASM)
               │ salva registradores, extrai error_code e CR2
               ▼
-      vmm_page_fault_handler(error_code, fault_addr, rip)
+      vmm_page_fault_handler(error_code, fault_addr, rip, cs)
               │
-              ├── error_code & 0x02? (escrita?)   ─── NÃO ──► KERNEL PANIC
-              │        │ SIM
-              ├── pte & PAGE_COW? ─────────────── NÃO ──► KERNEL PANIC
-              │        │ SIM
-              │
-              ├── pmm_ref_get(old_frame)
-              │        │
-              │   refcount > 1?
-              │    ├─ SIM: pmm_alloc → cópia 4 KiB → atualiza PTE → pmm_free(old)
-              │    └─ NÃO: atualiza PTE in-place (sem alocação)
-              │
-              └── vmm_flush_tlb(fault_addr) → iretq (retoma execução do usuário)
+              ├── error_code & 0x02? (escrita?)   ─── NÃO ──┐
+              │        │ SIM                                │
+              ├── pte & PAGE_COW? ─────────────── NÃO ───┼──► Unresolved Fault:
+              │        │ SIM                                │    Origem Ring 3 (cs & 3 == 3)?
+              │                                             │      ├─ SIM: scheduler_exit_current(-1)
+              ├── pmm_ref_get(old_frame)                    │      └─ NÃO: KERNEL PANIC
+              │        │                                    │
+              │   refcount > 1?                             │
+              │    ├─ SIM: pmm_alloc → cópia 4 KiB ─────────┤
+              │    │       → atualiza PTE → pmm_free(old)   │
+              │    └─ NÃO: atualiza PTE in-place            │
+              │                                             │
+              └── vmm_flush_tlb(fault_addr) ────────────────┘
+                  → iretq (retoma execução do usuário)
 ```
+
+#### Isolamento de Falhas do Ring 3 (v4.1)
+
+Para prevenir que programas de usuário malcomportados ou com bugs de estouro de pilha e acesso ilegal de memória provoquem pânico geral no kernel (Kernel Panic), o PhotonOS v4.1 implementa isolamento de privilégio na rotina `vmm_page_fault_handler`.
+
+Caso a falha de página não possa ser resolvida via Copy-On-Write, o kernel avalia o registrador `CS` (Code Segment) do frame de interrupção:
+- **Se a exceção originou-se em Ring 3** (`(cs & 3) == 3`), o processo de usuário é finalizado imediatamente chamando `scheduler_exit_current(-1)` de forma limpa.
+- **Se ocorreu em Ring 0**, a falha representa um erro crítico interno do kernel e prossegue para a rotina de KERNEL PANIC.
 
 ---
 
