@@ -14,7 +14,7 @@
 extern volatile uint64_t kernel_ticks;
 
 #define MAX_TASKS 16
-#define TASK_STACK_SIZE 4096
+#define TASK_STACK_SIZE 8192
 #define USER_STACK_SIZE 4096
 #define KERNEL_CODE_SELECTOR 0x08ULL
 #define KERNEL_DATA_SELECTOR 0x10ULL
@@ -252,7 +252,8 @@ static int allocate_task_slot(void)
 void scheduler_init(void)
 {
     tasks = kmalloc(MAX_TASKS * sizeof(struct task_control_block));
-    task_stacks = kmalloc(MAX_TASKS * TASK_STACK_SIZE);
+    task_stacks = kmalloc((MAX_TASKS + 1) * TASK_STACK_SIZE);
+    task_stacks = (uint8_t (*)[TASK_STACK_SIZE])(((uintptr_t)task_stacks + TASK_STACK_SIZE - 1) & ~(TASK_STACK_SIZE - 1));
     user_stacks_raw = kmalloc((MAX_TASKS + 1) * USER_STACK_SIZE);
     user_stacks = (uint8_t (*)[USER_STACK_SIZE])(((uintptr_t)user_stacks_raw + USER_STACK_SIZE - 1) & ~(USER_STACK_SIZE - 1));
 
@@ -298,6 +299,8 @@ static int scheduler_create_task_with_mode(task_entry_t entry, int user_mode)
         map_user_page(user_rsp - sizeof(uint64_t));
     }
 
+    task->guard_page = (uintptr_t)task_stacks[slot];
+    vmm_unmap(task->guard_page);
     task->kernel_stack_top = stack_top(task_stacks[slot]);
     task->cr3 = (uint64_t)vmm_kernel_pml4();
     task->rsp = build_initial_stack(task_stacks[slot], user_rsp, entry,
@@ -306,6 +309,8 @@ static int scheduler_create_task_with_mode(task_entry_t entry, int user_mode)
     task->registers.rflags = INITIAL_RFLAGS;
     task->pid = (uint32_t)slot + 1;
     task->parent_pid = current_task != 0 ? current_task->pid : 0;
+    task->uid = current_task != 0 ? current_task->uid : 0;
+    task->gid = current_task != 0 ? current_task->gid : 0;
     set_task_name(task, user_mode ? "user-task" : "kernel-task");
     reset_signal_state(task);
     task->wait_target = 0;
@@ -349,6 +354,8 @@ int scheduler_add_user_process(uint64_t entry, uint64_t user_rsp,
     }
 
     task_t *task = &tasks[slot];
+    task->guard_page = (uintptr_t)task_stacks[slot];
+    vmm_unmap(task->guard_page);
     task->kernel_stack_top = stack_top(task_stacks[slot]);
     task->cr3 = (uint64_t)pml4;
     task->rsp = build_initial_stack(task_stacks[slot], user_rsp,
@@ -357,6 +364,8 @@ int scheduler_add_user_process(uint64_t entry, uint64_t user_rsp,
     task->registers.rflags = INITIAL_RFLAGS;
     task->pid = (uint32_t)slot + 1;
     task->parent_pid = current_task != 0 ? current_task->pid : 0;
+    task->uid = current_task != 0 ? current_task->uid : 0;
+    task->gid = current_task != 0 ? current_task->gid : 0;
     set_task_name(task, "process");
     reset_signal_state(task);
     task->wait_target = 0;
@@ -718,6 +727,11 @@ static int deliver_pending_signal_unlocked(task_t *task)
     }
 
     uint64_t user_rsp = signal_handler_stack(frame->user_rsp);
+    if (user_rsp >= 0x0000800000000000ULL || user_rsp < 0x1000) {
+        task->pending_signals &= ~signal_bit(signum);
+        scheduler_terminate_task_unlocked(task, -1);
+        return 0;
+    }
 
     // Garanta que o stack de Ring 3 esteja mapeado e acessível
     uint64_t stack_page = user_rsp & ~(4096ULL - 1ULL);
@@ -898,25 +912,19 @@ int scheduler_fork_current(uint64_t syscall_frame_addr)
         return -1;
     }
 
-    /* 2. Aloca nova kernel stack para o filho. */
-    uint8_t *child_kstack = kmalloc(TASK_STACK_SIZE);
-    if (child_kstack == 0) {
-        klog("fork: falha ao alocar kernel stack do filho\n");
-        vmm_destroy_address_space(child_pml4);
-        return -1;
-    }
-
     uint64_t flags = spin_lock_irqsave(&task_table_lock);
 
-    /* 3. Obtem slot na tabela de tarefas. */
+    /* 2. Obtem slot na tabela de tarefas. */
     int slot = allocate_task_slot();
     if (slot < 0) {
         spin_unlock_irqrestore(&task_table_lock, flags);
         klog("fork: tabela de tarefas cheia\n");
-        kfree(child_kstack);
         vmm_destroy_address_space(child_pml4);
         return -1;
     }
+
+    /* 3. Prepara nova kernel stack para o filho a partir do slot reservado. */
+    uint8_t *child_kstack = task_stacks[slot];
 
     /* 4. Copia todo o TCB do pai para o filho. */
     task_t *child = &tasks[slot];
@@ -933,8 +941,13 @@ int scheduler_fork_current(uint64_t syscall_frame_addr)
     child->active_signal = 0;
     child->pending_signals = 0;
     child->mutex_wait_next = 0;
-    /* Filho nao herda paginas fisicas rastreadas (gerenciadas pela PML4 clonada). */
-    child->user_page_count = 0;
+    child->user_page_count = parent->user_page_count;
+    for (uint32_t i = 0; i < parent->user_page_count; i++) {
+        child->user_physical_pages[i] = parent->user_physical_pages[i];
+    }
+    child->guard_page = (uintptr_t)child_kstack;
+    vmm_unmap(child->guard_page);
+    child->kernel_stack_top = ((uintptr_t)child_kstack + TASK_STACK_SIZE) & ~0xFULL;
 
     /*
      * 6. Constroi um interrupt_task_frame no topo da nova kernel stack do filho.
@@ -1008,6 +1021,11 @@ void scheduler_handle_syscall_signals(uint64_t syscall_frame_addr, uint64_t sysc
 
     struct syscall_frame *frame = (struct syscall_frame *)syscall_frame_addr;
     uint64_t user_rsp = signal_handler_stack(frame->user_rsp);
+    if (user_rsp >= 0x0000800000000000ULL || user_rsp < 0x1000) {
+        task->pending_signals &= ~signal_bit(signum);
+        scheduler_terminate_task(task, -1);
+        return;
+    }
 
     // Garanta que o stack de Ring 3 esteja mapeado e acessível
     uint64_t stack_page = user_rsp & ~(4096ULL - 1ULL);

@@ -11,17 +11,57 @@
 #define VMM_PAGE_SIZE 4096ULL
 #define VMM_PAGE_MASK (~(VMM_PAGE_SIZE - 1ULL))
 #define VMM_ENTRY_ADDR_MASK 0x000FFFFFFFFFF000ULL
-#define VMM_ENTRY_FLAGS_MASK 0xFFFULL
+#define VMM_ENTRY_FLAGS_MASK 0x8000000000000FFFULL
 #define VMM_TABLE_ENTRIES 512
 
 static uint64_t *kernel_pml4;
 static spinlock_t vmm_lock;
+
+#define PF_ERROR_PRESENT (1ULL << 0)
+#define PF_ERROR_WRITE   (1ULL << 1)
 
 static uint64_t read_cr3(void)
 {
     uint64_t value;
     __asm__ volatile ("mov %%cr3, %0" : "=r"(value));
     return value;
+}
+
+/*
+ * The task's frame inventory is used when its address space is torn down.
+ * A COW split replaces one of those frames, so keep the inventory in sync
+ * before dropping the old frame's reference.
+ */
+static void replace_current_task_frame(uint64_t old_frame, uint64_t new_frame)
+{
+    task_t *task = scheduler_current_task();
+
+    if (task == NULL) {
+        return;
+    }
+
+    for (uint32_t i = 0; i < task->user_page_count; i++) {
+        if (task->user_physical_pages[i] == old_frame) {
+            task->user_physical_pages[i] = new_frame;
+            return;
+        }
+    }
+}
+
+void vmm_enable_cr0_wp(void)
+{
+    uint64_t cr0;
+    __asm__ volatile ("mov %%cr0, %0" : "=r"(cr0));
+    cr0 |= (1ULL << 16); /* Bit 16: Write Protect */
+    __asm__ volatile ("mov %0, %%cr0" : : "r"(cr0) : "memory");
+}
+
+void vmm_enable_efer_nxe(void)
+{
+    uint32_t low, high;
+    __asm__ volatile ("rdmsr" : "=a"(low), "=d"(high) : "c"(0xC0000080ULL));
+    low |= (1U << 11); /* Bit 11: NXE (No-Execute Enable) */
+    __asm__ volatile ("wrmsr" : : "a"(low), "d"(high), "c"(0xC0000080ULL) : "memory");
 }
 
 static void clear_page(void *page)
@@ -43,7 +83,7 @@ static void copy_page(void *dest, const void *src)
     }
 }
 
-static uint64_t table_flags(uint32_t flags)
+static uint64_t table_flags(uint64_t flags)
 {
     return VMM_PRESENT | VMM_WRITABLE | (flags & VMM_USER);
 }
@@ -65,11 +105,10 @@ static int valid_table_pointer(uint64_t *table)
 {
     uint64_t address = (uint64_t)table;
 
-    return address != 0 && address < PMM_TOTAL_MEMORY &&
-        (address & (VMM_PAGE_SIZE - 1ULL)) == 0;
+    return address != 0 && (address & (VMM_PAGE_SIZE - 1ULL)) == 0;
 }
 
-static uint64_t *ensure_next_table(uint64_t *table, uint64_t index, uint32_t flags)
+static uint64_t *ensure_next_table(uint64_t *table, uint64_t index, uint64_t flags)
 {
     if (!valid_table_pointer(table) || index >= VMM_TABLE_ENTRIES) {
         return NULL;
@@ -117,7 +156,7 @@ static uint64_t *ensure_next_table(uint64_t *table, uint64_t index, uint32_t fla
 }
 
 static void map_in_pml4(uint64_t *pml4, uintptr_t virtual_addr,
-    uintptr_t physical_addr, uint32_t flags)
+    uintptr_t physical_addr, uint64_t flags)
 {
     uintptr_t vaddr = virtual_addr & VMM_PAGE_MASK;
     uintptr_t paddr = physical_addr & VMM_PAGE_MASK;
@@ -149,6 +188,9 @@ void vmm_init(void)
 {
     spin_init(&vmm_lock);
     kernel_pml4 = (uint64_t *)(read_cr3() & VMM_ENTRY_ADDR_MASK);
+    vmm_enable_efer_nxe();
+    vmm_enable_cr0_wp();
+    klog("vmm: CR0.WP (Write Protect) e EFER.NXE (NX Bit) ativados com sucesso.\n");
 }
 
 void vmm_flush(uintptr_t addr)
@@ -156,7 +198,7 @@ void vmm_flush(uintptr_t addr)
     vmm_flush_tlb(addr);
 }
 
-void vmm_map(uintptr_t virtual_addr, uintptr_t physical_addr, uint32_t flags)
+void vmm_map(uintptr_t virtual_addr, uintptr_t physical_addr, uint64_t flags)
 {
     if (kernel_pml4 == NULL) {
         vmm_init();
@@ -285,7 +327,7 @@ void vmm_destroy_address_space(uint64_t *pml4)
 }
 
 void vmm_map_in_space(uint64_t *pml4, uintptr_t virtual_addr,
-    uintptr_t physical_addr, uint32_t flags)
+    uintptr_t physical_addr, uint64_t flags)
 {
     if (pml4 == NULL) {
         return;
@@ -293,6 +335,64 @@ void vmm_map_in_space(uint64_t *pml4, uintptr_t virtual_addr,
 
     uint64_t lock_flags = spin_lock_irqsave(&vmm_lock);
     map_in_pml4(pml4, virtual_addr, physical_addr, flags);
+    spin_unlock_irqrestore(&vmm_lock, lock_flags);
+}
+
+static void unmap_in_pml4(uint64_t *pml4, uintptr_t virtual_addr)
+{
+    if (pml4 == NULL || !valid_table_pointer(pml4)) {
+        return;
+    }
+
+    uintptr_t vaddr = virtual_addr & VMM_PAGE_MASK;
+    uintptr_t pml4_index = (vaddr >> 39) & 0x1FFULL;
+    uintptr_t pdpt_index = (vaddr >> 30) & 0x1FFULL;
+    uintptr_t pd_index = (vaddr >> 21) & 0x1FFULL;
+    uintptr_t pt_index = (vaddr >> 12) & 0x1FFULL;
+
+    if ((pml4[pml4_index] & VMM_PAGE_PRESENT) == 0 ||
+        !valid_table_entry(pml4[pml4_index])) {
+        return;
+    }
+
+    uint64_t *pdpt = entry_table(pml4[pml4_index]);
+    if (!valid_table_pointer(pdpt) ||
+        (pdpt[pdpt_index] & VMM_PAGE_PRESENT) == 0 ||
+        !valid_table_entry(pdpt[pdpt_index])) {
+        return;
+    }
+
+    uint64_t *pd = entry_table(pdpt[pdpt_index]);
+    if (!valid_table_pointer(pd) ||
+        (pd[pd_index] & VMM_PAGE_PRESENT) == 0 ||
+        !valid_table_entry(pd[pd_index])) {
+        return;
+    }
+
+    uint64_t *pt = entry_table(pd[pd_index]);
+    if (!valid_table_pointer(pt)) {
+        return;
+    }
+
+    pt[pt_index] = 0;
+}
+
+void vmm_unmap(uintptr_t virtual_addr)
+{
+    uint64_t lock_flags = spin_lock_irqsave(&vmm_lock);
+    unmap_in_pml4(vmm_kernel_pml4(), virtual_addr);
+    vmm_flush(virtual_addr & VMM_PAGE_MASK);
+    spin_unlock_irqrestore(&vmm_lock, lock_flags);
+}
+
+void vmm_unmap_in_space(uint64_t *pml4, uintptr_t virtual_addr)
+{
+    if (pml4 == NULL) {
+        return;
+    }
+
+    uint64_t lock_flags = spin_lock_irqsave(&vmm_lock);
+    unmap_in_pml4(pml4, virtual_addr);
     spin_unlock_irqrestore(&vmm_lock, lock_flags);
 }
 
@@ -435,7 +535,7 @@ uint64_t *vmm_clone_address_space(uint64_t *parent_pml4)
                     }
 
                     /* Mapeia a pagina na PML4 do filho com as mesmas flags (modificadas ou nao) */
-                    map_in_pml4(child_pml4, virt, phys_addr, (uint32_t)flags);
+                    map_in_pml4(child_pml4, virt, phys_addr, flags);
 
                     /* Invalida a pagina localmente no BSP */
                     vmm_flush_tlb(virt);
@@ -492,8 +592,10 @@ void vmm_page_fault_handler(uint64_t error_code, uintptr_t fault_addr, uintptr_t
                 pt = entry_table(pd[pd_index]);
                 if (valid_table_pointer(pt) && (pt[pt_index] & VMM_PAGE_PRESENT)) {
                     pte = pt[pt_index];
-                    /* Verifica se e uma escrita (bit 1 do erro) e se a PTE tem PAGE_COW setado */
-                    if ((error_code & 0x02) && (pte & PAGE_COW)) {
+                    /* COW only resolves a present write-protection fault. */
+                    if ((error_code & (PF_ERROR_PRESENT | PF_ERROR_WRITE)) ==
+                            (PF_ERROR_PRESENT | PF_ERROR_WRITE) &&
+                        (pte & PAGE_COW)) {
                         is_cow = 1;
                     }
                 }
@@ -525,6 +627,8 @@ void vmm_page_fault_handler(uint64_t error_code, uintptr_t fault_addr, uintptr_t
             flags |= PAGE_WRITABLE;
             pt[pt_index] = ((uint64_t)new_frame & VMM_ENTRY_ADDR_MASK) | flags;
 
+            replace_current_task_frame(old_phys_frame, (uint64_t)new_frame);
+
             /* Decrementa o contador de referencias do frame antigo */
             pmm_free((void *)old_phys_frame);
         } else {
@@ -541,6 +645,10 @@ void vmm_page_fault_handler(uint64_t error_code, uintptr_t fault_addr, uintptr_t
     }
 
 fault_unresolved:
+    if (error_code & 0x10) {
+        klog("kernel: #PF por violacao de execucao NX (Instruction Fetch em pagina nao-executavel).\n");
+    }
+
     /* If the fault originated from Ring 3 (user mode), terminate the
      * offending process instead of panicking the entire kernel. */
     if ((cs & 0x3ULL) == 0x3ULL) {
@@ -560,3 +668,101 @@ fault_unresolved:
     }
 }
 
+int vmm_validate_user_ptr(const void *ptr, size_t size, int write_intent)
+{
+    if (ptr == NULL || size == 0) {
+        return 0;
+    }
+
+    uintptr_t start = (uintptr_t)ptr;
+    uintptr_t end = start + size;
+
+    /* Check integer overflow */
+    if (end < start) {
+        return 0;
+    }
+
+    /* Check canonical user-space limit (0 to 0x00007FFFFFFFFFFF) */
+    if (end >= 0x0000800000000000ULL) {
+        return 0;
+    }
+
+    uint64_t *pml4 = (uint64_t *)(read_cr3() & VMM_ENTRY_ADDR_MASK);
+    if (!valid_table_pointer(pml4)) {
+        return 0;
+    }
+
+    uintptr_t page_start = start & VMM_PAGE_MASK;
+    uintptr_t page_end = (end + VMM_PAGE_SIZE - 1ULL) & VMM_PAGE_MASK;
+
+    for (uintptr_t vaddr = page_start; vaddr < page_end; vaddr += VMM_PAGE_SIZE) {
+        uintptr_t pml4_index = (vaddr >> 39) & 0x1FFULL;
+        uintptr_t pdpt_index = (vaddr >> 30) & 0x1FFULL;
+        uintptr_t pd_index   = (vaddr >> 21) & 0x1FFULL;
+        uintptr_t pt_index   = (vaddr >> 12) & 0x1FFULL;
+
+        if ((pml4[pml4_index] & VMM_PAGE_PRESENT) == 0 ||
+            (pml4[pml4_index] & VMM_USER) == 0 ||
+            !valid_table_entry(pml4[pml4_index])) {
+            return 0;
+        }
+
+        uint64_t *pdpt = entry_table(pml4[pml4_index]);
+        if (!valid_table_pointer(pdpt) ||
+            (pdpt[pdpt_index] & VMM_PAGE_PRESENT) == 0 ||
+            (pdpt[pdpt_index] & VMM_USER) == 0 ||
+            !valid_table_entry(pdpt[pdpt_index])) {
+            return 0;
+        }
+
+        uint64_t *pd = entry_table(pdpt[pdpt_index]);
+        if (!valid_table_pointer(pd) ||
+            (pd[pd_index] & VMM_PAGE_PRESENT) == 0 ||
+            (pd[pd_index] & VMM_USER) == 0 ||
+            !valid_table_entry(pd[pd_index])) {
+            return 0;
+        }
+
+        uint64_t *pt = entry_table(pd[pd_index]);
+        if (!valid_table_pointer(pt) ||
+            (pt[pt_index] & VMM_PAGE_PRESENT) == 0 ||
+            (pt[pt_index] & VMM_USER) == 0) {
+            return 0;
+        }
+
+        uint64_t pte = pt[pt_index];
+        if (write_intent) {
+            /* Page must be writable or COW */
+            if ((pte & PAGE_WRITABLE) == 0 && (pte & PAGE_COW) == 0) {
+                return 0;
+            }
+        }
+    }
+
+    return 1;
+}
+
+int vmm_validate_user_string(const char *str, size_t max_len)
+{
+    if (str == NULL || max_len == 0) {
+        return 0;
+    }
+
+    uintptr_t addr = (uintptr_t)str;
+    if (addr >= 0x0000800000000000ULL) {
+        return 0;
+    }
+
+    size_t len = 0;
+    while (len < max_len) {
+        if (!vmm_validate_user_ptr((const void *)(addr + len), 1, 0)) {
+            return 0;
+        }
+        if (((const char *)addr)[len] == '\0') {
+            return 1;
+        }
+        len++;
+    }
+
+    return 0;
+}

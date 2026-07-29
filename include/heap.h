@@ -6,5 +6,6 @@
 void heap_init(void);
 void *kmalloc(size_t size);
 void kfree(void *ptr);
+int heap_validate(void);
 
 #endif

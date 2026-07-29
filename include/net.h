@@ -57,12 +57,19 @@ void net_handle_arp(uint8_t *frame, size_t frame_length);
 void net_handle_icmp(uint8_t *frame, size_t frame_length);
 void net_kernel_thread(void);
 
+int net_send_ipv4(uint32_t dest_ip, uint8_t protocol, const void *payload,
+    size_t len);
+int net_send_udp(uint32_t dest_ip, uint16_t src_port, uint16_t dest_port,
+    const void *payload, size_t len);
+
 int sys_socket_send(uint32_t dest_ip, uint8_t protocol, const void *payload, size_t len);
 int sys_socket_recv(uint8_t protocol, void *buffer, size_t max_len);
 
 int sys_socket(int domain, int type, int protocol);
 int sys_bind(int fd, const struct sockaddr *addr, uint32_t addrlen);
 int sys_connect(int fd, const struct sockaddr *addr, uint32_t addrlen);
+int sys_listen(int fd, int backlog);
+int sys_accept(int fd, struct sockaddr *addr, uint32_t *addrlen);
 
 void net_init(void);
 

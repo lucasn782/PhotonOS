@@ -199,6 +199,7 @@ void video_init(void)
     mouse_x = (int)(framebuffer_width / 2U);
     mouse_y = (int)(framebuffer_height / 2U);
     video_clear(0x00000000);
+    video_swap_buffers();
     klog("VIDEO: LFB e Backbuffer mapeados e limpos com sucesso.\n");
 }
 
@@ -304,7 +305,7 @@ void video_scroll(void)
         }
     }
 
-    video_fill_rect(0, scroll_lines, width, VIDEO_FONT_HEIGHT, 0x00000000);
+    video_fill_rect(0, scroll_lines, framebuffer_stride_pixels, VIDEO_FONT_HEIGHT, 0x00000000);
     spin_unlock_irqrestore(&video_lock, flags);
 }
 

@@ -46,30 +46,42 @@ Este documento descreve o estado atual do desenvolvimento do PhotonOS, dividindo
 - **Isolamento de Falhas Ring 3**: Terminação limpa de processos usuários causadores de exceções (#GP / #PF) em vez de Kernel Panic.
 - **Sincronização de Documentação**: Auditoria completa do código-fonte e reorganização da pasta `docs/`.
 
+### Trilha 12 — Kernel Security Hardening & Memory Protection (v4.2-sec)
+- **Proteção por Hardware CR0.WP & EFER.NXE**: Ativação dos bits de Write Protection (CR0.WP) e No-Execute (NX Bit) em 64-bit Long Mode.
+- **Política W^X (Write XOR Execute)**: Mapeamento de páginas graváveis (heap, stack, data) com `PAGE_NX`, e páginas executáveis (`.text`) como somente-leitura.
+- **Kernel Stack Guard Pages**: Guard Pages não-presentes na base das pilhas de kernel de 8 KiB para captura imediata de estouro de pilha.
+- **Stack Canary (-fstack-protector-strong)**: Proteção contra estouro de pilha no kernel com `__stack_chk_guard` e `__stack_chk_fail`. A cobertura Ring 3 fica pendente da inicialização de TLS/FS-base por tarefa.
+- **Sanitização do Heap**: Detecção de Double Free, UAF Poisoning (`0xDD`) e verificador `heap_validate()`.
+- **Validação Estrita de Syscalls**: Verificação de ponteiros de usuário (`vmm_validate_user_ptr`/`vmm_validate_user_string`) em todas as system calls.
+
+### Trilha 13 — VFS Completo, Permissões & Mount Manager (v4.3-fs)
+- **Permissões POSIX Simplificadas**: Controle de acesso por bits octais (`0755`/`0644`), `uid` e `gid` de processos e arquivos, `chmod()` e `chown()`.
+- **Hard Links & Symlinks**: `link()`, `unlink()`, refcounting `nlink`, `symlink()`, `readlink()` e resolução recursiva de symlinks (`vfs_find_following_symlinks`).
+- **Mount Manager & Tabela Global de Mounts**: Estrutura `vfs_mount_t`, lista `vfs_mount_list`, chamadas `vfs_mount`/`vfs_umount` e travessia transparente de múltiplos volumes (`mounted_here`).
+
 ---
 
-## 🟡 Em Desenvolvimento (v4.2-dev)
+## 🟡 Em Desenvolvimento (v4.4-dev)
 
-### Subsistemas de Arquivos & Rede
-- **Links Simbólicos (Symlinks):** Resolução e suporte a caminhos com symlinks no VFS.
+### Pilha UDP/TCP & Transmissão Contínua (v4.4)
 - **Pilha TCP Stream Transmissão/Recepção:** Implementação completa da transmissão de dados confiável (VFS read/write) para sockets TCP.
-- **Sincronização de Sockets e Teclado**: Proteção concorrente do ring buffer do teclado via spinlocks e polimento da fila de rede.
+- **Tratamento de ICMP Port Unreachable:** Notificação para pacotes UDP recebidos em portas sem socket vinculado.
 
 ---
 
 ## 🔵 Planejado
 
-### Sistema de Arquivos & VFS
-- **Permissões de Arquivos:** Suporte a permissões Unix (Read/Write/Execute) no VFS.
-- **Montagem Dinâmica:** Suporte à montagem de múltiplos volumes em diferentes nós do VFS.
+### Espaço de Usuário Avançado (v4.5)
+- **Suporte a Execução de Scripts ELF Avançados e Variáveis de Ambiente:** Expansão da ulibc e suporte a argumentos e variáveis de ambiente no `sys_execve`.
 
-### Rede e Usuário
-- **Pilha TCP no Espaço de Usuário:** Implementação completa de transmissão de fluxo confiável com controle de fluxo.
-- **Servidor HTTP:** Aplicação demonstração rodando em Ring 3 escutando conexões web.
+### Sincronização e IPC (v4.6)
+- **Semáforos e Variáveis de Condição:** Sincronização avançada no escalonador para bloqueio e desbloqueio eficiente de threads.
 
-### Kernel & Segurança
-- **Proteção de Páginas de Kernel:** Ativação de bits WP (Write Protect) e NX (No-Execute) nas tabelas PML4 de kernel.
-- **Sincronização Avançada:** Adição de semáforos e variáveis de condição ao escalonador para bloqueio eficiente de tarefas.
+### Servidor HTTP em Ring 3 (v4.7)
+- **Servidor Web Demonstrativo:** Aplicação executando em espaço de usuário (Ring 3) respondendo a conexões HTTP GET na porta 80.
+
+### Utilitários do Sistema (v4.8)
+- **Comandos de Usuário Adicionais:** Utilitários `chmod`, `chown`, `ln`, `mount`, `umount`, `top`, `netstat`.
 
 ---
 
@@ -86,7 +98,10 @@ Este documento descreve o estado atual do desenvolvimento do PhotonOS, dividindo
    - *Descrição:* A cópia de dados no handler COW é feita por um loop byte-a-byte de 4096 iterações. Substituir por uma rotina otimizada de cópia por blocos de 64 bits ou instruções x86 `rep movsq` trará ganhos expressivos na performance do `sys_fork`.
 4. **Duplicação de Código em Validação de Sinais:**
    - *Status:* Baixo.
-   - *Descrição:* A função de validação `is_supported_signal()` está duplicada em `src/kernel/kernel.c` e `src/kernel/scheduler.c`. Deve ser movida para um arquivo de utilidades comuns ou header unificado.
+    - *Descrição:* A função de validação `is_supported_signal()` está duplicada em `src/kernel/kernel.c` e `src/kernel/scheduler.c`. Deve ser movida para um arquivo de utilidades comuns ou header unificado.
+5. **TLS para Ring 3 e Canário de Pilha:**
+    - *Status:* Moderado.
+    - *Descrição:* Os processos freestanding ainda não possuem FS-base/TLS. O canário do compilador foi desabilitado para Ring 3 para evitar acesso a `FS:0x28`; reativá-lo requer salvar, restaurar e inicializar FS-base por tarefa.
 
 ---
 

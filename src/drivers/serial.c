@@ -51,7 +51,13 @@ void serial_print(char *str)
     }
 }
 
+extern void vga_puts(const char *str);
+extern int video_active;
+
 void klog(char *msg)
 {
     serial_print(msg);
+    if (video_active) {
+        vga_puts(msg);
+    }
 }

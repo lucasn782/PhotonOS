@@ -13,7 +13,11 @@ static spinlock_t heap_lock;
 #define KERNEL_HEAP_INITIAL_PAGES 4ULL
 #define KERNEL_HEAP_MAX_PAGES 256ULL
 #define HEAP_MAGIC 0x48454150424C4B31ULL
+#define HEAP_FREED_MAGIC 0xDEADBEEF48454150ULL
+#define HEAP_POISON_BYTE 0xDD
 #define HEAP_MIN_SPLIT 32ULL
+
+extern void klog(const char *fmt, ...);
 
 struct heap_block {
     uint64_t magic;
@@ -45,7 +49,7 @@ static void heap_map_page(uintptr_t virtual_addr)
         return;
     }
 
-    vmm_map(virtual_addr, (uintptr_t)physical, PAGE_PRESENT | PAGE_WRITABLE);
+    vmm_map(virtual_addr, (uintptr_t)physical, PAGE_PRESENT | PAGE_WRITABLE | PAGE_NX);
 }
 
 static int heap_expand(size_t required)
@@ -75,7 +79,7 @@ static int heap_expand(size_t required)
     }
 
     struct heap_block *block = (struct heap_block *)old_end;
-    block->magic = HEAP_MAGIC;
+    block->magic = HEAP_FREED_MAGIC;
     block->size = added - sizeof(*block);
     block->free = 1;
     block->next = 0;
@@ -99,7 +103,7 @@ static void heap_split_block(struct heap_block *block, size_t size)
     struct heap_block *new_block =
         (struct heap_block *)((uint8_t *)(block + 1) + size);
 
-    new_block->magic = HEAP_MAGIC;
+    new_block->magic = HEAP_FREED_MAGIC;
     new_block->size = block->size - size - sizeof(*block);
     new_block->free = 1;
     new_block->next = block->next;
@@ -129,6 +133,31 @@ static void heap_coalesce(struct heap_block *block)
     }
 }
 
+int heap_validate(void)
+{
+    uint64_t flags = spin_lock_irqsave(&heap_lock);
+
+    struct heap_block *curr = heap_head;
+    while (curr != 0) {
+        if (curr->magic != HEAP_MAGIC && curr->magic != HEAP_FREED_MAGIC) {
+            klog("heap: corrupt magic at block %p\n", curr);
+            spin_unlock_irqrestore(&heap_lock, flags);
+            return 0;
+        }
+
+        if (curr->next != 0 && curr->next->prev != curr) {
+            klog("heap: broken link at block %p\n", curr);
+            spin_unlock_irqrestore(&heap_lock, flags);
+            return 0;
+        }
+
+        curr = curr->next;
+    }
+
+    spin_unlock_irqrestore(&heap_lock, flags);
+    return 1;
+}
+
 void heap_init(void)
 {
     spin_init(&heap_lock);
@@ -138,6 +167,7 @@ void heap_init(void)
     heap_head = 0;
 
     heap_expand(KERNEL_HEAP_INITIAL_PAGES * PMM_PAGE_SIZE);
+    klog("heap: inicializado com W^X (PAGE_NX), verificador e deteccao de Double-Free/UAF.\n");
 }
 
 void *kmalloc(size_t size)
@@ -152,8 +182,9 @@ void *kmalloc(size_t size)
 
     for (;;) {
         for (struct heap_block *block = heap_head; block != 0; block = block->next) {
-            if (block->magic == HEAP_MAGIC && block->free && block->size >= size) {
+            if ((block->magic == HEAP_MAGIC || block->magic == HEAP_FREED_MAGIC) && block->free && block->size >= size) {
                 heap_split_block(block, size);
+                block->magic = HEAP_MAGIC;
                 block->free = 0;
                 spin_unlock_irqrestore(&heap_lock, flags);
                 return block + 1;
@@ -176,11 +207,33 @@ void kfree(void *ptr)
     uint64_t flags = spin_lock_irqsave(&heap_lock);
 
     struct heap_block *block = ((struct heap_block *)ptr) - 1;
-    if (block->magic != HEAP_MAGIC) {
+    uintptr_t block_addr = (uintptr_t)block;
+
+    if (block_addr < heap_start || block_addr >= heap_end) {
+        klog("heap: kfree address %p out of bounds\n", ptr);
         spin_unlock_irqrestore(&heap_lock, flags);
         return;
     }
 
+    if (block->magic == HEAP_FREED_MAGIC || block->free) {
+        klog("heap: DOUBLE FREE DETECTED at %p!\n", ptr);
+        spin_unlock_irqrestore(&heap_lock, flags);
+        return;
+    }
+
+    if (block->magic != HEAP_MAGIC) {
+        klog("heap: CORRUPTION DETECTED at block %p\n", block);
+        spin_unlock_irqrestore(&heap_lock, flags);
+        return;
+    }
+
+    /* Use-After-Free Poisoning */
+    uint8_t *payload = (uint8_t *)(block + 1);
+    for (size_t i = 0; i < block->size; i++) {
+        payload[i] = HEAP_POISON_BYTE;
+    }
+
+    block->magic = HEAP_FREED_MAGIC;
     block->free = 1;
     heap_coalesce(block);
 

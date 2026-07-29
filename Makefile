@@ -24,20 +24,20 @@ USER_PING_OBJ := build/user/ping_blob.o
 IMG := build/photon.img
 DISK_IMG := build/disk.img
 FLOPPY_BYTES := 1474560
-KERNEL_SECTORS := 288
+KERNEL_SECTORS := 352
 KERNEL_MAX_BYTES := $(shell expr $(KERNEL_SECTORS) \* 512)
 KERNEL_OBJS := build/boot/kernel_asm.o build/user/shell_blob.o build/user/hello_blob.o build/user/upper_blob.o \
                build/user/rev_blob.o build/user/hang_blob.o build/user/spin_blob.o build/user/ping_blob.o \
                build/kernel/kernel.o build/kernel/memory.o build/kernel/vmm.o \
                build/drivers/serial.o build/drivers/video.o build/drivers/mouse.o build/kernel/scheduler.o build/kernel/mutex.o build/kernel/heap.o \
-               build/kernel/vfs.o build/kernel/initrd.o build/kernel/elf.o build/kernel/net.o build/drivers/fat16.o \
+               build/kernel/vfs.o build/kernel/initrd.o build/kernel/elf.o build/kernel/net.o build/kernel/tcp.o build/drivers/fat16.o \
                build/drivers/ata.o build/drivers/pci.o build/drivers/e1000.o \
                build/kernel/apic.o build/kernel/smp.o build/kernel/trampoline_blob.o \
                build/fs/ext2.o
 
 CFLAGS := -ffreestanding -m64 -nostdlib -mno-red-zone -fno-pic -fno-pie \
-          -fno-stack-protector -Wall -Wextra -Iinclude
-USER_CFLAGS := $(CFLAGS) -fno-builtin -fno-asynchronous-unwind-tables \
+          -fstack-protector-strong -Wall -Wextra -Iinclude
+USER_CFLAGS := $(CFLAGS) -fno-stack-protector -fno-builtin -fno-asynchronous-unwind-tables \
                -mcmodel=large
 LDFLAGS := -nostdlib -z max-page-size=0x1000 -T linker.ld -Map=build/photon.map
 USER_LDFLAGS := -nostdlib -s -N --no-warn-rwx-segments -z max-page-size=0x1000 \
@@ -104,7 +104,10 @@ build/kernel/initrd.o: src/kernel/initrd.c include/initrd.h include/vfs.h
 build/kernel/elf.o: src/kernel/elf.c include/elf.h include/memory.h include/scheduler.h include/task.h include/vfs.h include/vmm.h
 	@mkdir -p $(dir $@) && $(CC) $(CFLAGS) -c $< -o $@
 
-build/kernel/net.o: src/kernel/net.c include/net.h include/e1000.h include/scheduler.h include/serial.h include/mutex.h include/vmm.h
+build/kernel/net.o: src/kernel/net.c include/net.h include/tcp.h include/e1000.h include/scheduler.h include/serial.h include/mutex.h include/vmm.h include/sys/socket.h
+	@mkdir -p $(dir $@) && $(CC) $(CFLAGS) -c $< -o $@
+
+build/kernel/tcp.o: src/kernel/tcp.c include/tcp.h include/net.h include/heap.h include/mutex.h include/scheduler.h include/serial.h include/sys/socket.h
 	@mkdir -p $(dir $@) && $(CC) $(CFLAGS) -c $< -o $@
 
 build/drivers/fat16.o: src/drivers/fat16.c include/fat16.h include/ata.h include/heap.h include/serial.h include/vfs.h

@@ -173,11 +173,11 @@ enter_long_mode:
 
     mov ecx, IA32_EFER
     rdmsr
-    or eax, 0x00000100
+    or eax, 0x00000900 ; Bit 8 = LME, Bit 11 = NXE
     wrmsr
 
     mov eax, cr0
-    or eax, 0x80000001
+    or eax, 0x80010001 ; Bit 31 = PG, Bit 16 = WP, Bit 0 = PE
     mov cr0, eax
     jmp CODE64_SEL:long_mode_start
 

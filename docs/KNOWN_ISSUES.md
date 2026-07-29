@@ -1,6 +1,6 @@
 # Problemas Conhecidos (Known Issues)
 
-Este documento cataloga as limitações de design, bugs conhecidos, implementações parciais e restrições de compatibilidade existentes no PhotonOS v4.1.
+Este documento cataloga as limitações de design, bugs conhecidos, implementações parciais e restrições de compatibilidade existentes no PhotonOS v4.3-fs.
 
 ---
 

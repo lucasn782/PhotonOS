@@ -90,6 +90,7 @@ struct task_sigreturn_frame {
 struct task_control_block {
     uint64_t rsp;
     uint64_t kernel_stack_top;
+    uintptr_t guard_page;
     uint64_t cr3;
     vfs_node_t *file_descriptors[TASK_MAX_FDS];
     uint64_t fd_offsets[TASK_MAX_FDS];
@@ -100,6 +101,8 @@ struct task_control_block {
     struct task_registers registers;
     uint32_t pid;
     uint32_t parent_pid;
+    uint32_t uid;
+    uint32_t gid;
     char name[TASK_NAME_MAX];
     uintptr_t signal_handlers[TASK_SIGNAL_COUNT];
     uint32_t pending_signals;

@@ -41,5 +41,13 @@ void sigreturn(void);
 int getprocs(proc_info_t *buffer, size_t max_size);
 uint64_t get_ticks(void);
 int readdir(int fd, vfs_dir_entry_t *buf, uint32_t count);
+int chmod(const char *path, uint32_t mode);
+int chown(const char *path, uint32_t uid, uint32_t gid);
+int link(const char *oldpath, const char *newpath);
+int unlink(const char *pathname);
+int symlink(const char *target, const char *linkpath);
+int readlink(const char *pathname, char *buf, size_t bufsiz);
+int mount(const char *source, const char *target, const char *fs_type, uint64_t flags);
+int umount(const char *target);
 
 #endif

@@ -40,9 +40,10 @@ struct pci_bar {
     uint8_t is_64;
 };
 
-static uint32_t pci_ethernet_seen;
-static uint32_t pci_nic_initialized;
-static uint32_t pci_unsupported_logged;
+/* Keep driver state out of the legacy VGA aperture used by late .bss. */
+static uint32_t pci_ethernet_seen __attribute__((section(".network_state")));
+static uint32_t pci_nic_initialized __attribute__((section(".network_state")));
+static uint32_t pci_unsupported_logged __attribute__((section(".network_state")));
 
 static uint32_t inl(uint16_t port)
 {

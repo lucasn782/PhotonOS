@@ -65,6 +65,16 @@
 #define SYS_SOCKET 24ULL
 #define SYS_BIND   25ULL
 #define SYS_CONNECT 26ULL
+#define SYS_CHMOD 27ULL
+#define SYS_CHOWN 28ULL
+#define SYS_LINK 29ULL
+#define SYS_UNLINK 30ULL
+#define SYS_SYMLINK 31ULL
+#define SYS_READLINK 32ULL
+#define SYS_MOUNT 33ULL
+#define SYS_UMOUNT 34ULL
+#define SYS_LISTEN 35ULL
+#define SYS_ACCEPT 36ULL
 
 #define PIC1_COMMAND 0x20
 #define PIC1_DATA 0x21
@@ -131,6 +141,7 @@ static size_t cursor_col;
 static struct idt_entry idt[IDT_ENTRIES];
 static struct tss64 kernel_tss;
 static uint8_t double_fault_stack[4096] __attribute__((aligned(4096)));
+static uint8_t page_fault_stack[4096] __attribute__((aligned(4096)));
 uint64_t syscall_kernel_rsp0;
 static vfs_node_t console_stdin;
 static vfs_node_t console_stdout;
@@ -468,7 +479,7 @@ static void vga_clear(void)
     vga_update_hardware_cursor(cursor_col, cursor_row);
 }
 
-static void vga_puts(const char *str)
+void vga_puts(const char *str)
 {
     while (*str) {
         vga_put_char(*str++);
@@ -488,6 +499,7 @@ static void tss_init(void)
 {
     memory_set(&kernel_tss, 0, sizeof(kernel_tss));
     kernel_tss.ist1 = (uint64_t)&double_fault_stack[4096];
+    kernel_tss.ist2 = (uint64_t)&page_fault_stack[4096];
     kernel_tss.iomap_base = sizeof(kernel_tss);
     tss_install(&kernel_tss);
 }
@@ -1316,6 +1328,17 @@ static int sys_fork(uint64_t frame_addr)
     return scheduler_fork_current(frame_addr);
 }
 
+uintptr_t __stack_chk_guard = 0x595A5B5C5D5E5F60ULL;
+
+void __stack_chk_fail(void)
+{
+    __asm__ volatile ("cli");
+    klog("\n*** KERNEL PANIC: STACK SMASHING DETECTED (Kernel Stack Canary Corrupted) ***\n");
+    for (;;) {
+        __asm__ volatile ("hlt");
+    }
+}
+
 uint64_t syscall_handler(uint64_t number, uint64_t arg1, uint64_t arg2,
     uint64_t arg3, uint64_t arg4, uint64_t arg5, uint64_t arg6)
 {
@@ -1324,28 +1347,34 @@ uint64_t syscall_handler(uint64_t number, uint64_t arg1, uint64_t arg2,
     uint64_t ret = (uint64_t)-1;
 
     if (number == SYS_OPEN) {
+        if (!vmm_validate_user_string((const char *)arg1, 256)) return (uint64_t)-1;
         ret = (uint64_t)sys_open((const char *)arg1, (int)arg2);
     }
     else if (number == SYS_READ) {
+        if (arg3 > 0 && !vmm_validate_user_ptr((void *)arg2, (size_t)arg3, 1)) return (uint64_t)-1;
         ret = (uint64_t)sys_read((int)arg1, (void *)arg2, (uint32_t)arg3);
     }
     else if (number == SYS_SPAWN) {
+        if (!vmm_validate_user_string((const char *)arg1, 256)) return (uint64_t)-1;
         ret = (uint64_t)sys_spawn((const char *)arg1);
     }
     else if (number == SYS_EXIT) {
         ret = (uint64_t)sys_exit((int)arg1);
     }
     else if (number == SYS_WRITE) {
+        if (arg3 > 0 && !vmm_validate_user_ptr((const void *)arg2, (size_t)arg3, 0)) return (uint64_t)-1;
         ret = (uint64_t)sys_write((int)arg1, (const uint8_t *)arg2,
             (size_t)arg3);
     }
     else if (number == SYS_CREATE) {
+        if (!vmm_validate_user_string((const char *)arg1, 256)) return (uint64_t)-1;
         ret = (uint64_t)sys_create((const char *)arg1);
     }
     else if (number == SYS_WAIT) {
         ret = (uint64_t)sys_wait((int)arg1);
     }
     else if (number == SYS_PIPE) {
+        if (!vmm_validate_user_ptr((void *)arg1, sizeof(int) * 2, 1)) return (uint64_t)-1;
         ret = (uint64_t)sys_pipe((int *)arg1);
     }
     else if (number == SYS_BRK) {
@@ -1361,6 +1390,7 @@ uint64_t syscall_handler(uint64_t number, uint64_t arg1, uint64_t arg2,
         return sys_sigreturn(arg6);
     }
     else if (number == SYS_GETPROCS) {
+        if (arg2 > 0 && !vmm_validate_user_ptr((void *)arg1, (size_t)arg2, 1)) return (uint64_t)-1;
         ret = (uint64_t)sys_getprocs((void *)arg1, (size_t)arg2);
     }
     else if (number == SYS_DUP2) {
@@ -1370,14 +1400,18 @@ uint64_t syscall_handler(uint64_t number, uint64_t arg1, uint64_t arg2,
         ret = (uint64_t)sys_close((int)arg1);
     }
     else if (number == SYS_LIST) {
+        if (!vmm_validate_user_string((const char *)arg1, 256)) return (uint64_t)-1;
+        if (arg3 > 0 && !vmm_validate_user_ptr((void *)arg2, (size_t)arg3, 1)) return (uint64_t)-1;
         ret = (uint64_t)sys_list((const char *)arg1, (uint8_t *)arg2,
             (size_t)arg3);
     }
     else if (number == SYS_SOCKET_SEND) {
+        if (arg4 > 0 && !vmm_validate_user_ptr((const void *)arg3, (size_t)arg4, 0)) return (uint64_t)-1;
         ret = (uint64_t)sys_socket_send((uint32_t)arg1, (uint8_t)arg2,
             (const void *)arg3, (size_t)arg4);
     }
     else if (number == SYS_SOCKET_RECV) {
+        if (arg3 > 0 && !vmm_validate_user_ptr((void *)arg2, (size_t)arg3, 1)) return (uint64_t)-1;
         ret = (uint64_t)sys_socket_recv((uint8_t)arg1, (void *)arg2,
             (size_t)arg3);
     }
@@ -1389,9 +1423,11 @@ uint64_t syscall_handler(uint64_t number, uint64_t arg1, uint64_t arg2,
         ret = kernel_ticks;
     }
     else if (number == SYS_READDIR) {
+        if (arg3 > 0 && !vmm_validate_user_ptr((void *)arg2, sizeof(vfs_dir_entry_t) * arg3, 1)) return (uint64_t)-1;
         ret = (uint64_t)sys_readdir((int)arg1, (vfs_dir_entry_t *)arg2, (uint32_t)arg3);
     }
     else if (number == SYS_EXECVE) {
+        if (!vmm_validate_user_string((const char *)arg1, 256)) return (uint64_t)-1;
         ret = (uint64_t)sys_execve((const char *)arg1, (const char *const *)arg2,
             (const char *const *)arg3);
     }
@@ -1402,10 +1438,57 @@ uint64_t syscall_handler(uint64_t number, uint64_t arg1, uint64_t arg2,
         ret = (uint64_t)sys_socket((int)arg1, (int)arg2, (int)arg3);
     }
     else if (number == SYS_BIND) {
+        if (arg3 > 0 && !vmm_validate_user_ptr((const void *)arg2, (size_t)arg3, 0)) return (uint64_t)-1;
         ret = (uint64_t)sys_bind((int)arg1, (const struct sockaddr *)arg2, (uint32_t)arg3);
     }
     else if (number == SYS_CONNECT) {
+        if (arg3 > 0 && !vmm_validate_user_ptr((const void *)arg2, (size_t)arg3, 0)) return (uint64_t)-1;
         ret = (uint64_t)sys_connect((int)arg1, (const struct sockaddr *)arg2, (uint32_t)arg3);
+    }
+    else if (number == SYS_LISTEN) {
+        ret = (uint64_t)sys_listen((int)arg1, (int)arg2);
+    }
+    else if (number == SYS_ACCEPT) {
+        if (arg2 != 0 && !vmm_validate_user_ptr((const void *)arg2, sizeof(struct sockaddr_in), 1)) {
+            return (uint64_t)-1;
+        }
+        if (arg3 != 0 && !vmm_validate_user_ptr((const void *)arg3, sizeof(uint32_t), 1)) {
+            return (uint64_t)-1;
+        }
+        ret = (uint64_t)sys_accept((int)arg1, (struct sockaddr *)arg2, (uint32_t *)arg3);
+    }
+    else if (number == SYS_CHMOD) {
+        if (!vmm_validate_user_string((const char *)arg1, 256)) return (uint64_t)-1;
+        ret = (uint64_t)vfs_chmod((const char *)arg1, (uint32_t)arg2);
+    }
+    else if (number == SYS_CHOWN) {
+        if (!vmm_validate_user_string((const char *)arg1, 256)) return (uint64_t)-1;
+        ret = (uint64_t)vfs_chown((const char *)arg1, (uint32_t)arg2, (uint32_t)arg3);
+    }
+    else if (number == SYS_LINK) {
+        if (!vmm_validate_user_string((const char *)arg1, 256) || !vmm_validate_user_string((const char *)arg2, 256)) return (uint64_t)-1;
+        ret = (uint64_t)vfs_link((const char *)arg1, (const char *)arg2);
+    }
+    else if (number == SYS_UNLINK) {
+        if (!vmm_validate_user_string((const char *)arg1, 256)) return (uint64_t)-1;
+        ret = (uint64_t)vfs_unlink((const char *)arg1);
+    }
+    else if (number == SYS_SYMLINK) {
+        if (!vmm_validate_user_string((const char *)arg1, 256) || !vmm_validate_user_string((const char *)arg2, 256)) return (uint64_t)-1;
+        ret = (uint64_t)vfs_symlink((const char *)arg1, (const char *)arg2);
+    }
+    else if (number == SYS_READLINK) {
+        if (!vmm_validate_user_string((const char *)arg1, 256)) return (uint64_t)-1;
+        if (arg3 > 0 && !vmm_validate_user_ptr((void *)arg2, (size_t)arg3, 1)) return (uint64_t)-1;
+        ret = (uint64_t)vfs_readlink((const char *)arg1, (char *)arg2, (size_t)arg3);
+    }
+    else if (number == SYS_MOUNT) {
+        if (!vmm_validate_user_string((const char *)arg1, 256) || !vmm_validate_user_string((const char *)arg2, 256) || !vmm_validate_user_string((const char *)arg3, 256)) return (uint64_t)-1;
+        ret = (uint64_t)vfs_mount((const char *)arg1, (const char *)arg2, (const char *)arg3, (uint64_t)arg4);
+    }
+    else if (number == SYS_UMOUNT) {
+        if (!vmm_validate_user_string((const char *)arg1, 256)) return (uint64_t)-1;
+        ret = (uint64_t)vfs_umount((const char *)arg1);
     }
 
     scheduler_handle_syscall_signals(arg6, ret);
@@ -1601,6 +1684,7 @@ static void idt_init(void)
     idt[8].ist = 1;
     idt_set_gate(13, gpf_stub);
     idt_set_gate(14, page_fault_stub);
+    idt[14].ist = 2;
     idt_set_gate(0x79, tlb_shootdown_stub);
     idt_set_gate(0xFF, spurious_irq_stub);
     idt_load();

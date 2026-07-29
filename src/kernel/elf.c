@@ -87,9 +87,9 @@ static int elf_validate(const Elf64_Ehdr *ehdr)
         ehdr->e_phentsize == sizeof(Elf64_Phdr);
 }
 
-static uint32_t segment_page_flags(const Elf64_Phdr *phdr)
+static uint64_t segment_page_flags(const Elf64_Phdr *phdr)
 {
-    uint32_t flags = PAGE_PRESENT | PAGE_USER;
+    uint64_t flags = PAGE_PRESENT | PAGE_USER;
 
     if (phdr->p_flags & PF_W) {
         flags |= PAGE_WRITABLE;
@@ -113,7 +113,7 @@ static int map_segment(vfs_node_t *node, uint64_t *pml4, const Elf64_Phdr *phdr,
 {
     uint64_t segment_start = align_down(phdr->p_vaddr);
     uint64_t segment_end = align_up(phdr->p_vaddr + phdr->p_memsz);
-    uint32_t flags = segment_page_flags(phdr);
+    uint64_t flags = segment_page_flags(phdr);
 
     for (uint64_t page = segment_start; page < segment_end; page += PMM_PAGE_SIZE) {
         uint8_t *physical = pmm_alloc();

@@ -67,6 +67,8 @@ static inline uint32_t ntohl(uint32_t value)
 int socket(int domain, int type, int protocol);
 int bind(int fd, const struct sockaddr *addr, uint32_t addrlen);
 int connect(int fd, const struct sockaddr *addr, uint32_t addrlen);
+int listen(int fd, int backlog);
+int accept(int fd, struct sockaddr *addr, uint32_t *addrlen);
 
 int socket_send(uint32_t dest_ip, uint8_t protocol, const void *payload,
     size_t len);

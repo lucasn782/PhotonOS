@@ -33,6 +33,16 @@
 #define SYS_SOCKET 24
 #define SYS_BIND 25
 #define SYS_CONNECT 26
+#define SYS_CHMOD 27
+#define SYS_CHOWN 28
+#define SYS_LINK 29
+#define SYS_UNLINK 30
+#define SYS_SYMLINK 31
+#define SYS_READLINK 32
+#define SYS_MOUNT 33
+#define SYS_UMOUNT 34
+#define SYS_LISTEN 35
+#define SYS_ACCEPT 36
 
 #define PAGE_SIZE 4096UL
 #define PRINTF_BUF_SIZE 2048
@@ -481,6 +491,56 @@ int connect(int fd, const struct sockaddr *addr, uint32_t addrlen)
     return (int)syscall3(SYS_CONNECT, fd, (long)addr, addrlen);
 }
 
+int listen(int fd, int backlog)
+{
+    return (int)syscall2(SYS_LISTEN, fd, backlog);
+}
+
+int accept(int fd, struct sockaddr *addr, uint32_t *addrlen)
+{
+    return (int)syscall3(SYS_ACCEPT, fd, (long)addr, (long)addrlen);
+}
+
+int chmod(const char *path, uint32_t mode)
+{
+    return (int)syscall2(SYS_CHMOD, (long)path, (long)mode);
+}
+
+int chown(const char *path, uint32_t uid, uint32_t gid)
+{
+    return (int)syscall3(SYS_CHOWN, (long)path, (long)uid, (long)gid);
+}
+
+int link(const char *oldpath, const char *newpath)
+{
+    return (int)syscall2(SYS_LINK, (long)oldpath, (long)newpath);
+}
+
+int unlink(const char *pathname)
+{
+    return (int)syscall1(SYS_UNLINK, (long)pathname);
+}
+
+int symlink(const char *target, const char *linkpath)
+{
+    return (int)syscall2(SYS_SYMLINK, (long)target, (long)linkpath);
+}
+
+int readlink(const char *pathname, char *buf, size_t bufsiz)
+{
+    return (int)syscall3(SYS_READLINK, (long)pathname, (long)buf, (long)bufsiz);
+}
+
+int mount(const char *source, const char *target, const char *fs_type, uint64_t flags)
+{
+    return (int)syscall4(SYS_MOUNT, (long)source, (long)target, (long)fs_type, (long)flags);
+}
+
+int umount(const char *target)
+{
+    return (int)syscall1(SYS_UMOUNT, (long)target);
+}
+
 static int inet_is_digit(char ch)
 {
     return ch >= '0' && ch <= '9';
@@ -532,4 +592,11 @@ uint32_t inet_addr(const char *ip_str)
     }
 
     return htonl((octets[0] << 24) | (octets[1] << 16) | (octets[2] << 8) | octets[3]);
+}
+
+uintptr_t __stack_chk_guard = 0x123456789ABCDEF0ULL;
+
+void __stack_chk_fail(void)
+{
+    exit(-1);
 }

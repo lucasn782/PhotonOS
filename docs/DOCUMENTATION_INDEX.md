@@ -30,6 +30,52 @@ Este documento serve como o mapa central da documentação técnica do PhotonOS 
 *   **Dependências**: Nenhuma.
 *   **Público-Alvo**: Desenvolvedores e engenheiros de integração.
 
+### 5. [KERNEL_SECURITY.md](KERNEL_SECURITY.md)
+*   **Descrição**: Especificação de arquitetura de segurança do núcleo (Sprint 2).
+*   **Objetivo**: Detalhar validação de ponteiros de syscall, canário de pilha (-fstack-protector-strong), sanitização de Heap (Double-Free/UAF) e Guard Pages.
+*   **Dependências**: VMM, Heap, Syscalls.
+*   **Público-Alvo**: Engenheiros de segurança e mantenedores do kernel.
+
+### 6. [MEMORY_PROTECTION.md](MEMORY_PROTECTION.md)
+*   **Descrição**: Proteção de memória virtual e execução via hardware (Sprint 2).
+*   **Objetivo**: Detalhar CR0.WP, EFER.NXE, política W^X, invalidação TLB e barreiras de sincronização.
+*   **Dependências**: VMM, Paginação 64-bit.
+*   **Público-Alvo**: Engenheiros de sistemas e segurança.
+
+### 7. [VFS.md](VFS.md)
+*   **Descrição**: Arquitetura e infraestrutura do Virtual File System (Sprint 3).
+*   **Objetivo**: Detalhar abstração de nós, resolução recursiva de symlinks e chamadas de hard link.
+*   **Dependências**: VFS, EXT2, FAT16.
+*   **Público-Alvo**: Engenheiros de sistemas de arquivos.
+
+### 8. [MOUNT_MANAGER.md](MOUNT_MANAGER.md)
+*   **Descrição**: Especificação do Mount Manager e Tabela Global de Mounts (Sprint 3).
+*   **Objetivo**: Detalhar redirecionamento transparente de caminhos e gerenciamento de múltiplos volumes.
+*   **Dependências**: VFS, drivers de armazenamento.
+*   **Público-Alvo**: Engenheiros de kernel e armazenamento.
+
+### 9. [PERMISSIONS.md](PERMISSIONS.md)
+*   **Descrição**: Modelo de Permissões POSIX Simplificadas (Sprint 3).
+*   **Objetivo**: Detalhar UID, GID, bits octais de modo, verificação de acesso, `chmod` e `chown`.
+*   **Dependências**: VFS, Escalonador.
+*   **Público-Alvo**: Engenheiros de segurança e kernel.
+
+### 10. [VMM_COW_PAGEFAULT_FIXES_v4.1.md](VMM_COW_PAGEFAULT_FIXES_v4.1.md)
+*   **Descrição**: Registro da auditoria do VMM, Copy-On-Write, Page Fault e ciclo de vida de tarefas da v4.1.
+*   **Objetivo**: Documentar a causa raiz corrigida, os critérios de resolução COW, a política de guard pages, as hipóteses descartadas e a validação executada.
+*   **Dependências**: PMM, VMM, Scheduler, TSS/IDT e SMP.
+*   **Público-Alvo**: Mantenedores de memória virtual e engenheiros de kernel.
+
+### 11. Subsistema TCP v4.2
+*   **[tcp_architecture.md](tcp_architecture.md)**: Visão geral da arquitetura de rede, pipeline de processamento de segmentos e modelo de concorrência.
+*   **[tcp_socket_layer.md](tcp_socket_layer.md)**: Abstração VFS, nós de socket, mapeamento de syscalls (`connect`, `listen`, `accept`) e desativação de espera ocupada no escalonador.
+*   **[tcp_pcb.md](tcp_pcb.md)**: Estrutura detalhada do Protocol Control Block (`struct tcp_pcb`), filas de segmentos dinâmicos e temporizadores.
+*   **[tcp_port_management.md](tcp_port_management.md)**: Gerenciamento de portas bem conhecidas e efêmeras (49152..65535), prevenção de colisão e liberação.
+*   **[tcp_checksum.md](tcp_checksum.md)**: Especificação do checksum TCP RFC 793 com pseudo-cabeçalho IPv4 e complemento de 1 em soma de 16 bits.
+*   **[tcp_design.md](tcp_design.md)**: Princípios de design, desacoplamento modular, ausência de busy-wait e roadmap de evolução (Fase 1 vs Fase 2).
+*   **[tcp_state_machine.md](tcp_state_machine.md)**: Especificação da máquina de estados TCP da Fase 1 (`CLOSED`, `LISTEN`, `SYN_SENT`, `SYN_RECEIVED`, `ESTABLISHED`).
+*   **Público-Alvo**: Arquitetos de sistemas operacionais, engenheiros de rede e desenvolvedores do kernel.
+
 ---
 
 ## 🏗️ 1. Arquitetura do Núcleo (architecture/)

@@ -53,7 +53,8 @@ struct e1000_state {
     int initialized;
 };
 
-static struct e1000_state e1000;
+/* Must remain outside the 0xA0000-0xBFFFF legacy VGA aperture. */
+static struct e1000_state e1000 __attribute__((section(".network_state")));
 
 static void e1000_memset(void *dest, uint8_t value, size_t count)
 {

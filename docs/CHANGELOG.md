@@ -5,6 +5,72 @@ Convenções: cada entrada lista data, commit (quando aplicável), resumo, arqui
 
 ---
 
+## `v4.3-fs` — Filesystem Infrastructure, Permissions & Mount Manager (Sprint 3) 📂
+**Data:** 2026-07-22
+**Status:** Released
+
+### Novas Funcionalidades
+- **Permissões POSIX Simplificadas (mode_t):** Controle de acesso baseado em bits octais (`0755`/`0644`), bitmasks `S_IRWXU`/`S_IRWXG`/`S_IRWXO` e validação preventiva `vfs_check_permission()`.
+- **Gerenciamento de Identidade (UID & GID):** Suporte a propriedade de arquivos/diretórios por usuário (`uid`) e grupo (`gid`), herdados por tarefas via `fork()`/`spawn()`.
+- **Chamadas `chmod()` e `chown()`:** Suporte a alteração dinâmica de permissões octais e propriedades via `sys_chmod` e `sys_chown`.
+- **Hard Links (`link()`, `unlink()`):** Criação de múltiplos hard links compartilhando nós e contagem de referências físicas `nlink` com desalocação em `nlink == 0`.
+- **Symbolic Links (`symlink()`, `readlink()`):** Suporte a nós do tipo `VFS_NODE_SYMLINK`, armazenamento do caminho de destino em `symlink_target` e resolução recursiva `vfs_find_following_symlinks()` limitada a profundidade 8 (`ELOOP`).
+- **Mount Manager & Tabela Global de Mounts:** Estrutura `vfs_mount_t` e lista encadeada `vfs_mount_list` permitindo a montagem/desmontagem dinâmica de múltiplos volumes (`vfs_mount`/`vfs_umount`).
+- **Navegação Transparente de Múltiplos Volumes:** Redirecionamento automático `mounted_here` no `vfs_find()`, permitindo cruzar fronteiras entre múltiplos sistemas de arquivos montados (ex: FAT16 e EXT2).
+
+### Arquivos Alterados
+| Arquivo | Tipo | Resumo |
+|---------|------|--------|
+| `include/vfs.h` | Refatorado | Adição de `VFS_NODE_SYMLINK`, constantes `S_IRWX...`, `uid/gid/mode/nlink` em `vfs_node_t` e `vfs_dir_entry_t`, `vfs_mount_t` e prototypes VFS |
+| `src/kernel/vfs.c` | Refatorado | Implementação de `vfs_chmod`, `vfs_chown`, `vfs_link`, `vfs_unlink`, `vfs_symlink`, `vfs_readlink`, `vfs_mount`, `vfs_umount` e `vfs_check_permission` |
+| `include/task.h` | Atualizado | Inclusão de `uid` e `gid` na estrutura `task_control_block` |
+| `src/kernel/scheduler.c` | Atualizado | Herança e inicialização de `uid` e `gid` nas tarefas criadas |
+| `src/kernel/kernel.c` | Atualizado | Adição das constantes `SYS_CHMOD` a `SYS_UMOUNT` (27-34) e despacho no `syscall_handler` com validação de ponteiros |
+| `include/ulibc.h` | Atualizado | Protótipos das chamadas de usuário `chmod`, `chown`, `link`, `unlink`, `symlink`, `readlink`, `mount`, `umount` |
+| `src/user/ulibc.c` | Atualizado | Implementação dos wrappers inline POSIX de chamada de sistema |
+| `docs/VFS.md` | **Novo** | Especificação da arquitetura e abstração do Virtual File System |
+| `docs/MOUNT_MANAGER.md` | **Novo** | Especificação do Mount Manager e Tabela Global de Mounts |
+| `docs/PERMISSIONS.md` | **Novo** | Especificação do modelo de permissões POSIX simplificadas |
+
+---
+
+## `v4.2-sec` — Kernel Security Hardening & Memory Protection (Sprint 2) 🛡️
+**Data:** 2026-07-22
+**Status:** Released
+
+### Novas Funcionalidades
+- **CR0.WP (Write Protect):** Ativação por hardware do bit 16 do registrador `CR0`. O código executando em Ring 0 não pode mais gravar em páginas marcadas como Read-Only.
+- **NX Bit & EFER.NXE:** Ativação do bit 11 no MSR `IA32_EFER` (`0xC0000080`), ativando a aplicação do bit 63 (`PAGE_NX`) nas entradas de tabelas de páginas de 64 bits.
+- **Política W^X (Write XOR Execute):** Segregação estrita onde páginas graváveis (heap, stack, data) possuem `PAGE_NX` ativado, e páginas executáveis (`.text`) são mantidas como somente-leitura.
+- **Kernel Stack Guard Pages:** Pilhas de kernel de cada tarefa expandidas para 8 KiB (`TASK_STACK_SIZE`), com uma Guard Page não-presente (`PAGE_PRESENT = 0`) no endereço inferior. Estouro de pilha resulta em exceção `#PF` controlada sem corromper estruturas adjacentes.
+- **Stack Canary (-fstack-protector-strong):** Habilitação de canários de pilha do compilador com guardião `__stack_chk_guard` e manipulador de pânico `__stack_chk_fail` no kernel. O canário Ring 3 permanece desabilitado até que TLS/FS-base seja inicializado por tarefa.
+- **Sanitização e Validação do Heap:** Detecção de Double Free com log/abort seguro, UAF Poisoning (preenchimento com byte veneno `0xDD`) e verificador de integridade `heap_validate()`.
+- **Validação Estrita de Syscalls:** Verificação preventiva de ponteiros de usuário (`vmm_validate_user_ptr`/`vmm_validate_user_string`) impedindo dereferenciamento indevido de memória restrita ao kernel ou ponteiros nulos/inválidos.
+
+### Arquivos Alterados
+| Arquivo | Tipo | Resumo |
+|---------|------|--------|
+| `include/vmm.h` | Atualizado | Definição de `PAGE_NX`/`VMM_PAGE_NX`, prototypes de `CR0.WP`, `EFER.NXE` e validação de ponteiros de usuário |
+| `src/kernel/vmm.c` | Refatorado | Implementação de `CR0.WP`, `EFER.NXE`, `PAGE_NX`, `vmm_validate_user_ptr`, `vmm_validate_user_string` e log aprimorado de `#PF` |
+| `src/boot/kernel.asm` | Atualizado | Ativação precoce no boot de `EFER.NXE` (bit 11 MSR `0xC0000080`) e `CR0.WP` (bit 16 `CR0`) |
+| `src/boot/boot.asm` | Atualizado | Ajuste de `KERNEL_SECTORS` para 352 setores para imagens blindadas de até 176 KiB |
+| `include/task.h` | Atualizado | Adição do campo `guard_page` na estrutura `task_control_block` |
+| `src/kernel/scheduler.c` | Atualizado | Expansão de pilhas para 8 KiB com Guard Pages não-presentes na base |
+| `Makefile` | Atualizado | `-fstack-protector-strong` para kernel, `-fno-stack-protector` para Ring 3 sem TLS e ajuste de `KERNEL_SECTORS := 352` |
+| `src/kernel/kernel.c` | Atualizado | Definição de canário de pilha e validação de ponteiros em todas as chamadas de sistema no `syscall_handler` |
+| `src/user/ulibc.c` | Atualizado | Runtime de usuário; canário permanece desabilitado até haver TLS/FS-base |
+| `include/heap.h` | Atualizado | Protótipo `heap_validate(void)` |
+| `src/kernel/heap.c` | Refatorado | `PAGE_NX` no heap, detecção de Double Free, UAF Poisoning (`0xDD`) e `heap_validate()` |
+| `docs/KERNEL_SECURITY.md` | **Novo** | Especificação completa da arquitetura de segurança do núcleo |
+| `docs/MEMORY_PROTECTION.md` | **Novo** | Especificação técnica de proteção de memória por hardware |
+
+### Impacto Arquitetural
+- O kernel PhotonOS torna-se uma plataforma altamente segura com proteção de memória baseada em hardware (WP, NX, W^X).
+- Proteção completa contra estouro de pilha no kernel (canários + guard pages).
+- Erros de ponteiro em chamadas de sistema oriundos de Ring 3 agora falham graciosamente retornando `-1` (`EFAULT`) sem derrubar o kernel.
+
+---
+
 ## `v4.1` — The ulibc Refactor, POSIX Hardening & Documentation Sync Update 📝
 **Data:** 2026-07-21
 **Status:** Released
