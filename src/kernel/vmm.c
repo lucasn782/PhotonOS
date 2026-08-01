@@ -97,8 +97,7 @@ static int valid_table_entry(uint64_t entry)
 {
     uint64_t address = entry & VMM_ENTRY_ADDR_MASK;
 
-    return address != 0 && address < PMM_TOTAL_MEMORY &&
-        (address & (VMM_PAGE_SIZE - 1ULL)) == 0;
+    return address != 0 && (address & (VMM_PAGE_SIZE - 1ULL)) == 0;
 }
 
 static int valid_table_pointer(uint64_t *table)

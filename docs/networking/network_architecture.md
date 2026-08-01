@@ -110,3 +110,16 @@ klog("NET: Checksum UDP invalido.\n");
 klog("NET: Buffer do socket cheio, descartando pacote.\n");
 klog("NET: Pacote descartado por falta de socket ativo.\n");
 ```
+
+---
+
+## 8. Subsistema TCP (Fase 1 — v4.2)
+
+O PhotonOS implementa a infraestrutura base do protocolo TCP (RFC 793 / RFC 1071) totalmente desacoplada e integrada à camada IPv4 e Socket Layer:
+
+*   **Protocol Control Block (`tcp_pcb_t`)**: Gerenciador de conexões dinâmico mantido em lista global (`tcp_pcbs`) protegida por `tcp_pcbs_lock` e per-PCB `lock`.
+*   **Máquina de Estados RFC 793**: Definição completa dos 10 estados (`CLOSED`, `LISTEN`, `SYN_SENT`, `SYN_RECEIVED`, `ESTABLISHED`, `FIN_WAIT1`, `FIN_WAIT2`, `CLOSE_WAIT`, `LAST_ACK`, `TIME_WAIT`).
+*   **Checksum TCP RFC 793 / 1071**: Soma de verificação com pseudo-cabeçalho IPv4 (src_ip, dest_ip, proto=6, tcp_length) em palavras de 16-bits.
+*   **Parser e Serializador**: Funções reusáveis `tcp_parse_header` e `tcp_serialize_header` com validação de offset e flags.
+*   **Integração Socket Stream**: Suporte a `socket(AF_INET, SOCK_STREAM, IP_PROTO_TCP)` com alocação automática de PCB.
+

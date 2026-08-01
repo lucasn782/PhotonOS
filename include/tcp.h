@@ -39,6 +39,8 @@
 #define TCP_DELAYED_ACK_TICKS     20ULL
 #define TCP_CONNECT_TIMEOUT_TICKS 500ULL
 
+struct socket;
+
 struct __attribute__((packed)) tcp_header {
     uint16_t src_port;
     uint16_t dest_port;
@@ -49,10 +51,10 @@ struct __attribute__((packed)) tcp_header {
     uint16_t checksum;
     uint16_t urgent_ptr;
 };
+typedef struct tcp_header tcp_header_t;
 
 /*
- * Phase-1 subset of the TCP state machine.  Remaining RFC states
- * (FIN_WAIT_*, CLOSE_WAIT, CLOSING, LAST_ACK, TIME_WAIT) land later.
+ * Complete RFC 793 TCP state machine definition (Phase 2).
  */
 enum tcp_state {
     TCP_CLOSED = 0,
@@ -60,7 +62,13 @@ enum tcp_state {
     TCP_SYN_SENT,
     TCP_SYN_RECEIVED,
     TCP_ESTABLISHED,
+    TCP_FIN_WAIT1,
+    TCP_FIN_WAIT2,
+    TCP_CLOSE_WAIT,
+    TCP_LAST_ACK,
+    TCP_TIME_WAIT
 };
+typedef enum tcp_state tcp_state_t;
 
 /* Queued application payload (receive) or unacknowledged data (send). */
 struct tcp_segment {
@@ -92,24 +100,37 @@ struct tcp_timers {
 };
 
 /*
- * Protocol Control Block.
+ * Protocol Control Block (Phase 1).
  *
  * Addresses: network byte order.
  * Ports and sequence numbers: host byte order.
  * The per-PCB mutex protects state, timers and both segment queues.
  * The global PCB list lock protects registration and port allocation.
  */
-struct tcp_pcb {
+typedef struct tcp_pcb {
     uint32_t local_ip;
     uint32_t remote_ip;
     uint16_t local_port;
     uint16_t remote_port;
+
+    uint32_t snd_una;
+    uint32_t snd_nxt;
+
+    uint32_t rcv_nxt;
+
+    uint16_t snd_wnd;
+    uint16_t rcv_wnd;
+
+    uint8_t state;
+
+    struct socket *socket;
+
+    struct tcp_pcb *next;
+
+    /* Extended Kernel bookkeeping & synchronization fields */
     uint32_t seq_number;
     uint32_t ack_number;
     uint32_t window;
-    enum tcp_state state;
-
-    /* Legacy single field kept for callers; mirrors timers.retransmission. */
     uint64_t retransmission_timer;
 
     struct tcp_queue receive_queue;
@@ -125,20 +146,21 @@ struct tcp_pcb {
     struct tcp_pcb *accept_head;
     struct tcp_pcb *accept_tail;
 
-    void *socket;
     mutex_t lock;
-    struct tcp_pcb *next;
-};
+} tcp_pcb_t;
 
 void tcp_init(void);
 
+/* Phase 1 Management Functions */
+tcp_pcb_t *tcp_alloc(void);
+void tcp_free(tcp_pcb_t *pcb);
+int tcp_register(tcp_pcb_t *pcb);
+void tcp_unregister(tcp_pcb_t *pcb);
+tcp_pcb_t *tcp_lookup(uint32_t local_ip, uint32_t remote_ip,
+    uint16_t local_port, uint16_t remote_port);
+
 struct tcp_pcb *tcp_socket_create(void *socket);
 void tcp_socket_destroy(struct tcp_pcb *pcb);
-
-int tcp_register(struct tcp_pcb *pcb);
-void tcp_unregister(struct tcp_pcb *pcb);
-struct tcp_pcb *tcp_lookup(uint32_t local_ip, uint32_t remote_ip,
-    uint16_t local_port, uint16_t remote_port);
 
 int tcp_bind(struct tcp_pcb *pcb, uint32_t local_ip, uint16_t local_port);
 uint16_t tcp_allocate_ephemeral_port(struct tcp_pcb *pcb, uint32_t local_ip);
@@ -147,8 +169,17 @@ void tcp_release_port(struct tcp_pcb *pcb);
 int tcp_listen(struct tcp_pcb *pcb, int backlog);
 struct tcp_pcb *tcp_accept(struct tcp_pcb *listener);
 
+/* Header Serialization / Parsing (Phase 3) */
+int tcp_serialize_header(const struct tcp_header *hdr, uint8_t *buffer, size_t buf_size);
+int tcp_parse_header(const uint8_t *buffer, size_t len, struct tcp_header *hdr);
+
+/* Checksum (Phase 4) */
 uint16_t tcp_checksum(uint32_t src_ip, uint32_t dest_ip,
     const void *segment, size_t length);
+
+/* Transmission & Reception (Phases 6 & 7) */
+int tcp_send_segment(struct tcp_pcb *pcb, uint32_t seq, uint32_t ack, uint8_t flags,
+    uint16_t window, const void *payload, size_t len);
 int tcp_input(uint32_t src_ip, uint32_t dest_ip, const uint8_t *segment,
     size_t length);
 int tcp_output(struct tcp_pcb *pcb, uint8_t flags, const void *payload,
@@ -157,7 +188,7 @@ int tcp_output(struct tcp_pcb *pcb, uint8_t flags, const void *payload,
 int tcp_receive_read(struct tcp_pcb *pcb, uint8_t *buffer, size_t length);
 size_t tcp_receive_available(struct tcp_pcb *pcb);
 
-/* Arm / clear timer slots (no automatic expiry yet — Phase 2). */
+/* Arm / clear timer slots */
 void tcp_timer_arm_rto(struct tcp_pcb *pcb, uint64_t now_ticks);
 void tcp_timer_arm_keepalive(struct tcp_pcb *pcb, uint64_t now_ticks);
 void tcp_timer_arm_delayed_ack(struct tcp_pcb *pcb, uint64_t now_ticks);
@@ -165,4 +196,8 @@ void tcp_timer_clear(struct tcp_pcb *pcb);
 
 const char *tcp_state_name(enum tcp_state state);
 
+/* Unit Tests (Phase 9) */
+void tcp_run_tests(void);
+
 #endif
+

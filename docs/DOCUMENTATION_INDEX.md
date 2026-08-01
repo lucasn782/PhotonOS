@@ -66,14 +66,21 @@ Este documento serve como o mapa central da documentação técnica do PhotonOS 
 *   **Dependências**: PMM, VMM, Scheduler, TSS/IDT e SMP.
 *   **Público-Alvo**: Mantenedores de memória virtual e engenheiros de kernel.
 
-### 11. Subsistema TCP v4.2
-*   **[tcp_architecture.md](tcp_architecture.md)**: Visão geral da arquitetura de rede, pipeline de processamento de segmentos e modelo de concorrência.
+### 11. [BOOT_INITIALIZATION_FIX_v4.2.md](BOOT_INITIALIZATION_FIX_v4.2.md)
+*   **Descrição**: Relatório completo de recuperação do boot, resolução de Triple Fault, inicialização antecipada da IDT e realocação da BSS na v4.2.
+*   **Objetivo**: Documentar a causa raiz exata da regressão no boot, a colisão de BSS na memória VGA 0xA0000, as correções no Heap/VMM/SMP e o layout de memória atualizado.
+*   **Dependências**: Bootloader, GDT, IDT, PMM, VMM, Heap, SMP, Framebuffer.
+*   **Público-Alvo**: Engenheiros de kernel, especialistas de boot e mantenedores do sistema.
+
+### 11. Subsistema TCP v4.2 & Arquitetura de Rede
+*   **[tcp_architecture.md](tcp_architecture.md)**: Arquitetura completa do subsistema TCP, estrutura dos PCBs, máquina de estados, serialização/checksum, fluxos RX/TX e diagrama completo da pilha de rede.
+*   **[network_architecture.md](network_architecture.md)** (e **[networking/network_architecture.md](networking/network_architecture.md)**): Arquitetura global da pilha de rede, barramento PCI, DMA físico e suporte a sockets.
 *   **[tcp_socket_layer.md](tcp_socket_layer.md)**: Abstração VFS, nós de socket, mapeamento de syscalls (`connect`, `listen`, `accept`) e desativação de espera ocupada no escalonador.
 *   **[tcp_pcb.md](tcp_pcb.md)**: Estrutura detalhada do Protocol Control Block (`struct tcp_pcb`), filas de segmentos dinâmicos e temporizadores.
 *   **[tcp_port_management.md](tcp_port_management.md)**: Gerenciamento de portas bem conhecidas e efêmeras (49152..65535), prevenção de colisão e liberação.
 *   **[tcp_checksum.md](tcp_checksum.md)**: Especificação do checksum TCP RFC 793 com pseudo-cabeçalho IPv4 e complemento de 1 em soma de 16 bits.
-*   **[tcp_design.md](tcp_design.md)**: Princípios de design, desacoplamento modular, ausência de busy-wait e roadmap de evolução (Fase 1 vs Fase 2).
-*   **[tcp_state_machine.md](tcp_state_machine.md)**: Especificação da máquina de estados TCP da Fase 1 (`CLOSED`, `LISTEN`, `SYN_SENT`, `SYN_RECEIVED`, `ESTABLISHED`).
+*   **[tcp_design.md](tcp_design.md)**: Princípios de design, desacoplamento modular, ausência de busy-wait e roadmap de evolução.
+*   **[tcp_state_machine.md](tcp_state_machine.md)**: Especificação da máquina de estados TCP RFC 793 (10 estados).
 *   **Público-Alvo**: Arquitetos de sistemas operacionais, engenheiros de rede e desenvolvedores do kernel.
 
 ---

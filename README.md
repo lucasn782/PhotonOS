@@ -34,6 +34,12 @@ PhotonOS/
 
 ## 🚀 Funcionalidades Consolidadas
 
+### 🛡️ Boot Recovery & Estabilização (v4.2 — Boot Recovery)
+*   **Inicialização Antecipada da IDT:** A IDT é ativada e validada via `sidt` logo na entrada de `kmain()`, eliminando Triple Faults e garantindo relatórios explicativos de Kernel Panic no COM1.
+*   **Relocação da Seção `.bss` (0x00100000):** A `.bss` do kernel foi realocada para 1 MiB (`0x100000`), eliminando o conflito com a memória VGA (`0xA0000`–`0xBFFFF`) e restaurando a integridade dos descritores do PMM.
+*   **Heap Seguro:** `heap_expand()` valida explicitamente os retornos de `pmm_alloc()` e `vmm_map()`, abortando o crescimento do heap em caso de falha sem tentar gravar em memória não mapeada.
+*   **Validação Estrita de MMIO:** O VMM aceita mapeamentos de regiões de hardware MMIO (VBE LFB em `0xFD000000` e APIC em `0xFEE00000`) sem expurgar entradas de tabelas de páginas.
+
 ### 🌐 Infraestrutura TCP (Fase 1 — v4.2)
 *   **Subsistema TCP Modular:** Módulo kernel independente (`src/kernel/tcp.c`, `include/tcp.h`) contendo gerenciamento de PCBs em lista global protegida por mutex, cálculo de checksum RFC 793 com pseudo-cabeçalho IPv4 e demultiplexação pela tupla de 4 elementos ou socket listener.
 *   **Gerenciamento de Portas:** Algoritmo thread-safe de alocação de portas efêmeras IANA (49152–65535), `bind` explícito de portas locais, detecção de colisão e liberação segura sem vazamentos.

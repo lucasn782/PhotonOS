@@ -117,7 +117,7 @@ protected_start:
     mov fs, ax
     mov gs, ax
     mov ss, ax
-    mov esp, 0x00090000
+    mov esp, 0x00007C00
 
     call setup_page_tables
     call enter_long_mode

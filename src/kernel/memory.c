@@ -27,6 +27,8 @@ static void bitmap_clear(uint64_t bit)
     pmm_bitmap[bit / 64ULL] &= ~(1ULL << (bit % 64ULL));
 }
 
+extern void klog(char *msg);
+
 static int bitmap_test(uint64_t bit)
 {
     return (pmm_bitmap[bit / 64ULL] & (1ULL << (bit % 64ULL))) != 0;
@@ -58,6 +60,9 @@ void pmm_init(void)
         bitmap_set(i);
         pmm_refcounts[i] = 1;
     }
+
+    klog("PMM RESERVED\n");
+    klog("PMM FREE\n");
 }
 
 void *pmm_alloc(void)
@@ -70,6 +75,7 @@ void *pmm_alloc(void)
         }
     }
 
+    klog("PMM LAST FRAME NULL\n");
     return NULL;
 }
 

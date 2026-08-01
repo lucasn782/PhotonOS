@@ -1,92 +1,203 @@
 # 🏗️ Arquitetura do Subsistema TCP — PhotonOS v4.2
 
-## 🌐 Visão Geral
+## 🌐 1. Visão Geral do Subsistema TCP
 
-O subsistema TCP (Transmission Control Protocol) do **PhotonOS v4.2** foi projetado como um módulo kernel de rede limpo, modular e desacoplado (`src/kernel/tcp.c`, `include/tcp.h`). Ele estende a pilha IPv4 do sistema operacional sem comprometer a estabilidade do carregador ELF, do gerenciamento de memória (PMM/VMM), da concorrência SMP ou do escalonador preemptivo.
+O subsistema TCP (Transmission Control Protocol) do **PhotonOS v4.2** foi projetado como um módulo kernel desacoplado, modular e thread-safe (`src/kernel/tcp.c`, `include/tcp.h`). Ele estende a pilha de rede nativa (Ethernet → ARP → IPv4 → ICMP → Socket Layer) preparando toda a infraestrutura de transporte com orientação a conexões.
 
 ---
 
-## 🔀 Pipeline de Processamento de Datagramas
+## 📐 2. Diagrama Completo da Pilha de Rede
 
 ```text
 +-------------------------------------------------------------------+
-|                        Driver Intel e1000                         |
-|                 (Recepção de Quadros Ethernet DMA)                |
-+-------------------------------------------------------------------+
-                                  |
-                                  v
-+-------------------------------------------------------------------+
-|                        Camada Ethernet (L2)                       |
-|           Validação de EtherType (ETH_TYPE_IPV4 = 0x0800)         |
-+-------------------------------------------------------------------+
-                                  |
-                                  v
-+-------------------------------------------------------------------+
-|                         Camada IPv4 (L3)                          |
-|    Validação de IP local, versão (IPv4) e Checksum do IP Header   |
-|            Verificação de Protocolo (IP_PROTO_TCP = 6)            |
-+-------------------------------------------------------------------+
-                                  |
-                                  v
-+-------------------------------------------------------------------+
-|                          Camada TCP (L4)                          |
-|                       `tcp_input()` em tcp.c                      |
-|  1. Validação de Checksum TCP RFC 793 (Pseudo Header IPv4 + TCP)  |
-|  2. Extração dos Portas e Sequências em Host Byte Order           |
-|  3. Demultiplexação via `tcp_lookup()` (Tupla 4-way ou LISTEN)    |
-+-------------------------------------------------------------------+
-                                  |
-                                  v
-+-------------------------------------------------------------------+
-|                      Protocol Control Block                       |
-|                         (`struct tcp_pcb`)                        |
-|  1. Atualização do Estado do Protocolo                            |
-|  2. Enfileiramento na `receive_queue` (se dados)                  |
-|  3. Notificação via `tcp_socket_notify()` (Desperta Threads)      |
+|                     Aplicações de Usuário (Ring 3)                |
+|               chamadas POSIX: socket(), bind(), read(), write()   |
 +-------------------------------------------------------------------+
                                   |
                                   v
 +-------------------------------------------------------------------+
 |                      Camada de Sockets & VFS                      |
-|                  VFS Node (`socket_vfs_read`)                     |
-|    Cópia de Dados para o Buffer de Usuário no Leitor Bloqueado    |
+|           nós VFS_NODE_SOCKET (`sys_socket`, `sys_bind`)          |
++-------------------------------------------------------------------+
+                                  |
+                                  v
++-------------------------------------------------------------------+
+|                  Camada de Transporte TCP (L4)                    |
+|  - Gerenciador de PCBs (tcp_pcbs global)                          |
+|  - Máquina de Estados RFC 793 (10 estados)                        |
+|  - Checksum TCP RFC 793 / RFC 1071 (Pseudo-Header IPv4)           |
+|  - Parser e Serializador de Cabeçalho                             |
+|  - Entradas: `tcp_input()` | Saídas: `tcp_send_segment()`          |
++-------------------------------------------------------------------+
+                                  |
+                                  v
++-------------------------------------------------------------------+
+|                       Camada de Rede IPv4 (L3)                    |
+|   - `net_send_ipv4()` (Protocolo IP_PROTO_TCP = 6)                 |
+|   - Demux por protocolo em `net_poll_packets()`                   |
+|   - Suporte mantido: ICMP (Echo Request/Reply), UDP, RAW          |
++-------------------------------------------------------------------+
+                                  |
+                                  v
++-------------------------------------------------------------------+
+|                       Camada de Enlace (L2)                       |
+|           - Resolução ARP (`arp_resolve` / `arp_cache`)           |
+|           - Cabeçalho Ethernet II (ETH_TYPE_IPV4 = 0x0800)        |
++-------------------------------------------------------------------+
+                                  |
+                                  v
++-------------------------------------------------------------------+
+|                      Driver Intel e1000 (Hardware)                |
+|                    Transmissão e Recepção via DMA                 |
 +-------------------------------------------------------------------+
 ```
 
 ---
 
-## 🔬 Componentes Principais
+## 🔀 3. Fluxo de Entrada e Saída de Segmentos
 
-### 1. Núcleo TCP (`src/kernel/tcp.c`)
-- **`tcp_init()`**: Inicializa a lista global de PCBs (`tcp_pcbs`) e a mutex global de tabela (`tcp_pcbs_lock`).
-- **`tcp_input()`**: Ponto de entrada de segmentos TCP vindos do IPv4.
-- **`tcp_output()`**: Monta e envia segmentos TCP via `net_send_ipv4()`.
-- **`tcp_checksum()`**: Calcula o checksum do cabeçalho + payload com pseudo-cabeçalho IPv4 (RFC 793).
+### 📥 Fluxo de Entrada (RX Segment Pipeline)
 
-### 2. Gerenciamento de PCBs (`struct tcp_pcb`)
-- Cada PCB representa o estado de uma conexão de transporte local ou socket em escuta.
-- Mantido em uma lista encadeada global protegida por `tcp_pcbs_lock`.
-- Cada PCB possui sua própria mutex `pcb->lock` para sincronização granular.
+```text
+Ethernet Frame (e1000 DMA)
+  ↓
+EtherType == 0x0800 (IPv4)
+  ↓
+IP Protocol == 6 (IP_PROTO_TCP)
+  ↓
+`tcp_input(src_ip, dest_ip, segment, length)`
+  │
+  ├── 1. Validação de Checksum (Pseudo-Header IPv4 + TCP Header + Payload)
+  ├── 2. Desserialização do Cabeçalho (`tcp_parse_header()`)
+  ├── 3. Instrumentação de Log `[TCP RX]`
+  ├── 4. Demux / Lookup de PCB (`tcp_lookup()` 4-Tuple ou LISTEN)
+  └── 5. Atualização de Sequência/Ack (`rcv_nxt`, `snd_una`, `rcv_wnd`) no PCB
+```
 
-### 3. Integração VFS / Sockets (`src/kernel/net.c`)
-- Sockets TCP são expostos como arquivos VFS (`VFS_NODE_SOCKET`).
-- Suportam chamadas `read()`, `write()`, `bind()`, `connect()`, `listen()` e `accept()`.
+### 📤 Fluxo de Saída (TX Segment Pipeline)
+
+```text
+`tcp_send_segment(pcb, seq, ack, flags, window, payload, len)`
+  ↓
+Montagem do Cabeçalho TCP (`tcp_serialize_header()`)
+  ↓
+Cálculo de Checksum TCP RFC 793 (`tcp_checksum()`)
+  ↓
+Instrumentação de Log `[TCP TX]`
+  ↓
+Atualização de `snd_nxt` no PCB
+  ↓
+`net_send_ipv4(remote_ip, IP_PROTO_TCP, buffer, total_len)`
+  ↓
+Encapsulamento Ethernet + Transmissão DMA e1000
+```
 
 ---
 
-## 🔒 Concorrência e Sincronização
+## 🔬 4. Estrutura do PCB (Protocol Control Block)
 
-1. **Lock Hierarchy**:
-   - `sockets_mutex` (Camada de Sockets)
-   - `tcp_pcbs_lock` (Lista Global de PCBs TCP e Alocação de Portas)
-   - `pcb->lock` (Estrutura Individual do PCB)
+A estrutura `tcp_pcb_t` (`struct tcp_pcb`) armazena todo o estado de uma conexão TCP local ou socket listener:
 
-2. **Prevenção de Deadlocks**:
-   - Para aceitar conexões pendentes (`accept`), o listener adquire `listener->lock` antes de manipular a fila `accept_head`.
-   - Modificações na lista global exigem a aquisição prévia de `tcp_pcbs_lock`.
+```c
+typedef struct tcp_pcb {
+    uint32_t local_ip;      /* IP local em ord. de rede */
+    uint32_t remote_ip;     /* IP remoto em ord. de rede */
+
+    uint16_t local_port;    /* Porta local em ord. de host */
+    uint16_t remote_port;   /* Porta remota em ord. de host */
+
+    uint32_t snd_una;       /* Unacknowledged Sequence */
+    uint32_t snd_nxt;       /* Next Sequence to Send */
+
+    uint32_t rcv_nxt;       /* Next Sequence Expected */
+
+    uint16_t snd_wnd;       /* Send Window */
+    uint16_t rcv_wnd;       /* Receive Window */
+
+    uint8_t state;          /* Estado do protocolo (enum tcp_state) */
+
+    struct socket *socket;  /* Ponteiro para o socket VFS associado */
+
+    struct tcp_pcb *next;   /* Próximo nó na lista global de PCBs */
+
+    /* Campos de sincronização e filas de kernel */
+    uint32_t seq_number;
+    uint32_t ack_number;
+    uint32_t window;
+    uint64_t retransmission_timer;
+
+    struct tcp_queue receive_queue;
+    struct tcp_queue send_queue;
+    uint32_t flags;
+    struct tcp_timers timers;
+
+    /* Infraestrutura para Passive Open / Accept */
+    int backlog;
+    int accept_count;
+    struct tcp_pcb *parent;
+    struct tcp_pcb *accept_next;
+    struct tcp_pcb *accept_head;
+    struct tcp_pcb *accept_tail;
+
+    mutex_t lock;
+} tcp_pcb_t;
+```
 
 ---
 
-## 📌 Garantias de Não Regressão
-- A camada TCP interage com a rede exclusivamente chamando `net_send_ipv4()`.
-- `SOCK_RAW`, `SOCK_DGRAM` (UDP) e `ICMP` permanecem completamente operacionais e inalterados.
+## ⚙️ 5. Gerenciador de Conexões e Ciclo de Vida
+
+O gerenciamento de PCBs é coordenado por uma lista global (`tcp_pcbs`) com exclusão mútua garantida por `tcp_pcbs_lock`:
+
+- **`tcp_alloc()`**: Aloca dinamicamente um novo PCB no Kernel Heap, inicializa estado para `TCP_CLOSED`, define janelas padrão (65535 bytes) e inicializa a mutex individual do PCB (`pcb->lock`). Emite log `[TCP] pcb criado`.
+- **`tcp_free(pcb)`**: Remove o PCB da lista global via `tcp_unregister()`, limpa as filas de recepção/envio, redefine temporizadores e desaloca a memória física (`kfree`).
+- **`tcp_register(pcb)`**: Insere o PCB de maneira segura na lista global `tcp_pcbs`.
+- **`tcp_unregister(pcb)`**: Desconecta o PCB da lista encadeada global.
+- **`tcp_lookup(local_ip, remote_ip, local_port, remote_port)`**: Efetua busca por correspondência exata de 4-tuple (`local_ip, remote_ip, local_port, remote_port`) e fallback para conexões passivas em estado `TCP_LISTEN`.
+
+---
+
+## 🔄 6. Máquina de Estados TCP (RFC 793)
+
+O subsistema define formalmente os 10 estados padronizados da RFC 793:
+
+```c
+typedef enum tcp_state {
+    TCP_CLOSED = 0,
+    TCP_LISTEN,
+    TCP_SYN_SENT,
+    TCP_SYN_RECEIVED,
+    TCP_ESTABLISHED,
+    TCP_FIN_WAIT1,
+    TCP_FIN_WAIT2,
+    TCP_CLOSE_WAIT,
+    TCP_LAST_ACK,
+    TCP_TIME_WAIT
+} tcp_state_t;
+```
+
+A função `tcp_state_name(state)` converte os valores numéricos em representações textuais legíveis para logs e auditoria.
+
+---
+
+## 🔌 7. Integração com o Socket Layer
+
+Ao criar um socket através da chamada de sistema:
+
+```c
+int fd = sys_socket(AF_INET, SOCK_STREAM, IP_PROTO_TCP);
+```
+
+O Kernel aloca o socket e automaticamente invoca `tcp_alloc()` e `tcp_register()`, vinculando o PCB à estrutura do socket (`sock->tcp = pcb; pcb->socket = sock;`).
+
+> [!NOTE]
+> Os sockets do tipo `SOCK_RAW` e `SOCK_DGRAM` (UDP) e o protocolo ICMP continuam funcionando em suas rotas dedicadas sem qualquer alteração ou interferência.
+
+---
+
+## 🚀 8. Preparação para o Three-Way Handshake (Próxima Etapa)
+
+A infraestrutura atual deixa o kernel totalmente preparado para a implementação das chamadas `connect()`, `listen()` e `accept()` na próxima fase:
+1. Os campos `seq_number`, `ack_number`, `snd_nxt` e `rcv_nxt` já são manipulados e serializados corretamente nos segmentos.
+2. As filas de aceitação (`accept_head`, `accept_tail`, `backlog`) já estão estruturadas no PCB.
+3. O parser e gerador de cabeçalhos operam em ambas as direções com validação checksum RFC 793/1071.

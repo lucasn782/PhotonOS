@@ -42,14 +42,23 @@ static uintptr_t align_up_ptr(uintptr_t value, uintptr_t alignment)
     return (value + alignment - 1ULL) & ~(alignment - 1ULL);
 }
 
-static void heap_map_page(uintptr_t virtual_addr)
+static int heap_map_page(uintptr_t virtual_addr)
 {
     void *physical = pmm_alloc();
     if (physical == 0) {
-        return;
+        klog("HEAP MAP FAIL\n");
+        return -1;
     }
 
     vmm_map(virtual_addr, (uintptr_t)physical, PAGE_PRESENT | PAGE_WRITABLE | PAGE_NX);
+    if (!vmm_is_mapped(vmm_kernel_pml4(), virtual_addr)) {
+        klog("HEAP MAP FAIL\n");
+        pmm_free(physical);
+        return -1;
+    }
+
+    klog("HEAP MAP OK\n");
+    return 0;
 }
 
 static int heap_expand(size_t required)
@@ -58,11 +67,15 @@ static int heap_expand(size_t required)
     uintptr_t new_end = align_up_ptr(heap_end + required, PMM_PAGE_SIZE);
 
     if (new_end > heap_limit) {
+        klog("HEAP EXPAND FAIL\n");
         return 0;
     }
 
     for (uintptr_t page = heap_end; page < new_end; page += PMM_PAGE_SIZE) {
-        heap_map_page(page);
+        if (heap_map_page(page) != 0) {
+            klog("HEAP EXPAND FAIL\n");
+            return 0;
+        }
     }
 
     heap_end = new_end;
@@ -75,6 +88,7 @@ static int heap_expand(size_t required)
 
     if (tail != 0 && tail->free) {
         tail->size += added;
+        klog("HEAP EXPAND OK\n");
         return 1;
     }
 
@@ -91,6 +105,7 @@ static int heap_expand(size_t required)
         heap_head = block;
     }
 
+    klog("HEAP EXPAND OK\n");
     return 1;
 }
 

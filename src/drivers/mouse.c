@@ -17,35 +17,37 @@ static inline void outb(uint16_t port, uint8_t value)
     __asm__ volatile ("outb %0, %1" : : "a"(value), "Nd"(port));
 }
 
-static void mouse_wait_write(void)
+static int mouse_wait_write(void)
 {
-    // Wait until Input Buffer is empty (Bit 1 of Status is 0)
+    uint32_t timeout = 100000;
     while (inb(0x64) & 0x02) {
+        if (--timeout == 0) return 0;
         __asm__ volatile ("pause");
     }
+    return 1;
 }
 
-static void mouse_wait_read(void)
+static int mouse_wait_read(void)
 {
-    // Wait until Output Buffer is full (Bit 0 of Status is 1)
+    uint32_t timeout = 100000;
     while (!(inb(0x64) & 0x01)) {
+        if (--timeout == 0) return 0;
         __asm__ volatile ("pause");
     }
+    return 1;
 }
 
 static void mouse_write(uint8_t val)
 {
-    // Tell 8042 to send next byte to the auxiliary mouse device
-    mouse_wait_write();
+    if (!mouse_wait_write()) return;
     outb(0x64, 0xD4);
-    // Write data byte to data port
-    mouse_wait_write();
+    if (!mouse_wait_write()) return;
     outb(0x60, val);
 }
 
 static uint8_t mouse_read(void)
 {
-    mouse_wait_read();
+    if (!mouse_wait_read()) return 0;
     return inb(0x60);
 }
 
@@ -53,36 +55,28 @@ void mouse_init(void)
 {
     klog("MOUSE: inicializando controlador 8042...\n");
 
-    // 1. Enable auxiliary mouse port
-    mouse_wait_write();
+    if (!mouse_wait_write()) return;
     outb(0x64, 0xA8);
 
-    // 2. Enable Mouse IRQ 12
-    // Send "Get Command Byte" command
-    mouse_wait_write();
+    if (!mouse_wait_write()) return;
     outb(0x64, 0x20);
-    mouse_wait_read();
+    if (!mouse_wait_read()) return;
     uint8_t command_byte = inb(0x60);
 
-    // Set Bit 1 (enable auxiliary device interrupt IRQ 12)
-    // Clear Bit 5 (mouse clock disable, which enables clock)
     command_byte |= 0x02;
     command_byte &= ~0x20;
 
-    // Send "Set Command Byte" command
-    mouse_wait_write();
+    if (!mouse_wait_write()) return;
     outb(0x64, 0x60);
-    mouse_wait_write();
+    if (!mouse_wait_write()) return;
     outb(0x60, command_byte);
 
-    // 3. Set mouse default settings
     mouse_write(0xF6);
     uint8_t ack = mouse_read();
     if (ack != 0xFA) {
         klog("MOUSE: falha ao definir padroes (F6).\n");
     }
 
-    // 4. Enable packet streaming
     mouse_write(0xF4);
     ack = mouse_read();
     if (ack != 0xFA) {

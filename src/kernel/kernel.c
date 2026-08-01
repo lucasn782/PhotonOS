@@ -8,6 +8,7 @@
 #include "memory.h"
 #include "mutex.h"
 #include "net.h"
+#include "tcp.h"
 #include "pci.h"
 #include "proc.h"
 #include "scheduler.h"
@@ -1854,7 +1855,6 @@ static void keyboard_init(void)
     keyboard_altgr = 0;
     keyboard_queue_read = 0;
     keyboard_queue_write = 0;
-    idt_init();
     pic_init_irqs();
     keyboard_flush();
 }
@@ -1872,6 +1872,20 @@ void kmain(void)
     interrupts_disable();
     serial_init();
     klog("PhotonOS: serial COM1 ativo.\n");
+    
+    klog("BOOT: IDT INIT\n");
+    idt_init();
+    klog("BOOT: IDT LOAD\n");
+    idt_load();
+    
+    struct idt_pointer check_idtr;
+    __asm__ volatile ("sidt %0" : "=m"(check_idtr));
+    if (check_idtr.base != 0 && check_idtr.limit > 0) {
+        klog("BOOT: IDT READY\n");
+    } else {
+        klog("BOOT: IDT FAIL\n");
+    }
+
     vga_clear();
     vga_puts("PhotonOS: Kernel em C operando em Long Mode\n");
     
@@ -1885,9 +1899,8 @@ void kmain(void)
     vmm_init();
     klog("VMM Iniciado.\n");
     
-    // CORRIGIDO: Força a sincronia limpando os cursores após inicializar o buffer gráfico VBE
     video_init();
-    vga_clear(); 
+    vga_clear();
     
     vmm_self_test();
     heap_init();
@@ -1902,12 +1915,17 @@ void kmain(void)
     int network_ready = pci_init() == 0;
     if (network_ready) {
         net_init();
+        tcp_run_tests();
     }
     console_nodes_init();
     klog("VFS: initrd e armazenamento persistente inicializados.\n");
 
     apic_init();
     klog("APIC: PIC legado desativado. Local APIC mapeado e ativo.\n");
+
+    tss_init();
+    syscall_init();
+    klog("Syscall/TSS: estruturas de Ring 3 inicializadas.\n");
 
     smp_init();
     klog("SMP: trampolim instalado. Inicializando APs...\n");
@@ -1927,11 +1945,6 @@ void kmain(void)
         smp_boot_ap(2);
         smp_boot_ap(3);
     }
-
-    
-    tss_init();
-    syscall_init();
-    klog("Syscall/TSS: estruturas de Ring 3 inicializadas.\n");
     
     scheduler_init();
     if (network_ready) {

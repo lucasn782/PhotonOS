@@ -278,19 +278,48 @@ static int tcp_build_output_locked(struct tcp_pcb *pcb, uint8_t flags,
     return 0;
 }
 
-static struct tcp_pcb *tcp_pcb_alloc(void *socket)
+tcp_pcb_t *tcp_alloc(void)
 {
-    struct tcp_pcb *pcb = kmalloc(sizeof(*pcb));
+    tcp_pcb_t *pcb = kmalloc(sizeof(*pcb));
 
     if (pcb == 0) {
         return 0;
     }
     tcp_zero(pcb, sizeof(*pcb));
     pcb->window = TCP_DEFAULT_WINDOW;
+    pcb->snd_wnd = (uint16_t)TCP_DEFAULT_WINDOW;
+    pcb->rcv_wnd = (uint16_t)TCP_DEFAULT_WINDOW;
     pcb->state = TCP_CLOSED;
-    pcb->socket = socket;
     tcp_timers_reset(pcb);
     mutex_init(&pcb->lock);
+
+    klog("[TCP] pcb criado\n");
+    return pcb;
+}
+
+void tcp_free(tcp_pcb_t *pcb)
+{
+    if (pcb == 0) {
+        return;
+    }
+    tcp_unregister(pcb);
+    mutex_lock(&pcb->lock);
+    tcp_queue_clear_locked(&pcb->receive_queue);
+    tcp_queue_clear_locked(&pcb->send_queue);
+    tcp_timers_reset(pcb);
+    pcb->socket = 0;
+    pcb->state = TCP_CLOSED;
+    mutex_unlock(&pcb->lock);
+    kfree(pcb);
+}
+
+static struct tcp_pcb *tcp_pcb_alloc(void *socket)
+{
+    struct tcp_pcb *pcb = tcp_alloc();
+    if (pcb == 0) {
+        return 0;
+    }
+    pcb->socket = socket;
     return pcb;
 }
 
@@ -302,6 +331,11 @@ const char *tcp_state_name(enum tcp_state state)
     case TCP_SYN_SENT:     return "SYN_SENT";
     case TCP_SYN_RECEIVED: return "SYN_RECEIVED";
     case TCP_ESTABLISHED:  return "ESTABLISHED";
+    case TCP_FIN_WAIT1:    return "FIN_WAIT1";
+    case TCP_FIN_WAIT2:    return "FIN_WAIT2";
+    case TCP_CLOSE_WAIT:   return "CLOSE_WAIT";
+    case TCP_LAST_ACK:     return "LAST_ACK";
+    case TCP_TIME_WAIT:    return "TIME_WAIT";
     default:               return "UNKNOWN";
     }
 }
@@ -578,6 +612,40 @@ struct tcp_pcb *tcp_accept(struct tcp_pcb *listener)
     return child;
 }
 
+int tcp_serialize_header(const struct tcp_header *hdr, uint8_t *buffer, size_t buf_size)
+{
+    if (hdr == 0 || buffer == 0 || buf_size < sizeof(struct tcp_header)) {
+        return -1;
+    }
+    struct tcp_header *dest = (struct tcp_header *)buffer;
+    dest->src_port = htons(hdr->src_port);
+    dest->dest_port = htons(hdr->dest_port);
+    dest->seq_num = htonl(hdr->seq_num);
+    dest->ack_num = htonl(hdr->ack_num);
+    dest->data_offset_flags = htons(hdr->data_offset_flags);
+    dest->window_size = htons(hdr->window_size);
+    dest->checksum = htons(hdr->checksum);
+    dest->urgent_ptr = htons(hdr->urgent_ptr);
+    return (int)sizeof(struct tcp_header);
+}
+
+int tcp_parse_header(const uint8_t *buffer, size_t len, struct tcp_header *hdr)
+{
+    if (buffer == 0 || hdr == 0 || len < sizeof(struct tcp_header)) {
+        return -1;
+    }
+    const struct tcp_header *src = (const struct tcp_header *)buffer;
+    hdr->src_port = ntohs(src->src_port);
+    hdr->dest_port = ntohs(src->dest_port);
+    hdr->seq_num = ntohl(src->seq_num);
+    hdr->ack_num = ntohl(src->ack_num);
+    hdr->data_offset_flags = ntohs(src->data_offset_flags);
+    hdr->window_size = ntohs(src->window_size);
+    hdr->checksum = ntohs(src->checksum);
+    hdr->urgent_ptr = ntohs(src->urgent_ptr);
+    return 0;
+}
+
 uint16_t tcp_checksum(uint32_t src_ip, uint32_t dest_ip,
     const void *segment, size_t length)
 {
@@ -595,6 +663,52 @@ uint16_t tcp_checksum(uint32_t src_ip, uint32_t dest_ip,
     sum += (uint16_t)length;
     sum = tcp_checksum_add(sum, segment, length);
     return tcp_checksum_finish(sum);
+}
+
+int tcp_send_segment(struct tcp_pcb *pcb, uint32_t seq, uint32_t ack, uint8_t flags,
+    uint16_t window, const void *payload, size_t len)
+{
+    if (pcb == 0 || pcb->remote_ip == 0U || pcb->local_port == 0U || pcb->remote_port == 0U) {
+        return -1;
+    }
+    uint8_t buffer[TCP_HEADER_MIN_SIZE + TCP_DEFAULT_MSS];
+    if (len > TCP_DEFAULT_MSS) {
+        return -1;
+    }
+
+    struct tcp_header hdr;
+    hdr.src_port = pcb->local_port;
+    hdr.dest_port = pcb->remote_port;
+    hdr.seq_num = seq;
+    hdr.ack_num = ack;
+    hdr.data_offset_flags = (uint16_t)((5U << 12) | (flags & 0x3FU));
+    hdr.window_size = window != 0U ? window : pcb->snd_wnd;
+    hdr.checksum = 0;
+    hdr.urgent_ptr = 0;
+
+    if (tcp_serialize_header(&hdr, buffer, sizeof(buffer)) < 0) {
+        return -1;
+    }
+
+    if (len != 0U && payload != 0) {
+        tcp_copy(buffer + sizeof(struct tcp_header), payload, len);
+    }
+
+    size_t total_len = sizeof(struct tcp_header) + len;
+    uint32_t local_ip = tcp_effective_local_ip(pcb);
+    uint16_t csum = tcp_checksum(local_ip, pcb->remote_ip, buffer, total_len);
+    if (csum == 0U) {
+        csum = 0xFFFFU;
+    }
+
+    struct tcp_header *raw_hdr = (struct tcp_header *)buffer;
+    raw_hdr->checksum = htons(csum);
+
+    klog("[TCP TX] segmento transmitido\n");
+
+    pcb->snd_nxt = seq + (uint32_t)len + (((flags & (TCP_FLAG_SYN | TCP_FLAG_FIN)) != 0U) ? 1U : 0U);
+
+    return net_send_ipv4(pcb->remote_ip, IP_PROTO_TCP, buffer, total_len);
 }
 
 int tcp_output(struct tcp_pcb *pcb, uint8_t flags, const void *payload,
@@ -690,7 +804,7 @@ static int tcp_handle_listen_syn(struct tcp_pcb *listener, uint32_t src_ip,
 int tcp_input(uint32_t src_ip, uint32_t dest_ip, const uint8_t *segment,
     size_t length)
 {
-    const struct tcp_header *header;
+    struct tcp_header hdr;
     struct tcp_pcb *pcb;
     uint16_t header_len;
     uint16_t flags;
@@ -698,6 +812,7 @@ int tcp_input(uint32_t src_ip, uint32_t dest_ip, const uint8_t *segment,
     uint16_t remote_port;
     uint32_t sequence;
     uint32_t acknowledgement;
+    uint16_t raw_checksum;
     const uint8_t *payload;
     size_t payload_len;
     uint8_t out_packet[TCP_HEADER_MIN_SIZE];
@@ -707,22 +822,35 @@ int tcp_input(uint32_t src_ip, uint32_t dest_ip, const uint8_t *segment,
     void *socket = 0;
     void *listener_socket = 0;
 
-    if (segment == 0 || length < sizeof(struct tcp_header) ||
-        tcp_checksum(src_ip, dest_ip, segment, length) != 0U) {
+    if (segment == 0 || length < sizeof(struct tcp_header)) {
         return -1;
     }
-    header = (const struct tcp_header *)segment;
-    header_len = (uint16_t)((ntohs(header->data_offset_flags) >> 12) * 4U);
+
+    raw_checksum = ntohs(((const struct tcp_header *)segment)->checksum);
+    (void)raw_checksum;
+
+    if (tcp_checksum(src_ip, dest_ip, segment, length) != 0U) {
+        klog("TCP: Checksum invalido no segmento recebido.\n");
+        return -1;
+    }
+
+    if (tcp_parse_header(segment, length, &hdr) != 0) {
+        return -1;
+    }
+
+    header_len = (uint16_t)((hdr.data_offset_flags >> 12) * 4U);
     if (header_len < TCP_HEADER_MIN_SIZE || header_len > length) {
         return -1;
     }
-    local_port = ntohs(header->dest_port);
-    remote_port = ntohs(header->src_port);
-    flags = ntohs(header->data_offset_flags) & 0x01FFU;
-    sequence = ntohl(header->seq_num);
-    acknowledgement = ntohl(header->ack_num);
+    local_port = hdr.dest_port;
+    remote_port = hdr.src_port;
+    flags = hdr.data_offset_flags & 0x01FFU;
+    sequence = hdr.seq_num;
+    acknowledgement = hdr.ack_num;
     payload = segment + header_len;
     payload_len = length - header_len;
+
+    klog("[TCP RX] segmento recebido\n");
 
     mutex_lock(&tcp_pcbs_lock);
     pcb = tcp_lookup_locked(dest_ip, src_ip, local_port, remote_port);
@@ -733,6 +861,10 @@ int tcp_input(uint32_t src_ip, uint32_t dest_ip, const uint8_t *segment,
 
     mutex_lock(&pcb->lock);
     mutex_unlock(&tcp_pcbs_lock);
+
+    pcb->rcv_nxt = sequence + (uint32_t)payload_len + (((flags & (TCP_FLAG_SYN | TCP_FLAG_FIN)) != 0U) ? 1U : 0U);
+    pcb->snd_una = acknowledgement;
+    pcb->rcv_wnd = hdr.window_size;
 
     /* Passive open: demux landed on a LISTEN PCB. */
     if (pcb->state == TCP_LISTEN) {
@@ -879,4 +1011,92 @@ size_t tcp_receive_available(struct tcp_pcb *pcb)
     bytes = pcb->receive_queue.bytes;
     mutex_unlock(&pcb->lock);
     return bytes;
+}
+
+void tcp_run_tests(void)
+{
+    klog("\n========================================\n");
+    klog("[TCP TEST] Iniciando Suite de Testes TCP...\n");
+
+    /* Test 1: Alloc */
+    tcp_pcb_t *pcb = tcp_alloc();
+    if (pcb != 0 && pcb->state == TCP_CLOSED && pcb->rcv_wnd == TCP_DEFAULT_WINDOW) {
+        klog("[TCP TEST] PASS: tcp_alloc (PCB criado com sucesso e estado CLOSED)\n");
+    } else {
+        klog("[TCP TEST] FAIL: tcp_alloc\n");
+    }
+
+    /* Test 2: Register */
+    pcb->local_ip = 0x0A00020F; /* 10.0.2.15 */
+    pcb->local_port = 12345;
+    pcb->remote_ip = 0x0A000202; /* 10.0.2.2 */
+    pcb->remote_port = 80;
+    if (tcp_register(pcb) == 0) {
+        klog("[TCP TEST] PASS: tcp_register (PCB registrado na lista global)\n");
+    } else {
+        klog("[TCP TEST] FAIL: tcp_register\n");
+    }
+
+    /* Test 3: Lookup */
+    tcp_pcb_t *found = tcp_lookup(0x0A00020F, 0x0A000202, 12345, 80);
+    if (found == pcb) {
+        klog("[TCP TEST] PASS: tcp_lookup (PCB localizado por 4-tuple)\n");
+    } else {
+        klog("[TCP TEST] FAIL: tcp_lookup\n");
+    }
+
+    /* Test 4: Header Serializer & Parser */
+    struct tcp_header orig_hdr;
+    struct tcp_header parsed_hdr;
+    uint8_t hdr_buf[TCP_HEADER_MIN_SIZE];
+    orig_hdr.src_port = 1234;
+    orig_hdr.dest_port = 80;
+    orig_hdr.seq_num = 0x12345678;
+    orig_hdr.ack_num = 0x87654321;
+    orig_hdr.data_offset_flags = (5U << 12) | TCP_FLAG_SYN;
+    orig_hdr.window_size = 8192;
+    orig_hdr.checksum = 0;
+    orig_hdr.urgent_ptr = 0;
+
+    if (tcp_serialize_header(&orig_hdr, hdr_buf, sizeof(hdr_buf)) == sizeof(hdr_buf) &&
+        tcp_parse_header(hdr_buf, sizeof(hdr_buf), &parsed_hdr) == 0 &&
+        parsed_hdr.src_port == 1234 && parsed_hdr.dest_port == 80 &&
+        parsed_hdr.seq_num == 0x12345678 && parsed_hdr.ack_num == 0x87654321 &&
+        parsed_hdr.window_size == 8192) {
+        klog("[TCP TEST] PASS: tcp_serialize_header e tcp_parse_header\n");
+    } else {
+        klog("[TCP TEST] FAIL: tcp_serialize_header / tcp_parse_header\n");
+    }
+
+    /* Test 5: Checksum */
+    uint32_t src_ip = 0x0A00020F;
+    uint32_t dest_ip = 0x0A000202;
+    uint16_t csum = tcp_checksum(src_ip, dest_ip, hdr_buf, sizeof(hdr_buf));
+    ((struct tcp_header *)hdr_buf)->checksum = htons(csum);
+    if (tcp_checksum(src_ip, dest_ip, hdr_buf, sizeof(hdr_buf)) == 0U) {
+        klog("[TCP TEST] PASS: tcp_checksum (Checksum calculado e validado)\n");
+    } else {
+        klog("[TCP TEST] FAIL: tcp_checksum\n");
+    }
+
+    /* Test 6: Unregister & Free */
+    tcp_unregister(pcb);
+    found = tcp_lookup(0x0A00020F, 0x0A000202, 12345, 80);
+    if (found == 0) {
+        tcp_free(pcb);
+        klog("[TCP TEST] PASS: tcp_unregister e tcp_free (PCB removido e liberado)\n");
+    } else {
+        klog("[TCP TEST] FAIL: tcp_unregister / tcp_free\n");
+    }
+
+    /* Test 7: Socket Integration */
+    int fd = sys_socket(AF_INET, SOCK_STREAM, IP_PROTO_TCP);
+    if (fd >= 0) {
+        klog("[TCP TEST] PASS: sys_socket(AF_INET, SOCK_STREAM, IP_PROTO_TCP)\n");
+    } else {
+        klog("[TCP TEST] FAIL: sys_socket integration\n");
+    }
+
+    klog("[TCP TEST] Finalizada Suite de Testes TCP.\n");
+    klog("========================================\n\n");
 }

@@ -464,13 +464,6 @@ void ap_kmain(uint64_t ap_id)
         ::: "rax", "memory"
     );
 
-    /* Load the Task Register (TR) selector (0x30) to configure the TSS. */
-    __asm__ volatile (
-        "movw $0x30, %%ax\n\t"
-        "ltr  %%ax\n\t"
-        ::: "rax", "memory"
-    );
-
     /*
      * Step 2 — Enable Local APIC on this secondary core.
      * apic_init_ap() writes the SIVR (offset 0xF0) with software-enable bit.
