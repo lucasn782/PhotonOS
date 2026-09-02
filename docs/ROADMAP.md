@@ -69,13 +69,21 @@ Este documento descreve o estado atual do desenvolvimento do PhotonOS, dividindo
 - **Eliminação de Dependência de CHS em Hard Disk**: Validação estrita de extensões BIOS EDD (`INT 13h, AH=42h`) para execução segura em discos rígidos (`DL=0x80`).
 - **Resolução de Boot Regression**: Estabilização comprovada com 10/10 boots consecutivos com passagem em todos os subsistemas.
 
+### Trilha 16 — TCP Phase 2A: 3-Way Handshake & Conexão Ativa (v4.4-tcp2a)
+- **3-Way Handshake Ativo (RFC 793):** Sequência completa `SYN -> SYN+ACK -> ACK` validada por inspeção de pacotes PCAP no fio (*wire*).
+- **Máquina de Estados Operacional:** Transições estritas `CLOSED -> SYN_SENT -> ESTABLISHED`, tratamento de `RST` (porta fechada) e timeout.
+- **Syscall `connect()` com Bloqueio Seguro:** Integração com a camada de sockets sem busy-wait infinito, adormecendo a tarefa chamadora no escalonador.
+- **Temporizadores RTO e Prevenção de Deadlocks:** Retransmissão com recuo exponencial e transmissão diferida no `tcp_timer_tick()`, desacoplada de `tcp_pcbs_lock`.
+- **Concorrência e Estresse:** Validação de 4 conexões consecutivas e 4 conexões simultâneas via `fork()` sem corrupção ou vazamento de recursos.
+
 ---
 
 ## 🟡 Em Desenvolvimento (v4.4-dev)
 
-### Pilha UDP/TCP & Transmissão Contínua (v4.4)
-- **Pilha TCP Stream Transmissão/Recepção:** Implementação completa da transmissão de dados confiável (VFS read/write) para sockets TCP.
-- **Tratamento de ICMP Port Unreachable:** Notificação para pacotes UDP recebidos em portas sem socket vinculado.
+### Trilha 17 — TCP Phase 2B: Streams & Passive Open (v4.4)
+- **Transmissão e Recepção de Dados (`send`/`recv`):** Transferência de fluxo contínuo sobre conexões `ESTABLISHED` integradas ao VFS (`read`/`write`).
+- **Abertura Passiva do Servidor (`listen`/`accept`):** Fila de conexões pendentes (*backlog*) e geração de sockets derivados.
+- **Encerramento Ordenado de Conexão:** Transições `FIN`, `FIN+ACK`, `TIME_WAIT` e `CLOSED`.
 
 ---
 

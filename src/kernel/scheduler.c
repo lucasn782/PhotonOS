@@ -616,7 +616,7 @@ void scheduler_sleep_current(enum task_wait_reason reason, uint64_t target)
 
     if (reason == TASK_WAIT_CHILD) {
         current_task->state = TASK_WAITING;
-    } else if (reason == TASK_WAIT_SOCKET_RECV) {
+    } else if (reason == TASK_WAIT_SOCKET_RECV || reason == TASK_WAIT_NETWORK) {
         current_task->state = TASK_BLOCKED;
     } else {
         current_task->state = TASK_SLEEPING;
@@ -679,7 +679,7 @@ void scheduler_wake_socket_receivers(uint8_t protocol)
 void scheduler_wake_socket(void *sock)
 {
     for (uint32_t i = 0; i < task_count; i++) {
-        if (tasks[i].state == TASK_BLOCKED &&
+        if ((tasks[i].state == TASK_BLOCKED || tasks[i].state == TASK_SLEEPING) &&
             (tasks[i].wait_reason == TASK_WAIT_SOCKET_RECV ||
              tasks[i].wait_reason == TASK_WAIT_NETWORK) &&
             tasks[i].wait_target == (uint64_t)sock) {

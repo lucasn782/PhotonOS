@@ -299,8 +299,9 @@ int elf_load_process(const char *path, task_t *out_task)
         return -1;
     }
 
+    uint64_t user_stack_top = has_arg ? (ELF_USER_STACK_TOP - 256) : ELF_USER_STACK_TOP;
     uint64_t arg_rdi = has_arg ? (ELF_USER_STACK_TOP - 256) : 0;
-    int pid = scheduler_add_user_process(ehdr.e_entry, ELF_USER_STACK_TOP,
+    int pid = scheduler_add_user_process(ehdr.e_entry, user_stack_top,
         pml4, out_task, arg_rdi, 0);
     if (pid < 0) {
         return -1;

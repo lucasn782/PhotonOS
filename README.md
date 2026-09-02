@@ -1,6 +1,6 @@
 # PhotonOS v4.3 🚀
 
-O **PhotonOS v4.3** é um sistema operacional monolítico freestanding desenvolvido do zero para a arquitetura **x86_64**, executando em **64-bit Long Mode**. O projeto consolida um núcleo multi-core preemptivo robusto com Copy-On-Write (COW), descoberta dinâmica de CPUs via ACPI MADT, isolamento de falhas do Ring 3, pipeline gráfico por software, barramento PCI, interface de rede Intel e1000 estável, armazenamento persistente dual (FAT16 + EXT2), biblioteca padrão de usuário (`ulibc`) otimizada com printf bufferizado, infraestrutura completa de protocolo TCP (Fase 1), uma camada VFS expandida e o novo subsistema de **Sinais POSIX, Ciclo de Vida de Processos com Reparenting e File Descriptors com Pipe IPC**.
+O **PhotonOS v4.3** é um sistema operacional monolítico freestanding desenvolvido do zero para a arquitetura **x86_64**, executando em **64-bit Long Mode**. O projeto consolida um núcleo multi-core preemptivo robusto com Copy-On-Write (COW), descoberta dinâmica de CPUs via ACPI MADT, isolamento de falhas do Ring 3, pipeline gráfico por software, barramento PCI, interface de rede Intel e1000 estável, armazenamento persistente dual (FAT16 + EXT2), biblioteca padrão de usuário (`ulibc`) otimizada com printf bufferizado, subsistema de protocolo TCP (Fase 1 e Fase 2A: 3-Way Handshake e connect ativo), uma camada VFS expandida e o subsistema de **Sinais POSIX, Ciclo de Vida de Processos com Reparenting e File Descriptors com Pipe IPC**.
 
 ---
 
@@ -48,12 +48,12 @@ PhotonOS/
 *   **Heap Seguro:** `heap_expand()` valida explicitamente os retornos de `pmm_alloc()` e `vmm_map()`, abortando o crescimento do heap em caso de falha sem tentar gravar em memória não mapeada.
 *   **Validação Estrita de MMIO:** O VMM aceita mapeamentos de regiões de hardware MMIO (VBE LFB em `0xFD000000` e APIC em `0xFEE00000`) sem expurgar entradas de tabelas de páginas.
 
-### 🌐 Infraestrutura TCP (Fase 1 — v4.2.1)
-*   **Subsistema TCP Modular:** Módulo kernel independente (`src/kernel/tcp.c`, `include/tcp.h`) contendo gerenciamento de PCBs em lista global protegida por mutex, cálculo de checksum RFC 793 com pseudo-cabeçalho IPv4 e demultiplexação pela tupla de 4 elementos ou socket listener.
-*   **Integração Socket Layer (`sys_socket`):** Suporte completo à criação de sockets `socket(AF_INET, SOCK_STREAM, IPPROTO_TCP)` com suporte a descritores em contexto de kernel/boot (`kernel_task`), associação bidirecional socket ↔ PCB e não-regressão em `SOCK_RAW` (ping) e `SOCK_DGRAM` (UDP).
-*   **Gerenciamento de Portas:** Algoritmo thread-safe de alocação de portas efêmeras IANA (49152–65535), `bind` explícito de portas locais, detecção de colisão e liberação segura sem vazamentos.
-*   **Sockets e VFS:** Suporte nativo a `socket(AF_INET, SOCK_STREAM)`, `bind`, `connect`, `listen`, `accept`, `read` e `write` integrados aos nós do VFS e ao escalonador preemptivo sem espera ocupada ("zero busy-wait").
-*   **Estados do TCP:** Suporte completo aos 5 estados da Fase 1 (`CLOSED`, `LISTEN`, `SYN_SENT`, `SYN_RECEIVED`, `ESTABLISHED`) com filas de segmentos dinâmicos e suporte a temporizadores de retransmissão (RTO), Keep-Alive e Delayed ACK.
+### 🌐 Subsistema TCP (Fase 1 & Fase 2A — v4.4-tcp2a)
+*   **Fundação Estrutural (Fase 1):** Módulo de controle de protocolo (`src/kernel/tcp.c`, `include/tcp.h`) com gerenciamento de PCBs em lista global protegida por mutex, cálculo de checksum RFC 793 com pseudo-cabeçalho IPv4, alocação de portas efêmeras IANA (49152–65535), demultiplexação por 4-tuple e integração com `socket(AF_INET, SOCK_STREAM, IPPROTO_TCP)` e `bind()`.
+*   **Three-Way Handshake & Conexão Ativa (Fase 2A):** Implementação ativa do handshake completo (`SYN -> SYN+ACK -> ACK`) comprovado no fio (*wire*) via captura PCAP, máquina de estados operacional (`CLOSED -> SYN_SENT -> ESTABLISHED`), tratamento de `RST` e timeout de conexão.
+*   **Syscall `connect()` Cooperativa:** Bloqueio no escalonador via `scheduler_sleep_current(TASK_WAIT_NETWORK)` e `scheduler_yield()`, permitindo que o sistema continue executando outras tarefas e processando pacotes de rede sem espera ocupada ("zero busy-wait").
+*   **Temporizadores RTO e Prevenção de Impasses:** Retransmissão com recuo exponencial e fila de transmissão diferida (*deferred queue*) em `tcp_timer_tick()`, prevenindo deadlocks durante o envio de pacotes.
+*   **Próxima Etapa (Fase 2B):** Abertura passiva (`listen`/`accept`) e fluxo bidirecional de dados (`send`/`recv` / integração VFS read/write).
 
 ### 📂 Infraestrutura do VFS e Mount Manager (Sprint 3) — v4.3-fs
 *   **Permissões POSIX Simplificadas (mode_t):** Controle de acesso octal (`0755`/`0644`), validação `vfs_check_permission()` e chamadas `chmod()` / `chown()`.
@@ -125,8 +125,8 @@ qemu-system-x86_64 -drive format=raw,file=build/photon.img,if=floppy -drive form
 
 ## 📈 Roadmap Resumido
 
-*   **Marcos Concluídos**: Inicialização multiestágio 64-bit com janela LBA fragmentada (480 setores), alocador PMM/VMM com W^X, escalonador preemptivo Round-Robin multi-core (SMP), pipeline gráfico VBE com Double Buffering, driver de rede e1000 com ICMP/ARP e sockets BSD, Copy-On-Write (COW), sistemas de arquivos FAT16 e EXT2 graváveis, VFS com symlinks/hardlinks/permissões, printf bufferizado na ulibc, infraestrutura TCP (Fase 1) e subsistema de Sinais POSIX com IPC via Pipes anônimos.
-*   **Em Desenvolvimento (v4.4-dev)**: Transmissão contínua de dados em streams TCP (VFS read/write em sockets), e tratamento de ICMP Port Unreachable para datagramas UDP sem socket.
+*   **Marcos Concluídos**: Inicialização multiestágio 64-bit com janela LBA fragmentada (480 setores), alocador PMM/VMM com W^X, escalonador preemptivo Round-Robin multi-core (SMP), pipeline gráfico VBE com Double Buffering, driver de rede e1000 com ICMP/ARP e sockets BSD, Copy-On-Write (COW), sistemas de arquivos FAT16 e EXT2 graváveis, VFS com symlinks/hardlinks/permissões, printf bufferizado na ulibc, subsistema TCP (Fase 1 e Fase 2A: 3-Way Handshake, connect ativo e PCAP wire inspection) e subsistema de Sinais POSIX com IPC via Pipes anônimos.
+*   **Em Desenvolvimento (v4.4-dev)**: TCP Fase 2B (transmissão/recepção de dados via sockets de fluxo, passive open `listen`/`accept`), e tratamento de ICMP Port Unreachable para datagramas UDP sem socket.
 *   **Planejado**: Suporte a execução de scripts e variáveis de ambiente no userspace, semáforos/condvars no escalonador e servidor HTTP em Ring 3.
 
 Para documentação técnica detalhada de cada módulo, consulte o [Índice de Documentação Técnica](docs/DOCUMENTATION_INDEX.md).

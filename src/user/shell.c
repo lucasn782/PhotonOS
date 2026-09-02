@@ -679,6 +679,27 @@ static void command_ping(char *arg, int is_background)
     command_program(command, is_background);
 }
 
+static void command_tcptest(char *arg, int is_background)
+{
+    char command[96];
+    size_t offset = 0;
+
+    arg = skip_spaces(arg);
+    trim_right(arg);
+    if (arg[0] == '\0') {
+        write_str("uso: tcptest <connect|closed|timeout|stress|concurrent> <ip> <porta> [count]\n");
+        return;
+    }
+
+    offset = append_text(command, offset, "/bin/tcptest ");
+    while (*arg != '\0' && offset < sizeof(command) - 1) {
+        command[offset++] = *arg++;
+    }
+    command[offset] = '\0';
+
+    command_program(command, is_background);
+}
+
 static void command_vfstest(void)
 {
     write_str("[VFS TEST] Iniciando Testes da Camada VFS em Ring 3...\n");
@@ -1689,7 +1710,7 @@ static void execute_simple(char *line, int is_background)
     }
 
     if (streq(line, "help")) {
-        write_str("help ls pwd cd mkdir rmdir cat touch write echo mount umount ps ping forktest vfstest smptest sigtest kill sync umask hello upper rev\n");
+        write_str("help ls pwd cd mkdir rmdir cat touch write echo mount umount ps ping tcptest forktest vfstest smptest sigtest kill sync umask hello upper rev\n");
     } else if (streq(line, "ls")) {
         command_ls();
     } else if (streq(line, "pwd")) {
@@ -1720,6 +1741,10 @@ static void execute_simple(char *line, int is_background)
         write_str("uso: ping <endereco_ip>\n");
     } else if (starts_with(line, "ping ")) {
         command_ping(line + 5, is_background);
+    } else if (streq(line, "tcptest")) {
+        write_str("uso: tcptest <connect|closed|timeout|stress|concurrent> <ip> <porta> [count]\n");
+    } else if (starts_with(line, "tcptest ")) {
+        command_tcptest(line + 8, is_background);
     } else if (streq(line, "cat")) {
         command_cat(0);
     } else if (starts_with(line, "cat ")) {

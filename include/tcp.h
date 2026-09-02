@@ -38,6 +38,7 @@
 #define TCP_KEEPALIVE_TICKS       72000ULL
 #define TCP_DELAYED_ACK_TICKS     20ULL
 #define TCP_CONNECT_TIMEOUT_TICKS 500ULL
+#define TCP_MAX_SYN_RETRIES       3U
 
 struct socket;
 
@@ -100,7 +101,7 @@ struct tcp_timers {
 };
 
 /*
- * Protocol Control Block (Phase 1).
+ * Protocol Control Block (Phase 1 / Phase 2A).
  *
  * Addresses: network byte order.
  * Ports and sequence numbers: host byte order.
@@ -113,6 +114,7 @@ typedef struct tcp_pcb {
     uint16_t local_port;
     uint16_t remote_port;
 
+    uint32_t iss;
     uint32_t snd_una;
     uint32_t snd_nxt;
 
@@ -193,6 +195,7 @@ void tcp_timer_arm_rto(struct tcp_pcb *pcb, uint64_t now_ticks);
 void tcp_timer_arm_keepalive(struct tcp_pcb *pcb, uint64_t now_ticks);
 void tcp_timer_arm_delayed_ack(struct tcp_pcb *pcb, uint64_t now_ticks);
 void tcp_timer_clear(struct tcp_pcb *pcb);
+void tcp_timer_tick(uint64_t now_ticks);
 
 const char *tcp_state_name(enum tcp_state state);
 

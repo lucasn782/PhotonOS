@@ -15,6 +15,7 @@ copy_with_mtools() {
     mcopy -i "$DISK_IMG" -o "$USER_DIR/hang.elf" ::hang || return 1
     mcopy -i "$DISK_IMG" -o "$USER_DIR/spin.elf" ::spin || return 1
     mcopy -i "$DISK_IMG" -o "$USER_DIR/ping.elf" ::ping || return 1
+    mcopy -i "$DISK_IMG" -o "$USER_DIR/tcptest.elf" ::tcptest || return 1
 }
 
 copy_with_mount() {
@@ -30,7 +31,8 @@ copy_with_mount() {
         ! sudo cp "$USER_DIR/rev.elf" "$MOUNT_DIR/rev" ||
         ! sudo cp "$USER_DIR/hang.elf" "$MOUNT_DIR/hang" ||
         ! sudo cp "$USER_DIR/spin.elf" "$MOUNT_DIR/spin" ||
-        ! sudo cp "$USER_DIR/ping.elf" "$MOUNT_DIR/ping"; then
+        ! sudo cp "$USER_DIR/ping.elf" "$MOUNT_DIR/ping" ||
+        ! sudo cp "$USER_DIR/tcptest.elf" "$MOUNT_DIR/tcptest"; then
         sudo umount "$MOUNT_DIR" >/dev/null 2>&1 || true
         trap - EXIT
         return 1
@@ -59,7 +61,8 @@ create_with_python() {
         "$USER_DIR/rev.elf":rev \
         "$USER_DIR/hang.elf":hang \
         "$USER_DIR/spin.elf":spin \
-        "$USER_DIR/ping.elf":ping <<'PY'
+        "$USER_DIR/ping.elf":ping \
+        "$USER_DIR/tcptest.elf":tcptest <<'PY'
 import math
 import struct
 import sys

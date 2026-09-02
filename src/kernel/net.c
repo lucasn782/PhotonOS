@@ -9,6 +9,8 @@
 #include "heap.h"
 #include "vfs.h"
 
+extern volatile uint64_t kernel_ticks;
+
 #define NET_LOCAL_IPV4 0x0A00020FU
 #define NET_IPV4_NETMASK 0xFFFFFF00U
 #define NET_DEFAULT_GATEWAY_IPV4 0x0A000202U
@@ -922,6 +924,7 @@ void net_kernel_thread(void)
         for (int i = 0; i < NET_THREAD_POLL_BURST; i++) {
             net_poll_packets();
         }
+        tcp_timer_tick(kernel_ticks);
         scheduler_yield();
     }
 }
@@ -1207,8 +1210,6 @@ int sys_bind(int fd, const struct sockaddr *addr, uint32_t addrlen)
     return 0;
 }
 
-extern volatile uint64_t kernel_ticks;
-
 int sys_connect(int fd, const struct sockaddr *addr, uint32_t addrlen)
 {
     task_t *task = scheduler_current_task();
@@ -1272,11 +1273,25 @@ int sys_connect(int fd, const struct sockaddr *addr, uint32_t addrlen)
     pcb->local_ip = pcb->local_ip == 0U ? htonl(NET_LOCAL_IPV4) : pcb->local_ip;
     pcb->remote_ip = addr_in.sin_addr.s_addr;
     pcb->remote_port = ntohs(addr_in.sin_port);
-    pcb->seq_number = (uint32_t)kernel_ticks;
+
+    uint32_t iss = (uint32_t)(kernel_ticks + 1000ULL);
+    if (iss == 0) {
+        iss = 1000;
+    }
+    pcb->iss = iss;
+    pcb->seq_number = iss;
+    pcb->snd_una = iss;
+    pcb->snd_nxt = iss + 1U;
     pcb->ack_number = 0;
     pcb->window = TCP_DEFAULT_WINDOW;
     pcb->state = TCP_SYN_SENT;
-    pcb->retransmission_timer = kernel_ticks;
+    pcb->timers.rto_ticks = (uint32_t)TCP_RTO_TICKS_DEFAULT;
+    pcb->timers.retransmit_count = 0;
+    pcb->timers.retransmission = kernel_ticks + pcb->timers.rto_ticks;
+    pcb->timers.timeout = kernel_ticks + TCP_CONNECT_TIMEOUT_TICKS;
+    pcb->retransmission_timer = pcb->timers.retransmission;
+    pcb->flags |= TCP_PCB_FLAG_TIMER_RTO;
+
     mutex_unlock(&pcb->lock);
     sock->remote_addr = addr_in.sin_addr.s_addr;
     sock->remote_port = ntohs(addr_in.sin_port);
@@ -1296,7 +1311,7 @@ int sys_connect(int fd, const struct sockaddr *addr, uint32_t addrlen)
     }
 
     /*
-     * Block until ESTABLISHED or the PCB leaves SYN_SENT (RST / close).
+     * Block until ESTABLISHED or the PCB leaves SYN_SENT (RST / timeout / close).
      * Re-check under the PCB lock closes the receive-before-sleep race.
      * No busy-wait: sleep + yield only.
      */
@@ -1313,6 +1328,14 @@ int sys_connect(int fd, const struct sockaddr *addr, uint32_t addrlen)
             mutex_unlock(&pcb->lock);
             restore_interrupts(rflags);
             klog("NET: TCP connect falhou - conexao nao estabelecida.\n");
+            return -1;
+        }
+        if (pcb->timers.timeout != 0 && kernel_ticks >= pcb->timers.timeout) {
+            pcb->state = TCP_CLOSED;
+            tcp_timer_clear(pcb);
+            mutex_unlock(&pcb->lock);
+            restore_interrupts(rflags);
+            klog("NET: TCP connect timeout expirado.\n");
             return -1;
         }
         scheduler_sleep_current(TASK_WAIT_NETWORK, (uint64_t)sock);

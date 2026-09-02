@@ -3,6 +3,22 @@
 Histórico completo de mudanças do sistema operacional, organizado por versão.
 Convenções: cada entrada lista data, commit (quando aplicável), resumo, arquivos alterados, bugs corrigidos, novas funcionalidades, breaking changes e impacto arquitetural.
 
+## `v4.4-tcp2a` — TCP Phase 2A: 3-Way Handshake, State Machine & Connect() 🌐
+**Data:** 2026-09-02
+**Status:** Released
+
+### Novas Funcionalidades
+- **Three-Way Handshake RFC 793:** Implementação ativa do handshake completo (`SYN -> SYN+ACK -> ACK`) com validação de números de sequência (`ISS`), números de reconhecimento (`ack_num`), flags e cálculo de checksum.
+- **Integração com Syscall `sys_connect`:** Associação de endpoints de rede a sockets `SOCK_STREAM` (`IPPROTO_TCP`), alocação de portas efêmeras seguras (`49152..65535`) e bloqueio cooperativo através do escalonador sem consumo excessivo de CPU.
+- **Temporizadores RTO e Prevenção de Impasses:** Retransmissão de SYN com recuo exponencial e fila de transmissão diferida (*deferred queue*) em `tcp_timer_tick()`, garantindo que nenhuma transmissão de rede ocorra sob posse do mutex global `tcp_pcbs_lock`.
+- **Tratamento de RST e Timeout de Conexão:** Transição para `CLOSED` em caso de recepção de `RST` (porta remota fechada) ou expiração do temporizador de conexão de 2 segundos.
+- **Suite de Testes e Wire Inspection:** Criação do script `scripts/test_tcp_phase2a.py` e binário `tcptest.elf`, validando 5 casos de teste e capturando 32 segmentos TCP em arquivo PCAP com 100% de conformidade.
+
+### Correções de Bugs (Bug Fixes)
+- **Prevenção de Corrupção de Argumentos em `elf_load_process`:** Ajuste no cálculo do `user_rsp` inicial em `src/kernel/elf.c` para prevenir que o frame de pilha de funções em Ring 3 sobreescreva a string de argumentos posicionada no topo da pilha.
+
+---
+
 ## `v4.3` — POSIX Signals, Process Lifecycle & Pipe IPC ⚡
 **Data:** 2026-09-01
 **Status:** Released

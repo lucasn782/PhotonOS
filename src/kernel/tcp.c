@@ -57,6 +57,7 @@ static uint16_t tcp_checksum_finish(uint32_t sum)
     return (uint16_t)~sum;
 }
 
+
 /*
  * Effective local IPv4 used in the pseudo-header.  A PCB bound to INADDR_ANY
  * still emits segments from the host address configured by the IPv4 stack.
@@ -254,7 +255,13 @@ static int tcp_build_output_locked(struct tcp_pcb *pcb, uint8_t flags,
     local_ip = tcp_effective_local_ip(pcb);
     header->src_port = htons(pcb->local_port);
     header->dest_port = htons(pcb->remote_port);
-    header->seq_num = htonl(pcb->seq_number);
+
+    uint32_t current_seq = pcb->seq_number;
+    if ((flags & TCP_FLAG_SYN) != 0U && pcb->state == TCP_SYN_SENT) {
+        current_seq = pcb->iss;
+    }
+
+    header->seq_num = htonl(current_seq);
     header->ack_num = htonl(pcb->ack_number);
     header->data_offset_flags = htons((5U << 12) | flags);
     header->window_size = htons((uint16_t)(pcb->window & 0xFFFFU));
@@ -270,10 +277,17 @@ static int tcp_build_output_locked(struct tcp_pcb *pcb, uint8_t flags,
     if (header->checksum == 0U) {
         header->checksum = 0xFFFFU;
     }
-    if ((flags & TCP_FLAG_SYN) != 0U || (flags & TCP_FLAG_FIN) != 0U) {
+
+    if ((flags & TCP_FLAG_SYN) != 0U) {
+        pcb->snd_nxt = pcb->iss + 1U;
+        pcb->snd_una = pcb->iss;
+        pcb->seq_number = pcb->iss + 1U;
+    } else if ((flags & TCP_FLAG_FIN) != 0U) {
         pcb->seq_number++;
+        pcb->snd_nxt = pcb->seq_number;
     }
     pcb->seq_number += (uint32_t)payload_len;
+    pcb->snd_nxt = pcb->seq_number;
     *remote_ip = pcb->remote_ip;
     return 0;
 }
@@ -385,6 +399,83 @@ void tcp_timer_clear(struct tcp_pcb *pcb)
     mutex_lock(&pcb->lock);
     tcp_timers_reset(pcb);
     mutex_unlock(&pcb->lock);
+}
+
+void tcp_timer_tick(uint64_t now_ticks)
+{
+    /* Deferred TX queue: we must NOT call net_send_ipv4 while holding
+     * tcp_pcbs_lock, because net_send_ipv4 → net_poll_packets → tcp_input
+     * would try to re-acquire tcp_pcbs_lock → deadlock. */
+    struct {
+        uint8_t  packet[TCP_HEADER_MIN_SIZE];
+        size_t   packet_len;
+        uint32_t remote_ip;
+    } deferred[4];
+    int deferred_count = 0;
+
+    mutex_lock(&tcp_pcbs_lock);
+    for (struct tcp_pcb *pcb = tcp_pcbs; pcb != 0; pcb = pcb->next) {
+        mutex_lock(&pcb->lock);
+        if (pcb->state == TCP_SYN_SENT) {
+            /* Check connection timeout */
+            if (pcb->timers.timeout != 0 && now_ticks >= pcb->timers.timeout) {
+                pcb->state = TCP_CLOSED;
+                tcp_timers_reset(pcb);
+                void *sock = pcb->socket;
+                mutex_unlock(&pcb->lock);
+                if (sock != 0) {
+                    tcp_socket_notify(sock);
+                }
+                continue;
+            }
+            /* Check RTO retransmission */
+            if ((pcb->flags & TCP_PCB_FLAG_TIMER_RTO) != 0 &&
+                pcb->timers.retransmission != 0 &&
+                now_ticks >= pcb->timers.retransmission) {
+                if (pcb->timers.retransmit_count >= TCP_MAX_SYN_RETRIES) {
+                    pcb->state = TCP_CLOSED;
+                    tcp_timers_reset(pcb);
+                    void *sock = pcb->socket;
+                    mutex_unlock(&pcb->lock);
+                    if (sock != 0) {
+                        tcp_socket_notify(sock);
+                    }
+                    continue;
+                }
+
+                pcb->timers.retransmit_count++;
+                pcb->timers.rto_ticks = (uint32_t)(pcb->timers.rto_ticks * 2U);
+                if (pcb->timers.rto_ticks > 1000U) {
+                    pcb->timers.rto_ticks = 1000U;
+                }
+                pcb->timers.retransmission = now_ticks + pcb->timers.rto_ticks;
+                pcb->retransmission_timer = pcb->timers.retransmission;
+
+                if (deferred_count < 4) {
+                    deferred[deferred_count].packet_len = 0;
+                    deferred[deferred_count].remote_ip = 0;
+                    int res = tcp_build_output_locked(pcb, TCP_FLAG_SYN, 0, 0,
+                        deferred[deferred_count].packet,
+                        &deferred[deferred_count].packet_len,
+                        &deferred[deferred_count].remote_ip);
+                    if (res == 0) {
+                        deferred_count++;
+                    }
+                }
+                mutex_unlock(&pcb->lock);
+                continue;
+            }
+        }
+        mutex_unlock(&pcb->lock);
+    }
+    mutex_unlock(&tcp_pcbs_lock);
+
+    /* Transmit deferred packets with NO locks held. */
+    for (int i = 0; i < deferred_count; i++) {
+        klog("[TCP TX] SYN retransmitido\n");
+        net_send_ipv4(deferred[i].remote_ip, IP_PROTO_TCP,
+            deferred[i].packet, deferred[i].packet_len);
+    }
 }
 
 void tcp_init(void)
@@ -882,15 +973,15 @@ int tcp_input(uint32_t src_ip, uint32_t dest_ip, const uint8_t *segment,
     }
 
     if ((flags & TCP_FLAG_RST) != 0U) {
-        int orphan = (pcb->socket == 0);
+        int half_open_child = (pcb->parent != 0 && pcb->socket == 0);
         pcb->state = TCP_CLOSED;
         tcp_timers_reset(pcb);
         socket = pcb->socket;
         mutex_unlock(&pcb->lock);
         if (socket != 0) {
             tcp_socket_notify(socket);
-        } else if (orphan) {
-            /* Half-open child without a userspace socket. */
+        } else if (half_open_child) {
+            /* Half-open child from passive LISTEN without a userspace socket. */
             tcp_socket_destroy(pcb);
         }
         return 0;
@@ -899,8 +990,12 @@ int tcp_input(uint32_t src_ip, uint32_t dest_ip, const uint8_t *segment,
     if (pcb->state == TCP_SYN_SENT &&
         (flags & (TCP_FLAG_SYN | TCP_FLAG_ACK)) ==
             (TCP_FLAG_SYN | TCP_FLAG_ACK) &&
-        acknowledgement == pcb->seq_number) {
+        (acknowledgement == pcb->iss + 1U || acknowledgement == pcb->seq_number)) {
         pcb->ack_number = sequence + 1U;
+        pcb->rcv_nxt = sequence + 1U;
+        pcb->snd_una = acknowledgement;
+        pcb->snd_nxt = pcb->iss + 1U;
+        pcb->seq_number = pcb->iss + 1U;
         pcb->state = TCP_ESTABLISHED;
         tcp_timers_reset(pcb);
         pcb->timers.keepalive = kernel_ticks + TCP_KEEPALIVE_TICKS;
@@ -908,6 +1003,7 @@ int tcp_input(uint32_t src_ip, uint32_t dest_ip, const uint8_t *segment,
         send_out = 1;
         (void)tcp_build_output_locked(pcb, TCP_FLAG_ACK, 0, 0, out_packet,
             &out_packet_len, &out_remote_ip);
+        klog("[TCP RX] SYN+ACK recebido -> conexao ESTABLISHED, ACK transmitido\n");
     } else if (pcb->state == TCP_SYN_RECEIVED &&
         (flags & TCP_FLAG_ACK) != 0U &&
         (flags & TCP_FLAG_SYN) == 0U &&
@@ -1116,6 +1212,92 @@ void tcp_run_tests(void)
         if (fd_raw >= 0) sys_close(fd_raw);
         if (fd_udp >= 0) sys_close(fd_udp);
         klog("[TCP TEST] FAIL: sys_socket integration\n");
+    }
+
+    /* Test 8: State Machine & Active Handshake Simulation (Phase 2A) */
+    tcp_pcb_t *hs_pcb = tcp_alloc();
+    if (hs_pcb != 0) {
+        hs_pcb->local_ip = htonl(0x0A00020FU);
+        hs_pcb->remote_ip = htonl(0x0A000202U);
+        hs_pcb->local_port = 49160;
+        hs_pcb->remote_port = 8080;
+        hs_pcb->iss = 1000;
+        hs_pcb->seq_number = hs_pcb->iss;
+        hs_pcb->ack_number = 0;
+        hs_pcb->state = TCP_SYN_SENT;
+        tcp_register(hs_pcb);
+
+        /* Simulates incoming SYN+ACK from peer */
+        struct tcp_header synack_hdr;
+        uint8_t synack_buf[TCP_HEADER_MIN_SIZE];
+        synack_hdr.src_port = 8080;
+        synack_hdr.dest_port = 49160;
+        synack_hdr.seq_num = 5000; /* Peer ISN */
+        synack_hdr.ack_num = 1001; /* Peer ACK of our ISS+1 */
+        synack_hdr.data_offset_flags = (5U << 12) | TCP_FLAG_SYN | TCP_FLAG_ACK;
+        synack_hdr.window_size = 65535;
+        synack_hdr.checksum = 0;
+        synack_hdr.urgent_ptr = 0;
+
+        tcp_serialize_header(&synack_hdr, synack_buf, sizeof(synack_buf));
+        uint16_t hs_csum = tcp_checksum(htonl(0x0A000202U), htonl(0x0A00020FU), synack_buf, sizeof(synack_buf));
+        ((struct tcp_header *)synack_buf)->checksum = htons(hs_csum);
+
+        int input_res = tcp_input(htonl(0x0A000202U), htonl(0x0A00020FU), synack_buf, sizeof(synack_buf));
+        if (input_res == 0 && hs_pcb->state == TCP_ESTABLISHED && hs_pcb->ack_number == 5001) {
+            klog("[TCP TEST] PASS: 3-Way Handshake (SYN_SENT -> SYN+ACK -> ESTABLISHED)\n");
+        } else {
+            klog("[TCP TEST] FAIL: 3-Way Handshake Simulation\n");
+        }
+
+        /* Test 9: RST reception handling */
+        struct tcp_header rst_hdr;
+        uint8_t rst_buf[TCP_HEADER_MIN_SIZE];
+        rst_hdr.src_port = 8080;
+        rst_hdr.dest_port = 49160;
+        rst_hdr.seq_num = 5001;
+        rst_hdr.ack_num = 1001;
+        rst_hdr.data_offset_flags = (5U << 12) | TCP_FLAG_RST;
+        rst_hdr.window_size = 0;
+        rst_hdr.checksum = 0;
+        rst_hdr.urgent_ptr = 0;
+
+        tcp_serialize_header(&rst_hdr, rst_buf, sizeof(rst_buf));
+        uint16_t rst_csum = tcp_checksum(htonl(0x0A000202U), htonl(0x0A00020FU), rst_buf, sizeof(rst_buf));
+        ((struct tcp_header *)rst_buf)->checksum = htons(rst_csum);
+
+        int rst_res = tcp_input(htonl(0x0A000202U), htonl(0x0A00020FU), rst_buf, sizeof(rst_buf));
+        if (rst_res == 0 && hs_pcb->state == TCP_CLOSED) {
+            klog("[TCP TEST] PASS: RST handling (transicao para CLOSED)\n");
+        } else {
+            klog("[TCP TEST] FAIL: RST handling\n");
+        }
+
+        tcp_free(hs_pcb);
+    }
+
+    /* Test 10: Timer ticks & Timeout mechanics */
+    tcp_pcb_t *tm_pcb = tcp_alloc();
+    if (tm_pcb != 0) {
+        tm_pcb->local_ip = htonl(0x0A00020FU);
+        tm_pcb->remote_ip = htonl(0x0A000202U);
+        tm_pcb->local_port = 49161;
+        tm_pcb->remote_port = 9999;
+        tm_pcb->iss = 2000;
+        tm_pcb->state = TCP_SYN_SENT;
+        tm_pcb->timers.timeout = 500ULL;
+        tm_pcb->timers.retransmission = 1000ULL;
+        tm_pcb->timers.rto_ticks = 100;
+        tm_pcb->timers.retransmit_count = 0;
+        tcp_register(tm_pcb);
+
+        tcp_timer_tick(600ULL);
+        if (tm_pcb->state == TCP_CLOSED) {
+            klog("[TCP TEST] PASS: tcp_timer_tick (timeout expira e fecha PCB)\n");
+        } else {
+            klog("[TCP TEST] FAIL: tcp_timer_tick timeout\n");
+        }
+        tcp_free(tm_pcb);
     }
 
     klog("[TCP TEST] Finalizada Suite de Testes TCP.\n");

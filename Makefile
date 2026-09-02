@@ -21,6 +21,8 @@ USER_SPIN_ELF := build/user/spin.elf
 USER_SPIN_OBJ := build/user/spin_blob.o
 USER_PING_ELF := build/user/ping.elf
 USER_PING_OBJ := build/user/ping_blob.o
+USER_TCPTEST_ELF := build/user/tcptest.elf
+USER_TCPTEST_OBJ := build/user/tcptest_blob.o
 IMG := build/photon.img
 DISK_IMG := build/disk.img
 FLOPPY_BYTES := 1474560
@@ -194,6 +196,15 @@ $(USER_PING_ELF): build/user/ping.o build/user/ulibc.o
 $(USER_PING_OBJ): $(USER_PING_ELF)
 	cd build/user && $(LD) -r -b binary $(notdir $(USER_PING_ELF)) -o $(notdir $(USER_PING_OBJ))
 
+build/user/tcptest.o: src/user/tcptest.c include/ulibc.h include/sys/socket.h
+	@mkdir -p $(dir $@) && $(CC) $(USER_CFLAGS) -c $< -o $@
+
+$(USER_TCPTEST_ELF): build/user/tcptest.o build/user/ulibc.o
+	@mkdir -p $(dir $@) && $(LD) $(USER_LDFLAGS) $^ -o $@
+
+$(USER_TCPTEST_OBJ): $(USER_TCPTEST_ELF)
+	cd build/user && $(LD) -r -b binary $(notdir $(USER_TCPTEST_ELF)) -o $(notdir $(USER_TCPTEST_OBJ))
+
 $(KERNEL_ELF): $(KERNEL_OBJS) linker.ld
 	$(LD) $(LDFLAGS) $(KERNEL_OBJS) -o $@
 
@@ -208,7 +219,7 @@ $(IMG): $(BOOT_BIN) $(KERNEL_BIN)
 run: $(IMG)
 	qemu-system-x86_64 -smp 4 -serial stdio -drive format=raw,file=$(IMG)
 
-fat16-disk: $(USER_SHELL_ELF) $(USER_HELLO_ELF) $(USER_UPPER_ELF) $(USER_REV_ELF) $(USER_HANG_ELF) $(USER_SPIN_ELF) $(USER_PING_ELF)
+fat16-disk: $(USER_SHELL_ELF) $(USER_HELLO_ELF) $(USER_UPPER_ELF) $(USER_REV_ELF) $(USER_HANG_ELF) $(USER_SPIN_ELF) $(USER_PING_ELF) $(USER_TCPTEST_ELF)
 	DISK_IMG=$(DISK_IMG) USER_DIR=build/user bash scripts/create_fat16_disk.sh
 
 run-fat16: $(IMG) fat16-disk

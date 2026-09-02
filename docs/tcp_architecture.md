@@ -195,9 +195,16 @@ O Kernel aloca o socket e automaticamente invoca `tcp_alloc()` e `tcp_register()
 
 ---
 
-## 🚀 8. Preparação para o Three-Way Handshake (Próxima Etapa)
+## 🚀 8. Conclusão da Fase 2A & Preparação para a Fase 2B
 
-A infraestrutura atual deixa o kernel totalmente preparado para a implementação das chamadas `connect()`, `listen()` e `accept()` na próxima fase:
-1. Os campos `seq_number`, `ack_number`, `snd_nxt` e `rcv_nxt` já são manipulados e serializados corretamente nos segmentos.
-2. As filas de aceitação (`accept_head`, `accept_tail`, `backlog`) já estão estruturadas no PCB.
-3. O parser e gerador de cabeçalhos operam em ambas as direções com validação checksum RFC 793/1071.
+A **Fase 2A** (Active Open / 3-Way Handshake) foi concluída e validada:
+1. Implementação completa do Three-Way Handshake (`SYN -> SYN+ACK -> ACK`) com números de sequência monotônicos (`iss`), confirmação de `ack_num == iss + 1` e transição para `ESTABLISHED`.
+2. Syscall `connect()` funcional com bloqueio cooperativo através do escalonador (`scheduler_sleep_current(TASK_WAIT_NETWORK)` e `scheduler_yield()`).
+3. Temporizadores RTO com recuo exponencial e fila de transmissão diferida em `tcp_timer_tick()`.
+4. Validação por captura PCAP no fio (*wire*) e testes de concorrência/estresse (`scripts/test_tcp_phase2a.py`).
+Para detalhes completos, consulte [TCP Phase 2A](networking/tcp_phase2a.md).
+
+A próxima etapa (**Fase 2B**) desenvolverá:
+1. Transmissão e recepção contínua de dados (`send()`, `recv()`, `read()`, `write()`).
+2. Abertura passiva no servidor (`listen()`, `accept()`, gerenciamento de fila de `backlog`).
+3. Encerramento gracioso de quatro vias (`FIN`, `FIN+ACK`, `TIME_WAIT`).

@@ -90,7 +90,8 @@ Este documento serve como o mapa central da documentação técnica do PhotonOS 
 *   **Dependências**: QEMU, SeaBIOS, Bootloader.
 *   **Público-Alvo**: Desenvolvedores e engenheiros de depuração.
 
-### 14. Subsistema TCP v4.2 & Arquitetura de Rede
+### 14. Subsistema TCP v4.2 / v4.4 & Arquitetura de Rede
+*   **[networking/tcp_phase2a.md](networking/tcp_phase2a.md)**: Especificação completa da **TCP Phase 2A** (3-Way Handshake `SYN -> SYN+ACK -> ACK`, máquina de estados `ESTABLISHED`, temporizadores RTO, tratamento de RST, timeout, integração `connect()` e validação por captura PCAP no fio).
 *   **[tcp_socket_integration_fix.md](tcp_socket_integration_fix.md)**: Relatório da correção da integração `sys_socket()` com a camada de Sockets TCP no boot, causa raiz (`current_task == NULL`), alocação de descritores no contexto do kernel e testes de não-regressão.
 *   **[tcp_architecture.md](tcp_architecture.md)**: Arquitetura completa do subsistema TCP, estrutura dos PCBs, máquina de estados, serialização/checksum, fluxos RX/TX e diagrama completo da pilha de rede.
 *   **[network_architecture.md](network_architecture.md)** (e **[networking/network_architecture.md](networking/network_architecture.md)**): Arquitetura global da pilha de rede, barramento PCI, DMA físico e suporte a sockets.
