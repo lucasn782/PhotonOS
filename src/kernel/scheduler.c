@@ -38,6 +38,7 @@ static uint32_t task_count;
 static int current_task_index;
 static int idle_task_index;
 static struct task_control_block *current_task;
+static struct task_control_block kernel_task;
 static spinlock_t task_table_lock;
 static volatile uint64_t task_table_flags[256];
 
@@ -150,6 +151,8 @@ static void set_task_name(task_t *task, const char *name)
     task->name[i] = '\0';
 }
 
+static uint32_t next_pid = 1;
+
 static uint32_t signal_bit(int signum)
 {
     return 1U << (uint32_t)signum;
@@ -157,7 +160,7 @@ static uint32_t signal_bit(int signum)
 
 static int is_supported_signal(int signum)
 {
-    return signum == SIGINT || signum == SIGKILL || signum == SIGTERM;
+    return signum > 0 && signum < TASK_SIGNAL_COUNT;
 }
 
 static void reset_signal_state(task_t *task)
@@ -167,6 +170,7 @@ static void reset_signal_state(task_t *task)
     }
 
     task->pending_signals = 0;
+    task->blocked_signals = 0;
     task->active_signal = 0;
     task->signal_context.signum = 0;
 }
@@ -202,12 +206,11 @@ static void init_standard_fds(task_t *task)
 {
     for (uint32_t i = 0; i < TASK_MAX_FDS; i++) {
         task->file_descriptors[i] = 0;
-        task->fd_offsets[i] = 0;
     }
 
-    task->file_descriptors[0] = kernel_stdin_node();
-    task->file_descriptors[1] = kernel_stdout_node();
-    task->file_descriptors[2] = kernel_stderr_node();
+    task->file_descriptors[0] = file_description_alloc(kernel_stdin_node(), 0);
+    task->file_descriptors[1] = file_description_alloc(kernel_stdout_node(), 0);
+    task->file_descriptors[2] = file_description_alloc(kernel_stderr_node(), 0);
 }
 
 static void inherit_fds(task_t *task, task_t *parent)
@@ -219,7 +222,9 @@ static void inherit_fds(task_t *task, task_t *parent)
 
     for (uint32_t i = 0; i < TASK_MAX_FDS; i++) {
         task->file_descriptors[i] = parent->file_descriptors[i];
-        task->fd_offsets[i] = parent->fd_offsets[i];
+        if (task->file_descriptors[i] != 0) {
+            task->file_descriptors[i]->ref_count++;
+        }
     }
 }
 
@@ -236,7 +241,7 @@ static void release_user_pages(task_t *task)
 static int allocate_task_slot(void)
 {
     for (uint32_t i = 0; i < task_count; i++) {
-        if (tasks[i].state == TASK_ZOMBIE) {
+        if (tasks[i].state == TASK_UNUSED || tasks[i].state == TASK_DEAD) {
             release_user_pages(&tasks[i]);
             return (int)i;
         }
@@ -249,6 +254,26 @@ static int allocate_task_slot(void)
     return (int)task_count++;
 }
 
+static uint32_t generate_pid(void)
+{
+    uint32_t pid = next_pid;
+    for (;;) {
+        if (pid == 0) pid = 1;
+        int in_use = 0;
+        for (uint32_t i = 0; i < task_count; i++) {
+            if (tasks[i].state != TASK_UNUSED && tasks[i].state != TASK_DEAD && tasks[i].pid == pid) {
+                in_use = 1;
+                break;
+            }
+        }
+        if (!in_use) {
+            next_pid = pid + 1;
+            return pid;
+        }
+        pid++;
+    }
+}
+
 void scheduler_init(void)
 {
     tasks = kmalloc(MAX_TASKS * sizeof(struct task_control_block));
@@ -258,7 +283,8 @@ void scheduler_init(void)
     user_stacks = (uint8_t (*)[USER_STACK_SIZE])(((uintptr_t)user_stacks_raw + USER_STACK_SIZE - 1) & ~(USER_STACK_SIZE - 1));
 
     for (uint32_t i = 0; i < MAX_TASKS; i++) {
-        tasks[i].state = TASK_ZOMBIE;
+        tasks[i].state = TASK_UNUSED;
+        tasks[i].pid = 0;
     }
 
     task_count = 0;
@@ -299,18 +325,18 @@ static int scheduler_create_task_with_mode(task_entry_t entry, int user_mode)
         map_user_page(user_rsp - sizeof(uint64_t));
     }
 
-    task->guard_page = (uintptr_t)task_stacks[slot];
-    vmm_unmap(task->guard_page);
+    task->guard_page = 0;
     task->kernel_stack_top = stack_top(task_stacks[slot]);
     task->cr3 = (uint64_t)vmm_kernel_pml4();
     task->rsp = build_initial_stack(task_stacks[slot], user_rsp, entry,
         code_selector, data_selector, 0, 0);
     task->registers.rip = (uint64_t)entry;
     task->registers.rflags = INITIAL_RFLAGS;
-    task->pid = (uint32_t)slot + 1;
+    task->pid = generate_pid();
     task->parent_pid = current_task != 0 ? current_task->pid : 0;
     task->uid = current_task != 0 ? current_task->uid : 0;
     task->gid = current_task != 0 ? current_task->gid : 0;
+    task->umask = current_task != 0 ? current_task->umask : 0022;
     set_task_name(task, user_mode ? "user-task" : "kernel-task");
     reset_signal_state(task);
     task->wait_target = 0;
@@ -321,6 +347,8 @@ static int scheduler_create_task_with_mode(task_entry_t entry, int user_mode)
     task->state = TASK_READY;
     task->wait_reason = TASK_WAIT_NONE;
     task->mutex_wait_next = 0;
+    task->cwd[0] = '/';
+    task->cwd[1] = '\0';
     inherit_fds(task, current_task);
     int pid = (int)task->pid;
 
@@ -354,18 +382,18 @@ int scheduler_add_user_process(uint64_t entry, uint64_t user_rsp,
     }
 
     task_t *task = &tasks[slot];
-    task->guard_page = (uintptr_t)task_stacks[slot];
-    vmm_unmap(task->guard_page);
+    task->guard_page = 0;
     task->kernel_stack_top = stack_top(task_stacks[slot]);
     task->cr3 = (uint64_t)pml4;
     task->rsp = build_initial_stack(task_stacks[slot], user_rsp,
         (task_entry_t)entry, USER_CODE_SELECTOR, USER_DATA_SELECTOR, arg_rdi, arg_rsi);
     task->registers.rip = entry;
     task->registers.rflags = INITIAL_RFLAGS;
-    task->pid = (uint32_t)slot + 1;
+    task->pid = generate_pid();
     task->parent_pid = current_task != 0 ? current_task->pid : 0;
     task->uid = current_task != 0 ? current_task->uid : 0;
     task->gid = current_task != 0 ? current_task->gid : 0;
+    task->umask = current_task != 0 ? current_task->umask : 0022;
     set_task_name(task, "process");
     reset_signal_state(task);
     task->wait_target = 0;
@@ -376,6 +404,17 @@ int scheduler_add_user_process(uint64_t entry, uint64_t user_rsp,
     task->state = TASK_READY;
     task->wait_reason = TASK_WAIT_NONE;
     task->mutex_wait_next = 0;
+    if (current_task != 0 && current_task->cwd[0] != '\0') {
+        size_t ci = 0;
+        while (current_task->cwd[ci] != '\0' && ci < sizeof(task->cwd) - 1) {
+            task->cwd[ci] = current_task->cwd[ci];
+            ci++;
+        }
+        task->cwd[ci] = '\0';
+    } else {
+        task->cwd[0] = '/';
+        task->cwd[1] = '\0';
+    }
     inherit_fds(task, current_task);
 
     if (out_task != 0) {
@@ -390,14 +429,17 @@ int scheduler_add_user_process(uint64_t entry, uint64_t user_rsp,
 
 task_t *scheduler_current_task(void)
 {
-    return current_task;
+    if (current_task != 0) {
+        return current_task;
+    }
+    return &kernel_task;
 }
 
 task_t *scheduler_find_task(uint32_t pid)
 {
     uint64_t flags = spin_lock_irqsave(&task_table_lock);
     for (uint32_t i = 0; i < task_count; i++) {
-        if (tasks[i].pid == pid) {
+        if (tasks[i].state != TASK_UNUSED && tasks[i].state != TASK_DEAD && tasks[i].pid == pid) {
             spin_unlock_irqrestore(&task_table_lock, flags);
             return &tasks[i];
         }
@@ -437,6 +479,8 @@ void scheduler_yield(void)
     __asm__ volatile ("int $0x20" ::: "memory");
 }
 
+static void scheduler_terminate_task_unlocked(task_t *task, int status);
+
 int scheduler_send_signal(uint32_t pid, int signum)
 {
     if (!is_supported_signal(signum)) {
@@ -446,22 +490,118 @@ int scheduler_send_signal(uint32_t pid, int signum)
     uint64_t flags = spin_lock_irqsave(&task_table_lock);
     task_t *task = 0;
     for (uint32_t i = 0; i < task_count; i++) {
-        if (tasks[i].pid == pid) {
+        if (tasks[i].state != TASK_UNUSED && tasks[i].state != TASK_DEAD && tasks[i].pid == pid) {
             task = &tasks[i];
             break;
         }
     }
-    if (task == 0) {
+    if (task == 0 || task->state == TASK_ZOMBIE || task->state == TASK_DEAD) {
         spin_unlock_irqrestore(&task_table_lock, flags);
         return -1;
     }
 
+    if (signum == SIGKILL) {
+        scheduler_terminate_task_unlocked(task, 128 + SIGKILL);
+        spin_unlock_irqrestore(&task_table_lock, flags);
+        return 0;
+    }
+
+    if (signum == SIGSTOP) {
+        task->pending_signals &= ~signal_bit(SIGCONT);
+        task->state = TASK_STOPPED;
+        task->wait_reason = TASK_WAIT_NONE;
+        task->wait_target = 0;
+        uint32_t parent = task->parent_pid;
+        spin_unlock_irqrestore(&task_table_lock, flags);
+        if (parent != 0) {
+            scheduler_send_signal(parent, SIGCHLD);
+        }
+        return 0;
+    }
+
+    if (signum == SIGCONT) {
+        task->pending_signals &= ~signal_bit(SIGSTOP);
+        if (task->state == TASK_STOPPED) {
+            task->state = TASK_READY;
+            task->wait_reason = TASK_WAIT_NONE;
+            task->wait_target = 0;
+        }
+        if (task->signal_handlers[SIGCONT] == (uintptr_t)0 || task->signal_handlers[SIGCONT] == (uintptr_t)1) {
+            spin_unlock_irqrestore(&task_table_lock, flags);
+            return 0;
+        }
+    }
+
+    if (signum == SIGCHLD) {
+        if (task->signal_handlers[SIGCHLD] == (uintptr_t)0 || task->signal_handlers[SIGCHLD] == (uintptr_t)1) {
+            spin_unlock_irqrestore(&task_table_lock, flags);
+            return 0;
+        }
+    }
+
     task->pending_signals |= signal_bit(signum);
-    if (task->state == TASK_SLEEPING || task->state == TASK_WAITING ||
-        task->state == TASK_BLOCKED) {
+    if ((task->state == TASK_SLEEPING || task->state == TASK_WAITING ||
+        task->state == TASK_BLOCKED) && !(task->blocked_signals & signal_bit(signum))) {
         task->state = TASK_READY;
         task->wait_reason = TASK_WAIT_NONE;
         task->wait_target = 0;
+    }
+
+    spin_unlock_irqrestore(&task_table_lock, flags);
+    return 0;
+}
+
+int scheduler_sigaction(int signum, const struct sigaction *act, struct sigaction *oldact)
+{
+    if (signum <= 0 || signum >= TASK_SIGNAL_COUNT || signum == SIGKILL || signum == SIGSTOP) {
+        return -1;
+    }
+
+    task_t *task = scheduler_current_task();
+    if (task == 0) return -1;
+
+    uint64_t flags = spin_lock_irqsave(&task_table_lock);
+
+    if (oldact != 0) {
+        oldact->sa_handler = (sighandler_t)task->signal_handlers[signum];
+        oldact->sa_mask = task->blocked_signals;
+        oldact->sa_flags = 0;
+    }
+
+    if (act != 0) {
+        task->signal_handlers[signum] = (uintptr_t)act->sa_handler;
+    }
+
+    spin_unlock_irqrestore(&task_table_lock, flags);
+    return 0;
+}
+
+int scheduler_sigprocmask(int how, const sigset_t *set, sigset_t *oldset)
+{
+    task_t *task = scheduler_current_task();
+    if (task == 0) return -1;
+
+    uint64_t flags = spin_lock_irqsave(&task_table_lock);
+
+    if (oldset != 0) {
+        *oldset = task->blocked_signals;
+    }
+
+    if (set != 0) {
+        sigset_t new_set = *set;
+        new_set &= ~signal_bit(SIGKILL);
+        new_set &= ~signal_bit(SIGSTOP);
+
+        if (how == SIG_BLOCK) {
+            task->blocked_signals |= new_set;
+        } else if (how == SIG_UNBLOCK) {
+            task->blocked_signals &= ~new_set;
+        } else if (how == SIG_SETMASK) {
+            task->blocked_signals = new_set;
+        } else {
+            spin_unlock_irqrestore(&task_table_lock, flags);
+            return -1;
+        }
     }
 
     spin_unlock_irqrestore(&task_table_lock, flags);
@@ -550,36 +690,74 @@ void scheduler_wake_socket(void *sock)
     }
 }
 
-int scheduler_wait_current(uint32_t pid)
+int scheduler_waitpid(int32_t pid, int *status, int options)
 {
-    task_t *child = 0;
-
     if (current_task == 0) {
         return -1;
     }
 
     uint64_t flags = spin_lock_irqsave(&task_table_lock);
 
-    for (uint32_t i = 0; i < task_count; i++) {
-        if (tasks[i].pid == pid) {
-            child = &tasks[i];
-            break;
+    for (;;) {
+        task_t *child = 0;
+        int has_matching_children = 0;
+
+        for (uint32_t i = 0; i < task_count; i++) {
+            if (tasks[i].state == TASK_UNUSED || tasks[i].state == TASK_DEAD) {
+                continue;
+            }
+            if (tasks[i].parent_pid != current_task->pid) {
+                continue;
+            }
+            if (pid > 0 && tasks[i].pid != (uint32_t)pid) {
+                continue;
+            }
+
+            has_matching_children = 1;
+
+            if (tasks[i].state == TASK_ZOMBIE) {
+                child = &tasks[i];
+                break;
+            }
         }
-    }
 
-    if (child == 0 || child->parent_pid != current_task->pid) {
+        if (child != 0) {
+            uint32_t child_pid = child->pid;
+            int exit_code = child->exit_status;
+            child->state = TASK_DEAD;
+            child->pid = 0;
+            child->parent_pid = 0;
+            spin_unlock_irqrestore(&task_table_lock, flags);
+
+            if (status != 0) {
+                *status = exit_code;
+            }
+            return (int)child_pid;
+        }
+
+        if (!has_matching_children) {
+            spin_unlock_irqrestore(&task_table_lock, flags);
+            return -1;
+        }
+
+        if (options & WNOHANG) {
+            spin_unlock_irqrestore(&task_table_lock, flags);
+            return 0;
+        }
+
+        current_task->state = TASK_WAITING;
+        current_task->wait_reason = TASK_WAIT_CHILD;
+        current_task->wait_target = pid > 0 ? (uint64_t)pid : 0;
         spin_unlock_irqrestore(&task_table_lock, flags);
-        return -1;
+        scheduler_yield();
+        flags = spin_lock_irqsave(&task_table_lock);
     }
+}
 
-    if (child->state == TASK_ZOMBIE) {
-        spin_unlock_irqrestore(&task_table_lock, flags);
-        return 0;
-    }
-
-    scheduler_sleep_current(TASK_WAIT_CHILD, pid);
-    spin_unlock_irqrestore(&task_table_lock, flags);
-    return 1;
+int scheduler_wait_current(uint32_t pid)
+{
+    int status = 0;
+    return scheduler_waitpid((int32_t)pid, &status, 0);
 }
 
 static void wake_parent_waiters(uint32_t exited_pid)
@@ -588,7 +766,7 @@ static void wake_parent_waiters(uint32_t exited_pid)
         if ((tasks[i].state == TASK_SLEEPING ||
                 tasks[i].state == TASK_WAITING) &&
             tasks[i].wait_reason == TASK_WAIT_CHILD &&
-            tasks[i].wait_target == exited_pid) {
+            (tasks[i].wait_target == exited_pid || tasks[i].wait_target == 0 || tasks[i].wait_target == (uint64_t)-1)) {
             tasks[i].state = TASK_READY;
             tasks[i].wait_reason = TASK_WAIT_NONE;
             tasks[i].wait_target = 0;
@@ -598,16 +776,17 @@ static void wake_parent_waiters(uint32_t exited_pid)
 
 static void scheduler_terminate_task_unlocked(task_t *task, int status)
 {
-    if (task == 0 || task->state == TASK_ZOMBIE) {
+    if (task == 0 || task->state == TASK_ZOMBIE || task->state == TASK_DEAD || task->state == TASK_UNUSED) {
         return;
     }
 
     uint32_t exited_pid = task->pid;
+    uint32_t parent_pid = task->parent_pid;
     uint64_t exited_cr3 = task->cr3;
     uint64_t restore_cr3 = 0;
 
     if (task != current_task && current_task != 0 &&
-        current_task->state != TASK_ZOMBIE) {
+        current_task->state != TASK_ZOMBIE && current_task->state != TASK_DEAD && current_task->state != TASK_UNUSED) {
         restore_cr3 = current_task->cr3;
     }
 
@@ -621,25 +800,46 @@ static void scheduler_terminate_task_unlocked(task_t *task, int status)
     task->wait_target = 0;
     task->pending_signals = 0;
     task->active_signal = 0;
+    task_close_all_fds(task);
     release_user_pages(task);
     vmm_destroy_address_space((uint64_t *)exited_cr3);
     task->cr3 = (uint64_t)vmm_kernel_pml4();
+
+    /* Reparent children to PID 1 (shell / init) */
+    for (uint32_t i = 0; i < task_count; i++) {
+        if (tasks[i].state != TASK_UNUSED && tasks[i].state != TASK_DEAD && tasks[i].parent_pid == exited_pid) {
+            tasks[i].parent_pid = 1;
+        }
+    }
+
     wake_parent_waiters(exited_pid);
 
     if (restore_cr3 != 0) {
         vmm_switch_address_space((uint64_t *)restore_cr3);
     }
+
+    /* Send SIGCHLD to parent */
+    if (parent_pid != 0) {
+        for (uint32_t i = 0; i < task_count; i++) {
+            if (tasks[i].state != TASK_UNUSED && tasks[i].state != TASK_DEAD && tasks[i].pid == parent_pid) {
+                if (tasks[i].signal_handlers[SIGCHLD] != (uintptr_t)0 && tasks[i].signal_handlers[SIGCHLD] != (uintptr_t)1) {
+                    tasks[i].pending_signals |= signal_bit(SIGCHLD);
+                }
+                break;
+            }
+        }
+    }
 }
 
 void scheduler_terminate_task(task_t *task, int status)
 {
-    if (task == 0 || task->state == TASK_ZOMBIE) {
+    if (task == 0 || task->state == TASK_ZOMBIE || task->state == TASK_DEAD || task->state == TASK_UNUSED) {
         return;
     }
 
     uint64_t flags = spin_lock_irqsave(&task_table_lock);
 
-    if (task->state == TASK_ZOMBIE) {
+    if (task->state == TASK_ZOMBIE || task->state == TASK_DEAD || task->state == TASK_UNUSED) {
         spin_unlock_irqrestore(&task_table_lock, flags);
         return;
     }
@@ -660,8 +860,9 @@ void scheduler_exit_current(int status)
 
 static int next_pending_signal(task_t *task)
 {
+    uint32_t deliverable = task->pending_signals & ~task->blocked_signals;
     for (int signum = 1; signum < TASK_SIGNAL_COUNT; signum++) {
-        if (task->pending_signals & signal_bit(signum)) {
+        if (deliverable & signal_bit(signum)) {
             return signum;
         }
     }
@@ -712,11 +913,26 @@ static int deliver_pending_signal_unlocked(task_t *task)
         return 1;
     }
 
+    if (signum == SIGCHLD || signum == SIGCONT) {
+        uintptr_t h = task->signal_handlers[signum];
+        if (h == (uintptr_t)0 || h == (uintptr_t)1) {
+            task->pending_signals &= ~signal_bit(signum);
+            return 1;
+        }
+    }
+
+    if (signum == SIGPIPE || signum == SIGINT || signum == SIGTERM) {
+        uintptr_t h = task->signal_handlers[signum];
+        if (h == (uintptr_t)1) {
+            task->pending_signals &= ~signal_bit(signum);
+            return 1;
+        }
+    }
+
     uintptr_t handler = signum == SIGKILL ? 0 : task->signal_handlers[signum];
     if (handler == 0 || handler == (uintptr_t)-1) {
-        // Forçar terminação padrão se o handler for inválido
         task->pending_signals &= ~signal_bit(signum);
-        scheduler_terminate_task_unlocked(task, -1);
+        scheduler_terminate_task_unlocked(task, 128 + signum);
         return 0;
     }
 
@@ -729,11 +945,10 @@ static int deliver_pending_signal_unlocked(task_t *task)
     uint64_t user_rsp = signal_handler_stack(frame->user_rsp);
     if (user_rsp >= 0x0000800000000000ULL || user_rsp < 0x1000) {
         task->pending_signals &= ~signal_bit(signum);
-        scheduler_terminate_task_unlocked(task, -1);
+        scheduler_terminate_task_unlocked(task, 128 + signum);
         return 0;
     }
 
-    // Garanta que o stack de Ring 3 esteja mapeado e acessível
     uint64_t stack_page = user_rsp & ~(4096ULL - 1ULL);
     if (!vmm_is_mapped((uint64_t *)task->cr3, stack_page)) {
         void *physical = pmm_alloc();
@@ -741,7 +956,7 @@ static int deliver_pending_signal_unlocked(task_t *task)
             if (physical != 0) {
                 pmm_free(physical);
             }
-            scheduler_terminate_task_unlocked(task, -1);
+            scheduler_terminate_task_unlocked(task, 128 + signum);
             return 0;
         }
 
@@ -773,6 +988,9 @@ __attribute__((force_align_arg_pointer))
 uint64_t scheduler_tick(uint64_t current_rsp)
 {
     kernel_ticks++;
+    if (serial_received()) {
+        scheduler_wake_stdin_readers();
+    }
 
     uint64_t flags = spin_lock_irqsave(&task_table_lock);
 
@@ -803,13 +1021,9 @@ uint64_t scheduler_tick(uint64_t current_rsp)
         struct task_control_block *candidate = &tasks[index];
         if (candidate->state == TASK_READY || candidate->state == TASK_RUNNING) {
             
-            /* Validação defensiva de sinais: Threads nativas de Kernel (Ring 0) 
-             * não possuem pilha de usuário ou trampolines de sinal. */
             if (candidate->cr3 != (uint64_t)vmm_kernel_pml4()) {
                 if (candidate->pending_signals != 0 && candidate->active_signal == 0) {
-                    
-                    // Salva o CR3 atual antes de testar o sinal da tarefa
-                    uint64_t previous_cr3 = (uint64_t)vmm_kernel_pml4(); // Default seguro
+                    uint64_t previous_cr3 = (uint64_t)vmm_kernel_pml4();
                     if (current_task != NULL) {
                         previous_cr3 = current_task->cr3;
                     }
@@ -817,16 +1031,12 @@ uint64_t scheduler_tick(uint64_t current_rsp)
                     vmm_switch_address_space((uint64_t *)candidate->cr3);
                     
                     if (!deliver_pending_signal_unlocked(candidate)) {
-                        /* Se a tarefa foi abortada/destruída pelo sinal, precisamos
-                         * restaurar o espaço de endereçamento seguro imediatamente 
-                         * antes de continuar varrendo a tabela! */
                         vmm_switch_address_space((uint64_t *)previous_cr3);
                         continue;
                     }
                 }
             }
 
-            /* Transição de Contexto e Compromisso de Estado (Atômico) */
             current_task_index = index;
             current_task = candidate;
             current_task->state = TASK_RUNNING;
@@ -839,10 +1049,9 @@ uint64_t scheduler_tick(uint64_t current_rsp)
         }
     }
 
-    /* Fallback de Segurança Robusto: Nenhuma tarefa pronta -> Vai para a Idle */
     if (idle_task_index >= 0 && idle_task_index < (int)task_count) {
         struct task_control_block *idle = &tasks[idle_task_index];
-        if (idle->state != TASK_ZOMBIE) {
+        if (idle->state != TASK_ZOMBIE && idle->state != TASK_DEAD && idle->state != TASK_UNUSED) {
             current_task_index = idle_task_index;
             current_task = idle;
             current_task->state = TASK_RUNNING;
@@ -877,21 +1086,6 @@ struct syscall_frame {
     uint64_t user_rsp;
 };
 
-/*
- * scheduler_fork_current - Duplica o processo pai em execucao.
- *
- * syscall_frame_addr: endereco do struct syscall_frame salvo pelo stub ASM
- *   no topo da kernel stack do pai durante a syscall.
- *
- * Retorna o PID do filho ao pai (o filho retornara 0 via iretq).
- * Retorna -1 em caso de falha.
- *
- * Estrategia de retorno do filho:
- *   O filho e inserido na tabela com um interrupt_task_frame pre-montado no
- *   topo da sua nova kernel stack. Quando o scheduler_tick o selecionar, o
- *   timer_irq_stub fara pop de todos os registradores + iretq, acordando o
- *   filho em Ring 3 com RAX = 0.
- */
 int scheduler_fork_current(uint64_t syscall_frame_addr)
 {
     task_t *parent = current_task;
@@ -899,13 +1093,11 @@ int scheduler_fork_current(uint64_t syscall_frame_addr)
         return -1;
     }
 
-    /* Captura o frame de syscall do pai para copiar o contexto de CPU. */
     struct syscall_frame *sframe = (struct syscall_frame *)syscall_frame_addr;
     if (sframe == 0) {
         return -1;
     }
 
-    /* 1. Clona o espaco de endereçamento (deep-copy paginas de usuario). */
     uint64_t *child_pml4 = vmm_clone_address_space((uint64_t *)parent->cr3);
     if (child_pml4 == NULL) {
         klog("fork: falha ao clonar PML4\n");
@@ -914,7 +1106,6 @@ int scheduler_fork_current(uint64_t syscall_frame_addr)
 
     uint64_t flags = spin_lock_irqsave(&task_table_lock);
 
-    /* 2. Obtem slot na tabela de tarefas. */
     int slot = allocate_task_slot();
     if (slot < 0) {
         spin_unlock_irqrestore(&task_table_lock, flags);
@@ -923,15 +1114,12 @@ int scheduler_fork_current(uint64_t syscall_frame_addr)
         return -1;
     }
 
-    /* 3. Prepara nova kernel stack para o filho a partir do slot reservado. */
     uint8_t *child_kstack = task_stacks[slot];
 
-    /* 4. Copia todo o TCB do pai para o filho. */
     task_t *child = &tasks[slot];
     *child = *parent;
 
-    /* 5. Ajusta campos exclusivos do filho. */
-    child->pid          = (uint32_t)slot + 1;
+    child->pid          = generate_pid();
     child->parent_pid   = parent->pid;
     child->cr3          = (uint64_t)child_pml4;
     child->state        = TASK_READY;
@@ -940,36 +1128,30 @@ int scheduler_fork_current(uint64_t syscall_frame_addr)
     child->exit_status  = 0;
     child->active_signal = 0;
     child->pending_signals = 0;
+    child->blocked_signals = parent->blocked_signals;
     child->mutex_wait_next = 0;
     child->user_page_count = parent->user_page_count;
     for (uint32_t i = 0; i < parent->user_page_count; i++) {
         child->user_physical_pages[i] = parent->user_physical_pages[i];
     }
-    child->guard_page = (uintptr_t)child_kstack;
-    vmm_unmap(child->guard_page);
+    for (uint32_t i = 0; i < TASK_MAX_FDS; i++) {
+        if (child->file_descriptors[i] != 0) {
+            child->file_descriptors[i]->ref_count++;
+        }
+    }
+    child->guard_page = 0;
     child->kernel_stack_top = ((uintptr_t)child_kstack + TASK_STACK_SIZE) & ~0xFULL;
 
-    /*
-     * 6. Constroi um interrupt_task_frame no topo da nova kernel stack do filho.
-     *
-     * O timer_irq_stub empilha os registradores nesta ordem (pop reverso):
-     *   r15, r14, r13, r12, r11, r10, r9, r8, rbp, rdi, rsi, rdx, rcx, rbx, rax
-     *   + frame de interrupcao da CPU: rip, cs, rflags, user_rsp, ss
-     *
-     * O filho acorda via iretq com RAX = 0 (retorno fork para filho).
-     * RIP = rcx do syscall_frame (endereco de retorno do syscall no userspace).
-     * RFLAGS = r11 do syscall_frame (flags salvas pelo syscall).
-     */
     uintptr_t stack_top_addr = ((uintptr_t)child_kstack + TASK_STACK_SIZE) & ~0xFULL;
     struct interrupt_task_frame *child_frame =
         (struct interrupt_task_frame *)(stack_top_addr - sizeof(struct interrupt_task_frame));
 
     child_frame->ss       = USER_DATA_SELECTOR;
     child_frame->user_rsp = sframe->user_rsp;
-    child_frame->rflags   = sframe->r11;   /* r11 salva RFLAGS no syscall path */
+    child_frame->rflags   = sframe->r11;
     child_frame->cs       = USER_CODE_SELECTOR;
-    child_frame->rip      = sframe->rcx;   /* rcx salva RIP de retorno no syscall path */
-    child_frame->rax      = 0;             /* Regra de Ouro do Fork: filho retorna 0 */
+    child_frame->rip      = sframe->rcx;
+    child_frame->rax      = 0;
     child_frame->rbx      = sframe->rbx;
     child_frame->rcx      = sframe->rcx;
     child_frame->rdx      = sframe->rdx;
@@ -985,7 +1167,6 @@ int scheduler_fork_current(uint64_t syscall_frame_addr)
     child_frame->r14      = sframe->r14;
     child_frame->r15      = sframe->r15;
 
-    /* 7. Configura RSP e kernel_stack_top do filho. */
     child->rsp              = (uint64_t)child_frame;
     child->kernel_stack_top = stack_top_addr;
 
@@ -1009,13 +1190,26 @@ void scheduler_handle_syscall_signals(uint64_t syscall_frame_addr, uint64_t sysc
         return;
     }
 
+    if (signum == SIGCHLD || signum == SIGCONT) {
+        uintptr_t h = task->signal_handlers[signum];
+        if (h == (uintptr_t)0 || h == (uintptr_t)1) {
+            task->pending_signals &= ~signal_bit(signum);
+            return;
+        }
+    }
+
+    if (signum == SIGPIPE || signum == SIGINT || signum == SIGTERM) {
+        uintptr_t h = task->signal_handlers[signum];
+        if (h == (uintptr_t)1) {
+            task->pending_signals &= ~signal_bit(signum);
+            return;
+        }
+    }
+
     uintptr_t handler = signum == SIGKILL ? 0 : task->signal_handlers[signum];
     if (handler == 0 || handler == (uintptr_t)-1) {
         task->pending_signals &= ~signal_bit(signum);
-        scheduler_terminate_task(task, -1);
-        /* Não trava o CPU — retorna ao syscall_entry.
-         * Na próxima tick do timer (IRQ 0), o scheduler verá que a task
-         * atual está ZOMBIE e selecionará outra task. */
+        scheduler_terminate_task(task, 128 + signum);
         return;
     }
 
@@ -1023,11 +1217,10 @@ void scheduler_handle_syscall_signals(uint64_t syscall_frame_addr, uint64_t sysc
     uint64_t user_rsp = signal_handler_stack(frame->user_rsp);
     if (user_rsp >= 0x0000800000000000ULL || user_rsp < 0x1000) {
         task->pending_signals &= ~signal_bit(signum);
-        scheduler_terminate_task(task, -1);
+        scheduler_terminate_task(task, 128 + signum);
         return;
     }
 
-    // Garanta que o stack de Ring 3 esteja mapeado e acessível
     uint64_t stack_page = user_rsp & ~(4096ULL - 1ULL);
     if (!vmm_is_mapped((uint64_t *)task->cr3, stack_page)) {
         void *physical = pmm_alloc();
@@ -1035,7 +1228,7 @@ void scheduler_handle_syscall_signals(uint64_t syscall_frame_addr, uint64_t sysc
             if (physical != 0) {
                 pmm_free(physical);
             }
-            scheduler_terminate_task(task, -1);
+            scheduler_terminate_task(task, 128 + signum);
             for (;;) {
                 __asm__ volatile ("sti; hlt");
             }
@@ -1054,7 +1247,6 @@ void scheduler_handle_syscall_signals(uint64_t syscall_frame_addr, uint64_t sysc
 
     *(uint64_t *)user_rsp = SIGNAL_TRAMPOLINE_ADDR;
 
-    // Save context from the syscall frame.
     task->signal_context.registers.r15 = frame->r15;
     task->signal_context.registers.r14 = frame->r14;
     task->signal_context.registers.r13 = frame->r13;
@@ -1080,7 +1272,6 @@ void scheduler_handle_syscall_signals(uint64_t syscall_frame_addr, uint64_t sysc
     task->active_signal = (uint32_t)signum;
     task->pending_signals &= ~signal_bit(signum);
 
-    // Redirect to signal handler
     frame->rcx = handler;
     frame->user_rsp = user_rsp;
     frame->rdi = (uint64_t)signum;

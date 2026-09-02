@@ -1,10 +1,18 @@
-# PhotonOS v4.2 🚀
+# PhotonOS v4.3 🚀
 
-O **PhotonOS v4.2** é um sistema operacional monolítico freestanding desenvolvido do zero para a arquitetura **x86_64**, executando em **64-bit Long Mode**. O projeto consolida um núcleo multi-core preemptivo robusto com Copy-On-Write (COW), descoberta dinâmica de CPUs via ACPI MADT, isolamento de falhas do Ring 3, pipeline gráfico por software, barramento PCI, interface de rede Intel e1000 estável, armazenamento persistente dual (FAT16 + EXT2), biblioteca padrão de usuário (`ulibc`) otimizada com printf bufferizado e uma nova infraestrutura completa de protocolo TCP (Fase 1).
+O **PhotonOS v4.3** é um sistema operacional monolítico freestanding desenvolvido do zero para a arquitetura **x86_64**, executando em **64-bit Long Mode**. O projeto consolida um núcleo multi-core preemptivo robusto com Copy-On-Write (COW), descoberta dinâmica de CPUs via ACPI MADT, isolamento de falhas do Ring 3, pipeline gráfico por software, barramento PCI, interface de rede Intel e1000 estável, armazenamento persistente dual (FAT16 + EXT2), biblioteca padrão de usuário (`ulibc`) otimizada com printf bufferizado, infraestrutura completa de protocolo TCP (Fase 1), uma camada VFS expandida e o novo subsistema de **Sinais POSIX, Ciclo de Vida de Processos com Reparenting e File Descriptors com Pipe IPC**.
 
 ---
 
-## 🛠️ Estrutura do Projeto
+## 🚀 Funcionalidades Consolidadas
+
+### ⚡ Sinais POSIX, Ciclo de Vida de Processos & IPC (v4.3)
+*   **Subsistema de Sinais POSIX:** Suporte a sinais assíncronos (`SIGINT`, `SIGKILL`, `SIGPIPE`, `SIGTERM`, `SIGCHLD`, `SIGCONT`, `SIGSTOP`, `SIGTSTP`), gerenciamento de máscaras bloqueadas (`sigprocmask`), registro de tratadores customizados (`sigaction`), desvio de contexto em Ring 3 via trampoline (`SIGNAL_TRAMPOLINE_ADDR` / `sys_sigreturn`) e ações padrão do kernel.
+*   **Máquina de Estados de Processos Estrita:** Ciclo de vida robusto com estados `TASK_UNUSED`, `TASK_READY`, `TASK_RUNNING`, `TASK_SLEEPING`, `TASK_WAITING`, `TASK_BLOCKED`, `TASK_STOPPED`, `TASK_ZOMBIE` e `TASK_DEAD`.
+*   **Gerador de PID Monotônico:** Alocação estritamente crescente e livre de reutilização prematura de PIDs sob spinlocks com IRQ salva.
+*   **Reparenting Automático e SIGCHLD:** Ao encerrar, os processos órfãos são automaticamente adotados pelo PID 1 (shell/init), e o processo pai recebe a notificação `SIGCHLD` de forma atômica.
+*   **Colheita Atômica por `waitpid`:** Suporte a `waitpid(pid, status, options)` com flag `WNOHANG` e transição atômica de `TASK_ZOMBIE` para `TASK_DEAD`, prevenindo Use-After-Free e vazamentos de descritores.
+*   **IPC com Pipes e Detecção de Broken Pipe:** Buffer circular de 4 KiB com contagem atômica de leitores (`readers`) e escritores (`writers`). Emissão automática de `SIGPIPE` e retorno `-1` em escritas sem leitores ativos, e retorno `0` (EOF) em leituras quando todos os escritores fecharam.
 
 ```text
 PhotonOS/
@@ -40,8 +48,9 @@ PhotonOS/
 *   **Heap Seguro:** `heap_expand()` valida explicitamente os retornos de `pmm_alloc()` e `vmm_map()`, abortando o crescimento do heap em caso de falha sem tentar gravar em memória não mapeada.
 *   **Validação Estrita de MMIO:** O VMM aceita mapeamentos de regiões de hardware MMIO (VBE LFB em `0xFD000000` e APIC em `0xFEE00000`) sem expurgar entradas de tabelas de páginas.
 
-### 🌐 Infraestrutura TCP (Fase 1 — v4.2)
+### 🌐 Infraestrutura TCP (Fase 1 — v4.2.1)
 *   **Subsistema TCP Modular:** Módulo kernel independente (`src/kernel/tcp.c`, `include/tcp.h`) contendo gerenciamento de PCBs em lista global protegida por mutex, cálculo de checksum RFC 793 com pseudo-cabeçalho IPv4 e demultiplexação pela tupla de 4 elementos ou socket listener.
+*   **Integração Socket Layer (`sys_socket`):** Suporte completo à criação de sockets `socket(AF_INET, SOCK_STREAM, IPPROTO_TCP)` com suporte a descritores em contexto de kernel/boot (`kernel_task`), associação bidirecional socket ↔ PCB e não-regressão em `SOCK_RAW` (ping) e `SOCK_DGRAM` (UDP).
 *   **Gerenciamento de Portas:** Algoritmo thread-safe de alocação de portas efêmeras IANA (49152–65535), `bind` explícito de portas locais, detecção de colisão e liberação segura sem vazamentos.
 *   **Sockets e VFS:** Suporte nativo a `socket(AF_INET, SOCK_STREAM)`, `bind`, `connect`, `listen`, `accept`, `read` e `write` integrados aos nós do VFS e ao escalonador preemptivo sem espera ocupada ("zero busy-wait").
 *   **Estados do TCP:** Suporte completo aos 5 estados da Fase 1 (`CLOSED`, `LISTEN`, `SYN_SENT`, `SYN_RECEIVED`, `ESTABLISHED`) com filas de segmentos dinâmicos e suporte a temporizadores de retransmissão (RTO), Keep-Alive e Delayed ACK.
@@ -116,10 +125,14 @@ qemu-system-x86_64 -drive format=raw,file=build/photon.img,if=floppy -drive form
 
 ## 📈 Roadmap Resumido
 
-*   **Marcos Concluídos**: Inicialização 64-bit, alocador PMM/VMM, escalonador preemptivo Round-Robin, pipeline gráfico VBE com Double Buffering, driver de rede e1000, multiprocessamento SMP, Copy-On-Write (COW), sistema de arquivos EXT2 gravável, e printf bufferizado na ulibc.
-*   **Em Desenvolvimento (v4.2-dev)**: Links simbólicos (symlinks) no VFS, transmissão de dados em sockets TCP stream, e sincronização concorrente na fila de caracteres do teclado em SMP.
-*   **Planejado**: Permissões de arquivos Unix no VFS, montagem dinâmica de volumes adicionais, e endurecimento do espaço de endereçamento do kernel (NX/WP).
+*   **Marcos Concluídos**: Inicialização multiestágio 64-bit com janela LBA fragmentada (480 setores), alocador PMM/VMM com W^X, escalonador preemptivo Round-Robin multi-core (SMP), pipeline gráfico VBE com Double Buffering, driver de rede e1000 com ICMP/ARP e sockets BSD, Copy-On-Write (COW), sistemas de arquivos FAT16 e EXT2 graváveis, VFS com symlinks/hardlinks/permissões, printf bufferizado na ulibc, infraestrutura TCP (Fase 1) e subsistema de Sinais POSIX com IPC via Pipes anônimos.
+*   **Em Desenvolvimento (v4.4-dev)**: Transmissão contínua de dados em streams TCP (VFS read/write em sockets), e tratamento de ICMP Port Unreachable para datagramas UDP sem socket.
+*   **Planejado**: Suporte a execução de scripts e variáveis de ambiente no userspace, semáforos/condvars no escalonador e servidor HTTP em Ring 3.
 
-Para documentação extremamente detalhada de cada módulo, consulte o [Índice de Documentação Técnica](docs/DOCUMENTATION_INDEX.md).
+Para documentação técnica detalhada de cada módulo, consulte o [Índice de Documentação Técnica](docs/DOCUMENTATION_INDEX.md).
 
-Para o registro da auditoria e das correções de Page Fault/COW, consulte [VMM_COW_PAGEFAULT_FIXES_v4.1.md](docs/VMM_COW_PAGEFAULT_FIXES_v4.1.md).
+Para a especificação técnica do bootstrap e carregamento do kernel, consulte [BOOT.md](docs/BOOT.md).
+
+Para histórico de troubleshooting, causa raiz de limites de 64 KiB em BIOS LBA e análise de traces do QEMU, consulte [BOOT_TROUBLESHOOTING.md](docs/BOOT_TROUBLESHOOTING.md).
+
+Para o registro de recuperação de boot e realocação da BSS na v4.2, consulte [BOOT_INITIALIZATION_FIX_v4.2.md](docs/BOOT_INITIALIZATION_FIX_v4.2.md).

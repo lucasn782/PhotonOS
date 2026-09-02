@@ -43,6 +43,23 @@
 #define SYS_UMOUNT 34
 #define SYS_LISTEN 35
 #define SYS_ACCEPT 36
+#define SYS_LSEEK 37
+#define SYS_STAT 38
+#define SYS_FSTAT 39
+#define SYS_MKDIR 40
+#define SYS_RMDIR 41
+#define SYS_CHDIR 42
+#define SYS_GETCWD 43
+#define SYS_TRUNCATE 44
+#define SYS_FTRUNCATE 45
+#define SYS_DUP 46
+#define SYS_SYNC 47
+#define SYS_UMASK 48
+#define SYS_FLOCK 49
+#define SYS_FCNTL 50
+#define SYS_SIGACTION 51
+#define SYS_SIGPROCMASK 52
+#define SYS_WAITPID 53
 
 #define PAGE_SIZE 4096UL
 #define PRINTF_BUF_SIZE 2048
@@ -433,9 +450,34 @@ void yield(void)
     syscall0(SYS_YIELD);
 }
 
+int wait(int *status)
+{
+    return (int)syscall3(SYS_WAITPID, -1, (long)status, 0);
+}
+
+int waitpid(int pid, int *status, int options)
+{
+    return (int)syscall3(SYS_WAITPID, pid, (long)status, options);
+}
+
+int pipe(int fds[2])
+{
+    return (int)syscall1(SYS_PIPE, (long)fds);
+}
+
 sighandler_t signal(int signum, sighandler_t handler)
 {
     return (sighandler_t)syscall2(SYS_SIGNAL, signum, (long)handler);
+}
+
+int sigaction(int signum, const struct sigaction *act, struct sigaction *oldact)
+{
+    return (int)syscall3(SYS_SIGACTION, signum, (long)act, (long)oldact);
+}
+
+int sigprocmask(int how, const sigset_t *set, sigset_t *oldset)
+{
+    return (int)syscall3(SYS_SIGPROCMASK, how, (long)set, (long)oldset);
 }
 
 int kill(int pid, int signum)
@@ -526,6 +568,31 @@ int symlink(const char *target, const char *linkpath)
     return (int)syscall2(SYS_SYMLINK, (long)target, (long)linkpath);
 }
 
+int lseek(int fd, long offset, int whence)
+{
+    return (int)syscall3(SYS_LSEEK, (long)fd, offset, (long)whence);
+}
+
+int stat(const char *path, struct stat *buf)
+{
+    return (int)syscall2(SYS_STAT, (long)path, (long)buf);
+}
+
+int fstat(int fd, struct stat *buf)
+{
+    return (int)syscall2(SYS_FSTAT, (long)fd, (long)buf);
+}
+
+int mkdir(const char *path, uint32_t mode)
+{
+    return (int)syscall2(SYS_MKDIR, (long)path, (long)mode);
+}
+
+int rmdir(const char *path)
+{
+    return (int)syscall1(SYS_RMDIR, (long)path);
+}
+
 int readlink(const char *pathname, char *buf, size_t bufsiz)
 {
     return (int)syscall3(SYS_READLINK, (long)pathname, (long)buf, (long)bufsiz);
@@ -539,6 +606,59 @@ int mount(const char *source, const char *target, const char *fs_type, uint64_t 
 int umount(const char *target)
 {
     return (int)syscall1(SYS_UMOUNT, (long)target);
+}
+
+int chdir(const char *path)
+{
+    return (int)syscall1(SYS_CHDIR, (long)path);
+}
+
+char *getcwd(char *buf, size_t size)
+{
+    long ret = syscall2(SYS_GETCWD, (long)buf, (long)size);
+    if (ret < 0) {
+        return 0;
+    }
+    return buf;
+}
+
+int truncate(const char *path, size_t length)
+{
+    return (int)syscall2(SYS_TRUNCATE, (long)path, (long)length);
+}
+
+int ftruncate(int fd, size_t length)
+{
+    return (int)syscall2(SYS_FTRUNCATE, (long)fd, (long)length);
+}
+
+int dup(int oldfd)
+{
+    return (int)syscall1(SYS_DUP, (long)oldfd);
+}
+
+int sync(void)
+{
+    return (int)syscall0(SYS_SYNC);
+}
+
+uint32_t umask(uint32_t mask)
+{
+    return (uint32_t)syscall1(SYS_UMASK, (long)mask);
+}
+
+int flock(int fd, int op)
+{
+    return (int)syscall2(SYS_FLOCK, (long)fd, (long)op);
+}
+
+int fcntl(int fd, int cmd, ...)
+{
+    va_list ap;
+    va_start(ap, cmd);
+    long arg = va_arg(ap, long);
+    va_end(ap);
+    return (int)syscall3(SYS_FCNTL, (long)fd, (long)cmd, arg);
 }
 
 static int inet_is_digit(char ch)

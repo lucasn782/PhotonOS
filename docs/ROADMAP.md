@@ -59,6 +59,16 @@ Este documento descreve o estado atual do desenvolvimento do PhotonOS, dividindo
 - **Hard Links & Symlinks**: `link()`, `unlink()`, refcounting `nlink`, `symlink()`, `readlink()` e resolução recursiva de symlinks (`vfs_find_following_symlinks`).
 - **Mount Manager & Tabela Global de Mounts**: Estrutura `vfs_mount_t`, lista `vfs_mount_list`, chamadas `vfs_mount`/`vfs_umount` e travessia transparente de múltiplos volumes (`mounted_here`).
 
+### Trilha 14 — Sinais POSIX, Ciclo de Vida de Processos & IPC (v4.3)
+- **Subsistema de Sinais POSIX**: Suporte a sinais assíncronos (`SIGINT`, `SIGKILL`, `SIGPIPE`, `SIGTERM`, `SIGCHLD`, `SIGCONT`, `SIGSTOP`, `SIGTSTP`), `sigaction`, `sigprocmask` e trampoline em Ring 3.
+- **Ciclo de Vida de Processos**: Máquina de estados estrita (`TASK_READY`, `TASK_RUNNING`, `TASK_STOPPED`, `TASK_ZOMBIE`, `TASK_DEAD`), gerador de PID monotônico, reparenting automático para PID 1 e `waitpid(WNOHANG)`.
+- **IPC por Pipes Anônimos**: Buffer circular de 4 KiB, contagem de leitores/escritores, detecção de Broken Pipe (`SIGPIPE`) e retorno EOF (`0`).
+
+### Trilha 15 — Estabilização do Bootloader & Bugfix de Janela LBA (v4.3-boot)
+- **Fragmentação LBA em 4 Janelas (480 setores)**: Carregamento do kernel particionado em pacotes DAP de no máximo 128 setores (64 KiB), eliminando overflow de offset de 16 bits no Modo Real.
+- **Eliminação de Dependência de CHS em Hard Disk**: Validação estrita de extensões BIOS EDD (`INT 13h, AH=42h`) para execução segura em discos rígidos (`DL=0x80`).
+- **Resolução de Boot Regression**: Estabilização comprovada com 10/10 boots consecutivos com passagem em todos os subsistemas.
+
 ---
 
 ## 🟡 Em Desenvolvimento (v4.4-dev)

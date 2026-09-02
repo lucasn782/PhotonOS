@@ -1089,11 +1089,32 @@ void tcp_run_tests(void)
         klog("[TCP TEST] FAIL: tcp_unregister / tcp_free\n");
     }
 
-    /* Test 7: Socket Integration */
-    int fd = sys_socket(AF_INET, SOCK_STREAM, IP_PROTO_TCP);
-    if (fd >= 0) {
-        klog("[TCP TEST] PASS: sys_socket(AF_INET, SOCK_STREAM, IP_PROTO_TCP)\n");
+    /* Test 7: Socket Integration & Non-Regression */
+    int fd_tcp = sys_socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    int fd_raw = sys_socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
+    int fd_udp = sys_socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+
+    if (fd_tcp >= 0 && fd_raw >= 0 && fd_udp >= 0) {
+        struct sockaddr_in bind_addr;
+        bind_addr.sin_family = AF_INET;
+        bind_addr.sin_port = htons(8080);
+        bind_addr.sin_addr.s_addr = htonl(0x0A00020F);
+
+        int bind_res = sys_bind(fd_tcp, (const struct sockaddr *)&bind_addr, sizeof(bind_addr));
+        if (bind_res == 0) {
+            klog("[TCP TEST] PASS: sys_socket(AF_INET, SOCK_STREAM, IPPROTO_TCP) e sys_bind()\n");
+        } else {
+            klog("[TCP TEST] FAIL: sys_bind TCP\n");
+        }
+
+        sys_close(fd_tcp);
+        sys_close(fd_raw);
+        sys_close(fd_udp);
+        klog("[TCP TEST] PASS: sys_socket integration e nao-regressao RAW/DGRAM\n");
     } else {
+        if (fd_tcp >= 0) sys_close(fd_tcp);
+        if (fd_raw >= 0) sys_close(fd_raw);
+        if (fd_udp >= 0) sys_close(fd_udp);
         klog("[TCP TEST] FAIL: sys_socket integration\n");
     }
 

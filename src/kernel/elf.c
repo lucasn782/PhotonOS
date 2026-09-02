@@ -7,7 +7,7 @@
 #include "vfs.h"
 #include "vmm.h"
 
-#define ELF_USER_STACK_TOP 0x0000008000010000ULL
+#define ELF_USER_STACK_TOP 0x0000008000800000ULL
 #define ELF_USER_STACK_PAGES 4ULL
 #define PAGE_MASK (~(PMM_PAGE_SIZE - 1ULL))
 

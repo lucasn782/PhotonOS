@@ -2,6 +2,7 @@
 #include <stddef.h>
 
 #include "ata.h"
+#include "fat16.h"
 #include "elf.h"
 #include "heap.h"
 #include "initrd.h"
@@ -19,6 +20,10 @@
 #include "mouse.h"
 #include "apic.h"
 #include "smp.h"
+#include "bcache.h"
+
+#include "sys/stat.h"
+#include "sys/socket.h"
 
 #define VGA_WIDTH 80
 #define VGA_HEIGHT 25
@@ -76,6 +81,29 @@
 #define SYS_UMOUNT 34ULL
 #define SYS_LISTEN 35ULL
 #define SYS_ACCEPT 36ULL
+#define SYS_LSEEK 37ULL
+#define SYS_STAT 38ULL
+#define SYS_FSTAT 39ULL
+#define SYS_MKDIR 40ULL
+#define SYS_RMDIR 41ULL
+#define SYS_CHDIR 42ULL
+#define SYS_GETCWD 43ULL
+#define SYS_TRUNCATE 44ULL
+#define SYS_FTRUNCATE 45ULL
+#define SYS_DUP 46ULL
+#define SYS_SYNC 47ULL
+#define SYS_UMASK 48ULL
+#define SYS_FLOCK 49ULL
+#define SYS_FCNTL 50ULL
+#define SYS_SIGACTION 51ULL
+#define SYS_SIGPROCMASK 52ULL
+#define SYS_WAITPID 53ULL
+
+#define F_DUPFD 0
+#define F_GETFD 1
+#define F_SETFD 2
+#define F_GETFL 3
+#define F_SETFL 4
 
 #define PIC1_COMMAND 0x20
 #define PIC1_DATA 0x21
@@ -172,6 +200,8 @@ struct pipe_buffer {
     size_t read_pos;
     size_t write_pos;
     size_t count;
+    uint32_t readers;
+    uint32_t writers;
     mutex_t lock;
 };
 
@@ -530,8 +560,83 @@ vfs_node_t *kernel_stderr_node(void)
     return &console_stderr;
 }
 
+file_description_t *file_description_alloc(vfs_node_t *node, uint32_t flags)
+{
+    if (node == 0) return 0;
+    file_description_t *fdesc = kmalloc(sizeof(*fdesc));
+    if (fdesc == 0) return 0;
+    fdesc->node = node;
+    fdesc->offset = 0;
+    fdesc->flags = flags;
+    fdesc->ref_count = 1;
+    vfs_node_ref(node);
+    return fdesc;
+}
+
+void file_description_unref(file_description_t *fdesc)
+{
+    if (fdesc == 0) return;
+    if (fdesc->ref_count > 0) {
+        fdesc->ref_count--;
+    }
+    if (fdesc->ref_count == 0) {
+        vfs_node_t *node = fdesc->node;
+        if (node != 0) {
+            if (node->close != 0) {
+                node->close(node);
+            }
+            vfs_node_unref(node);
+        }
+        kfree(fdesc);
+    }
+}
+
+void task_close_all_fds(task_t *task)
+{
+    if (task == 0) return;
+    for (int i = 0; i < TASK_MAX_FDS; i++) {
+        if (task->file_descriptors[i] != 0) {
+            file_description_t *fdesc = task->file_descriptors[i];
+            task->file_descriptors[i] = 0;
+            if (fdesc->node != 0) {
+                vfs_node_unlock_by_pid(fdesc->node, task->pid);
+            }
+            file_description_unref(fdesc);
+        }
+    }
+}
+
 static int keyboard_queue_pop(char *ch);
-static int copy_user_path(char *dest, const char *src, size_t capacity);
+
+static int copy_user_path(char *dest, const char *src, size_t capacity)
+{
+    if (dest == 0 || src == 0 || capacity == 0) {
+        return -1;
+    }
+
+    for (size_t i = 0; i < capacity; i++) {
+        dest[i] = src[i];
+        if (src[i] == '\0') {
+            return 0;
+        }
+    }
+
+    /* A valid user string can be larger than this syscall's kernel buffer.
+     * Reject it instead of resolving a different, silently truncated path. */
+    dest[capacity - 1] = '\0';
+    return -1;
+}
+
+static int resolve_user_path(char *dest, const char *src, size_t capacity)
+{
+    task_t *task = scheduler_current_task();
+    char raw_path[128];
+    if (task == 0 || copy_user_path(raw_path, src, sizeof(raw_path)) != 0) {
+        return -1;
+    }
+    const char *cwd = (task->cwd[0] != '\0') ? task->cwd : "/";
+    return vfs_build_path(cwd, raw_path, dest, capacity);
+}
 
 static void memory_copy(void *dest, const void *src, size_t size)
 {
@@ -570,6 +675,45 @@ static size_t console_write(vfs_node_t *node, size_t offset, size_t size,
     return size;
 }
 
+static void pipe_node_close(vfs_node_t *node)
+{
+    if (node == 0) return;
+    struct pipe_end *end = node->data;
+    if (end == 0 || end->pipe == 0) return;
+
+    struct pipe_buffer *pipe = end->pipe;
+    int free_pipe = 0;
+
+    mutex_lock(&pipe->lock);
+    if (end->readable) {
+        if (pipe->readers > 0) {
+            pipe->readers--;
+        }
+        if (pipe->readers == 0) {
+            scheduler_wake_pipe_writers(pipe);
+        }
+    }
+    if (end->writable) {
+        if (pipe->writers > 0) {
+            pipe->writers--;
+        }
+        if (pipe->writers == 0) {
+            scheduler_wake_pipe_readers(pipe);
+        }
+    }
+    if (pipe->readers == 0 && pipe->writers == 0) {
+        free_pipe = 1;
+    }
+    mutex_unlock(&pipe->lock);
+
+    kfree(end);
+    node->data = 0;
+
+    if (free_pipe) {
+        kfree(pipe);
+    }
+}
+
 static int pipe_read(vfs_node_t *node, uint64_t offset, uint32_t size,
     uint8_t *buffer)
 {
@@ -590,6 +734,11 @@ static int pipe_read(vfs_node_t *node, uint64_t offset, uint32_t size,
     }
 
     if (read_count == 0) {
+        if (pipe->writers == 0) {
+            /* Todos os escritores fecharam e o buffer está vazio -> EOF (retorna 0) */
+            mutex_unlock(&pipe->lock);
+            return 0;
+        }
         mutex_unlock(&pipe->lock);
         scheduler_sleep_current(TASK_WAIT_PIPE_READ, (uint64_t)pipe);
     } else {
@@ -613,6 +762,17 @@ static size_t pipe_write(vfs_node_t *node, size_t offset, size_t size,
     size_t written = 0;
 
     mutex_lock(&pipe->lock);
+
+    /* Broken pipe: se todos os leitores fecharam, emite SIGPIPE e retorna -1 */
+    if (pipe->readers == 0) {
+        mutex_unlock(&pipe->lock);
+        task_t *current = scheduler_current_task();
+        if (current != 0) {
+            scheduler_send_signal(current->pid, SIGPIPE);
+        }
+        return (size_t)-1;
+    }
+
     while (written < size && pipe->count < PIPE_BUFFER_SIZE) {
         pipe->data[pipe->write_pos] = buffer[written++];
         pipe->write_pos = (pipe->write_pos + 1) % PIPE_BUFFER_SIZE;
@@ -658,6 +818,15 @@ static void keyboard_queue_push(char ch)
 
 static int keyboard_queue_pop(char *ch)
 {
+    if (serial_received()) {
+        char c = serial_getc();
+        if (c == '\r') {
+            c = '\n';
+        }
+        *ch = c;
+        return 1;
+    }
+
     if (keyboard_queue_read == keyboard_queue_write) {
         return 0;
     }
@@ -669,32 +838,200 @@ static int keyboard_queue_pop(char *ch)
 
 static int sys_open(const char *path, int flags)
 {
-    (void)flags;
     task_t *task = scheduler_current_task();
     char kernel_path[128];
 
-    if (task == 0 || copy_user_path(kernel_path, path, sizeof(kernel_path)) != 0) {
+    if (task == 0 || resolve_user_path(kernel_path, path, sizeof(kernel_path)) != 0) {
         return -1;
     }
 
     vfs_node_t *node = vfs_find(kernel_path);
-    if (node == 0 || node->type != VFS_NODE_FILE) {
+    if (node == 0 && (flags & 0100)) {
+        if (fat16_vfs_create(kernel_path) == 0) {
+            node = vfs_find(kernel_path);
+        }
+    }
+    if (node == 0 || (node->type != VFS_NODE_FILE && node->type != VFS_NODE_DIRECTORY)) {
+        return -1;
+    }
+
+    int access_mode = flags & 3;
+    if (access_mode == 0 || access_mode == 2) {
+        if (!vfs_check_permission(node, 4, task->uid, task->gid)) {
+            return -1;
+        }
+    }
+    if (access_mode == 1 || access_mode == 2) {
+        if (!vfs_check_permission(node, 2, task->uid, task->gid)) {
+            return -1;
+        }
+    }
+
+    file_description_t *fdesc = file_description_alloc(node, (uint32_t)flags);
+    if (fdesc == 0) {
         return -1;
     }
 
     for (int i = 3; i < TASK_MAX_FDS; i++) {
         if (task->file_descriptors[i] == 0) {
             if (node->open != 0 && node->open(node) != 0) {
+                file_description_unref(fdesc);
                 return -1;
             }
 
-            task->file_descriptors[i] = node;
-            task->fd_offsets[i] = 0;
+            task->file_descriptors[i] = fdesc;
             return i;
         }
     }
 
+    file_description_unref(fdesc);
     return -1;
+}
+
+static int sys_lseek(int fd, long offset, int whence)
+{
+    task_t *task = scheduler_current_task();
+
+    if (task == 0 || fd < 0 || fd >= TASK_MAX_FDS || task->file_descriptors[fd] == 0) {
+        return -1;
+    }
+
+    file_description_t *fdesc = task->file_descriptors[fd];
+    vfs_node_t *node = fdesc->node;
+    if (node == 0) {
+        return -1;
+    }
+
+    int64_t current_offset = (int64_t)fdesc->offset;
+    int64_t new_offset = 0;
+
+    if (whence == 0) {
+        new_offset = offset;
+    } else if (whence == 1) {
+        new_offset = current_offset + offset;
+    } else if (whence == 2) {
+        new_offset = (int64_t)node->size + offset;
+    } else {
+        return -1;
+    }
+
+    if (new_offset < 0) {
+        return -1;
+    }
+
+    fdesc->offset = (uint64_t)new_offset;
+    return (int)new_offset;
+}
+
+static int sys_stat(const char *path, struct stat *stbuf)
+{
+    task_t *task = scheduler_current_task();
+    char kernel_path[128];
+
+    if (task == 0 || stbuf == 0 || resolve_user_path(kernel_path, path, sizeof(kernel_path)) != 0) {
+        return -1;
+    }
+
+    vfs_node_t *node = vfs_find_following_symlinks(kernel_path, 8);
+    if (node == 0) {
+        return -1;
+    }
+
+    struct stat kst;
+    memory_set(&kst, 0, sizeof(kst));
+    kst.st_dev = 1;
+    kst.st_ino = (uint32_t)(uintptr_t)node;
+    kst.st_mode = node->mode;
+    if (node->type == VFS_NODE_DIRECTORY) kst.st_mode |= S_IFDIR;
+    else if (node->type == VFS_NODE_FILE) kst.st_mode |= S_IFREG;
+    else if (node->type == VFS_NODE_DEVICE) kst.st_mode |= S_IFCHR;
+    else if (node->type == VFS_NODE_PIPE) kst.st_mode |= S_IFIFO;
+    else if (node->type == VFS_NODE_SYMLINK) kst.st_mode |= S_IFLNK;
+    else if (node->type == VFS_NODE_SOCKET) kst.st_mode |= S_IFSOCK;
+
+    kst.st_nlink = node->nlink;
+    kst.st_uid = node->uid;
+    kst.st_gid = node->gid;
+    kst.st_size = node->size;
+    kst.st_blksize = 512;
+    kst.st_blocks = (node->size + 511) / 512;
+    kst.st_type = (uint32_t)node->type;
+
+    memory_copy(stbuf, &kst, sizeof(kst));
+    return 0;
+}
+
+static int sys_fstat(int fd, struct stat *stbuf)
+{
+    task_t *task = scheduler_current_task();
+
+    if (task == 0 || fd < 0 || fd >= TASK_MAX_FDS || stbuf == 0 || task->file_descriptors[fd] == 0) {
+        return -1;
+    }
+
+    vfs_node_t *node = task->file_descriptors[fd]->node;
+    if (node == 0) {
+        return -1;
+    }
+
+    struct stat kst;
+    memory_set(&kst, 0, sizeof(kst));
+    kst.st_dev = 1;
+    kst.st_ino = (uint32_t)(uintptr_t)node;
+    kst.st_mode = node->mode;
+    if (node->type == VFS_NODE_DIRECTORY) kst.st_mode |= S_IFDIR;
+    else if (node->type == VFS_NODE_FILE) kst.st_mode |= S_IFREG;
+    else if (node->type == VFS_NODE_DEVICE) kst.st_mode |= S_IFCHR;
+    else if (node->type == VFS_NODE_PIPE) kst.st_mode |= S_IFIFO;
+    else if (node->type == VFS_NODE_SYMLINK) kst.st_mode |= S_IFLNK;
+    else if (node->type == VFS_NODE_SOCKET) kst.st_mode |= S_IFSOCK;
+
+    kst.st_nlink = node->nlink;
+    kst.st_uid = node->uid;
+    kst.st_gid = node->gid;
+    kst.st_size = node->size;
+    kst.st_blksize = 512;
+    kst.st_blocks = (node->size + 511) / 512;
+    kst.st_type = (uint32_t)node->type;
+
+    memory_copy(stbuf, &kst, sizeof(kst));
+    return 0;
+}
+
+static int sys_mkdir(const char *path, uint32_t mode)
+{
+    task_t *task = scheduler_current_task();
+    char kernel_path[128];
+
+    if (task == 0 || resolve_user_path(kernel_path, path, sizeof(kernel_path)) != 0) {
+        return -1;
+    }
+
+    return vfs_mkdir(kernel_path, mode);
+}
+
+static int sys_rmdir(const char *path)
+{
+    task_t *task = scheduler_current_task();
+    char kernel_path[128];
+
+    if (task == 0 || resolve_user_path(kernel_path, path, sizeof(kernel_path)) != 0) {
+        return -1;
+    }
+
+    return vfs_rmdir(kernel_path);
+}
+
+static int sys_unlink(const char *path)
+{
+    task_t *task = scheduler_current_task();
+    char kernel_path[128];
+
+    if (task == 0 || resolve_user_path(kernel_path, path, sizeof(kernel_path)) != 0) {
+        return -1;
+    }
+
+    return vfs_unlink(kernel_path);
 }
 
 int task_alloc_fd(task_t *task, vfs_node_t *node)
@@ -703,14 +1040,19 @@ int task_alloc_fd(task_t *task, vfs_node_t *node)
         return -1;
     }
 
+    file_description_t *fdesc = file_description_alloc(node, 0);
+    if (fdesc == 0) {
+        return -1;
+    }
+
     for (int i = 3; i < TASK_MAX_FDS; i++) {
         if (task->file_descriptors[i] == 0) {
-            task->file_descriptors[i] = node;
-            task->fd_offsets[i] = 0;
+            task->file_descriptors[i] = fdesc;
             return i;
         }
     }
 
+    file_description_unref(fdesc);
     return -1;
 }
 
@@ -727,7 +1069,7 @@ static int sys_create(const char *path)
     task_t *task = scheduler_current_task();
     char kernel_path[128];
 
-    if (task == 0 || copy_user_path(kernel_path, path, sizeof(kernel_path)) != 0) {
+    if (task == 0 || resolve_user_path(kernel_path, path, sizeof(kernel_path)) != 0) {
         return -1;
     }
 
@@ -747,7 +1089,12 @@ static int sys_read(int fd, void *buffer, uint32_t size)
         return -1;
     }
 
-    vfs_node_t *node = task->file_descriptors[fd];
+    file_description_t *fdesc = task->file_descriptors[fd];
+    vfs_node_t *node = fdesc->node;
+    if (node == 0) {
+        return -1;
+    }
+
     if (node == &console_stdin && !task_owns_stdin(task)) {
         return 0;
     }
@@ -757,7 +1104,7 @@ static int sys_read(int fd, void *buffer, uint32_t size)
         return -1;
     }
 
-    int bytes = vfs_read(node, task->fd_offsets[fd], size, kbuf);
+    int bytes = vfs_read(node, fdesc->offset, size, kbuf);
 
     if (bytes == 0 && node == &console_stdin) {
         scheduler_sleep_current(TASK_WAIT_STDIN, 0);
@@ -776,7 +1123,7 @@ static int sys_read(int fd, void *buffer, uint32_t size)
         }
 
         memory_copy(buffer, kbuf, bytes);
-        task->fd_offsets[fd] += bytes;
+        fdesc->offset += bytes;
     }
 
     if (kbuf != 0) {
@@ -786,7 +1133,6 @@ static int sys_read(int fd, void *buffer, uint32_t size)
     return bytes;
 }
 
-// CORRIGIDO: Fallback de segurança para roteamento garantido do buffer de stdout/stderr gráfico
 static int sys_write(int fd, const uint8_t *buffer, size_t size)
 {
     task_t *task = scheduler_current_task();
@@ -795,30 +1141,30 @@ static int sys_write(int fd, const uint8_t *buffer, size_t size)
         return -1;
     }
 
-    /* Fallback definitivo: roteamento atomico em Ring 0 para stdout (1) e stderr (2) */
-    if (fd == 1 || fd == 2) {
-        if (!vmm_is_mapped((uint64_t *)task->cr3, (uintptr_t)buffer)) {
-            return -1;
-        }
-        if (size > 1 && !vmm_is_mapped((uint64_t *)task->cr3, (uintptr_t)buffer + size - 1)) {
-            return -1;
-        }
+    file_description_t *fdesc = task->file_descriptors[fd];
+    if (fdesc == 0) {
+        /* Fallback de seguranca caso os descritores padrao nao estejam alocados */
+        if (fd == 1 || fd == 2) {
+            if (!vmm_is_mapped((uint64_t *)task->cr3, (uintptr_t)buffer)) {
+                return -1;
+            }
+            if (size > 1 && !vmm_is_mapped((uint64_t *)task->cr3, (uintptr_t)buffer + size - 1)) {
+                return -1;
+            }
 
-        for (size_t i = 0; i < size; i++) {
-            vga_put_char((char)buffer[i]);
-            serial_putc((char)buffer[i]);
+            for (size_t i = 0; i < size; i++) {
+                vga_put_char((char)buffer[i]);
+                serial_putc((char)buffer[i]);
+            }
+            if (video_active) {
+                video_swap_buffers();
+            }
+            return (int)size;
         }
-        /* CORRECAO B4: video_swap_buffers chamado UMA unica vez apos o loop
-         * completo, evitando swap duplo que ocorria quando console_write
-         * tambem invocava o swap pelo caminho vfs_write */
-        if (video_active) {
-            video_swap_buffers();
-        }
-        return (int)size;
+        return -1;
     }
 
-    if (task->file_descriptors[fd] == 0 ||
-        task->file_descriptors[fd]->write == 0) {
+    if (fdesc->node == 0 || fdesc->node->write == 0) {
         return -1;
     }
 
@@ -843,35 +1189,173 @@ static int sys_write(int fd, const uint8_t *buffer, size_t size)
         memory_copy(kbuf, buffer, size);
     }
 
-    size_t bytes = vfs_write(task->file_descriptors[fd],
-        task->fd_offsets[fd], size, kbuf);
+    size_t bytes = vfs_write(fdesc->node, fdesc->offset, size, kbuf);
 
     if (kbuf != 0) {
         kfree(kbuf);
     }
 
-    if (bytes > 0) {
-        task->fd_offsets[fd] += bytes;
+    if (bytes > 0 && fdesc->node->type != VFS_NODE_PIPE) {
+        fdesc->offset += bytes;
     }
 
     return (int)bytes;
 }
 
-static int copy_user_path(char *dest, const char *src, size_t capacity)
+static int sys_chdir(const char *path)
 {
-    if (dest == 0 || src == 0 || capacity == 0) {
+    char kernel_path[128];
+    if (resolve_user_path(kernel_path, path, sizeof(kernel_path)) != 0) {
+        return -1;
+    }
+    return vfs_chdir(kernel_path);
+}
+
+static int sys_getcwd(char *buf, size_t size)
+{
+    char kbuf[64];
+    if (vfs_getcwd(kbuf, sizeof(kbuf)) != 0) {
+        return -1;
+    }
+    size_t len = 0;
+    while (kbuf[len] != '\0') len++;
+    if (size <= len) {
+        return -1;
+    }
+    memory_copy(buf, kbuf, len + 1);
+    return 0;
+}
+
+static int sys_truncate(const char *path, size_t length)
+{
+    char kernel_path[128];
+    if (resolve_user_path(kernel_path, path, sizeof(kernel_path)) != 0) {
+        return -1;
+    }
+    return vfs_truncate_path(kernel_path, length);
+}
+
+static int sys_ftruncate(int fd, size_t length)
+{
+    task_t *task = scheduler_current_task();
+    if (task == 0 || fd < 0 || fd >= TASK_MAX_FDS || task->file_descriptors[fd] == 0) {
+        return -1;
+    }
+    file_description_t *fdesc = task->file_descriptors[fd];
+    if (fdesc->node == 0) {
+        return -1;
+    }
+    return vfs_truncate(fdesc->node, length);
+}
+
+static int sys_chmod(const char *path, uint32_t mode)
+{
+    char kernel_path[128];
+    if (resolve_user_path(kernel_path, path, sizeof(kernel_path)) != 0) {
+        return -1;
+    }
+    return vfs_chmod(kernel_path, mode);
+}
+
+static int sys_chown(const char *path, uint32_t uid, uint32_t gid)
+{
+    char kernel_path[128];
+    if (resolve_user_path(kernel_path, path, sizeof(kernel_path)) != 0) {
+        return -1;
+    }
+    return vfs_chown(kernel_path, uid, gid);
+}
+
+static int sys_link(const char *oldpath, const char *newpath)
+{
+    char kp1[128];
+    char kp2[128];
+    if (resolve_user_path(kp1, oldpath, sizeof(kp1)) != 0 ||
+        resolve_user_path(kp2, newpath, sizeof(kp2)) != 0) {
+        return -1;
+    }
+    return vfs_link(kp1, kp2);
+}
+
+static int sys_symlink(const char *target, const char *linkpath)
+{
+    char kp2[128];
+    if (resolve_user_path(kp2, linkpath, sizeof(kp2)) != 0) {
+        return -1;
+    }
+    return vfs_symlink(target, kp2);
+}
+
+static int sys_readlink(const char *path, char *buf, size_t bufsiz)
+{
+    char kp[128];
+    if (resolve_user_path(kp, path, sizeof(kp)) != 0) {
+        return -1;
+    }
+    return vfs_readlink(kp, buf, bufsiz);
+}
+
+static int sys_sync(void)
+{
+    return vfs_sync();
+}
+
+static int sys_umask(uint32_t mask)
+{
+    task_t *task = scheduler_current_task();
+    if (task == 0) return 0022;
+    uint32_t old_mask = task->umask;
+    task->umask = mask & 0777;
+    return (int)old_mask;
+}
+
+static int sys_flock(int fd, int op)
+{
+    task_t *task = scheduler_current_task();
+    if (task == 0 || fd < 0 || fd >= TASK_MAX_FDS || task->file_descriptors[fd] == 0) {
+        return -1;
+    }
+    file_description_t *fdesc = task->file_descriptors[fd];
+    if (fdesc->node == 0) {
+        return -1;
+    }
+    return vfs_flock(fdesc->node, op, task->pid);
+}
+
+static int sys_fcntl(int fd, int cmd, uint64_t arg)
+{
+    task_t *task = scheduler_current_task();
+    if (task == 0 || fd < 0 || fd >= TASK_MAX_FDS || task->file_descriptors[fd] == 0) {
         return -1;
     }
 
-    for (size_t i = 0; i < capacity; i++) {
-        dest[i] = src[i];
-        if (src[i] == '\0') {
-            return 0;
+    file_description_t *fdesc = task->file_descriptors[fd];
+
+    if (cmd == F_DUPFD) {
+        int min_fd = (int)arg;
+        if (min_fd < 0 || min_fd >= TASK_MAX_FDS) {
+            return -1;
         }
+        for (int i = min_fd; i < TASK_MAX_FDS; i++) {
+            if (task->file_descriptors[i] == 0) {
+                task->file_descriptors[i] = fdesc;
+                fdesc->ref_count++;
+                return i;
+            }
+        }
+        return -1;
+    } else if (cmd == F_GETFD) {
+        return 0;
+    } else if (cmd == F_SETFD) {
+        return 0;
+    } else if (cmd == F_GETFL) {
+        return (int)fdesc->flags;
+    } else if (cmd == F_SETFL) {
+        fdesc->flags = (uint32_t)arg;
+        return 0;
     }
 
-    dest[capacity - 1] = '\0';
-    return 0;
+    return -1;
 }
 
 static int sys_spawn(const char *path)
@@ -957,6 +1441,24 @@ static int sys_exit(int status)
     return 0;
 }
 
+static int sys_waitpid(int pid, int *status, int options)
+{
+    task_t *task = scheduler_current_task();
+    int kstatus = 0;
+    int result = scheduler_waitpid((int32_t)pid, &kstatus, options);
+
+    if (result > 0) {
+        if (foreground_pid == (uint32_t)result) {
+            foreground_pid = task != 0 ? task->pid : 0;
+        }
+        if (status != 0) {
+            *status = kstatus;
+        }
+    }
+
+    return result;
+}
+
 static int sys_wait(int pid)
 {
     task_t *task = scheduler_current_task();
@@ -973,20 +1475,30 @@ static int sys_wait(int pid)
 
 static int is_supported_signal(int signum)
 {
-    return signum == SIGINT || signum == SIGKILL || signum == SIGTERM;
+    return signum > 0 && signum < TASK_SIGNAL_COUNT;
 }
 
 static uintptr_t sys_signal(int signum, uintptr_t handler)
 {
     task_t *task = scheduler_current_task();
 
-    if (task == 0 || !is_supported_signal(signum) || signum == SIGKILL) {
+    if (task == 0 || !is_supported_signal(signum) || signum == SIGKILL || signum == SIGSTOP) {
         return (uintptr_t)-1;
     }
 
     uintptr_t previous = task->signal_handlers[signum];
     task->signal_handlers[signum] = handler;
     return previous;
+}
+
+static int sys_sigaction(int signum, const struct sigaction *act, struct sigaction *oldact)
+{
+    return scheduler_sigaction(signum, act, oldact);
+}
+
+static int sys_sigprocmask(int how, const sigset_t *set, sigset_t *oldset)
+{
+    return scheduler_sigprocmask(how, set, oldset);
 }
 
 static int sys_kill(int pid, int signum)
@@ -1000,22 +1512,14 @@ static int sys_kill(int pid, int signum)
         return -1;
     }
 
-    if (signum == SIGKILL ||
-        (target->signal_handlers[signum] == 0 &&
-            (signum == SIGINT || signum == SIGTERM))) {
-        if (target == scheduler_current_task()) {
-            return sys_exit(128 + signum);
-        }
-
-        scheduler_terminate_task(target, 128 + signum);
+    int ret = scheduler_send_signal((uint32_t)pid, signum);
+    if (ret == 0 && (signum == SIGKILL || signum == SIGINT || signum == SIGTERM || signum == SIGPIPE)) {
         if (foreground_pid == (uint32_t)pid) {
             task_t *current = scheduler_current_task();
             foreground_pid = current != 0 ? current->pid : 0;
         }
-        return 0;
     }
-
-    return scheduler_send_signal((uint32_t)pid, signum);
+    return ret;
 }
 
 static uint64_t sys_sigreturn(uint64_t syscall_frame)
@@ -1079,6 +1583,11 @@ static int sys_pipe(int *fds)
     write_node = kmalloc(sizeof(*write_node));
     if (pipe == 0 || read_end == 0 || write_end == 0 ||
         read_node == 0 || write_node == 0) {
+        if (pipe) kfree(pipe);
+        if (read_end) kfree(read_end);
+        if (write_end) kfree(write_end);
+        if (read_node) kfree(read_node);
+        if (write_node) kfree(write_node);
         return -1;
     }
 
@@ -1086,6 +1595,8 @@ static int sys_pipe(int *fds)
     memory_set(read_node, 0, sizeof(*read_node));
     memory_set(write_node, 0, sizeof(*write_node));
     mutex_init(&pipe->lock);
+    pipe->readers = 1;
+    pipe->writers = 1;
 
     read_end->pipe = pipe;
     read_end->readable = 1;
@@ -1097,13 +1608,20 @@ static int sys_pipe(int *fds)
     read_node->type = VFS_NODE_PIPE;
     read_node->data = read_end;
     read_node->read = pipe_read;
+    read_node->close = pipe_node_close;
+    read_node->ref_count = 0;
+
     write_node->type = VFS_NODE_PIPE;
     write_node->data = write_end;
     write_node->write = pipe_write;
+    write_node->close = pipe_node_close;
+    write_node->ref_count = 0;
 
     read_fd = task_alloc_fd(task, read_node);
     write_fd = task_alloc_fd(task, write_node);
     if (read_fd < 0 || write_fd < 0) {
+        if (read_fd >= 0) sys_close(read_fd);
+        if (write_fd >= 0) sys_close(write_fd);
         return -1;
     }
 
@@ -1169,6 +1687,26 @@ static uintptr_t sys_brk(uintptr_t addr)
     return task->heap_end;
 }
 
+static int sys_dup(int old_fd)
+{
+    task_t *task = scheduler_current_task();
+
+    if (task == 0 || old_fd < 0 || old_fd >= TASK_MAX_FDS ||
+        task->file_descriptors[old_fd] == 0) {
+        return -1;
+    }
+
+    for (int i = 0; i < TASK_MAX_FDS; i++) {
+        if (task->file_descriptors[i] == 0) {
+            task->file_descriptors[i] = task->file_descriptors[old_fd];
+            task->file_descriptors[i]->ref_count++;
+            return i;
+        }
+    }
+
+    return -1;
+}
+
 static int sys_dup2(int old_fd, int new_fd)
 {
     task_t *task = scheduler_current_task();
@@ -1179,12 +1717,20 @@ static int sys_dup2(int old_fd, int new_fd)
         return -1;
     }
 
+    if (old_fd == new_fd) {
+        return new_fd;
+    }
+
+    if (task->file_descriptors[new_fd] != 0) {
+        sys_close(new_fd);
+    }
+
     task->file_descriptors[new_fd] = task->file_descriptors[old_fd];
-    task->fd_offsets[new_fd] = task->fd_offsets[old_fd];
+    task->file_descriptors[new_fd]->ref_count++;
     return new_fd;
 }
 
-static int sys_close(int fd)
+int sys_close(int fd)
 {
     task_t *task = scheduler_current_task();
 
@@ -1193,13 +1739,12 @@ static int sys_close(int fd)
         return -1;
     }
 
-    vfs_node_t *node = task->file_descriptors[fd];
+    file_description_t *fdesc = task->file_descriptors[fd];
     task->file_descriptors[fd] = 0;
-    task->fd_offsets[fd] = 0;
-
-    if (node->close != 0) {
-        node->close(node);
+    if (fdesc->node != 0) {
+        vfs_node_unlock_by_pid(fdesc->node, task->pid);
     }
+    file_description_unref(fdesc);
     return 0;
 }
 
@@ -1219,6 +1764,9 @@ static uint32_t proc_state_from_task(enum task_state state)
     }
     if (state == TASK_BLOCKED) {
         return PROC_STATE_BLOCKED;
+    }
+    if (state == TASK_STOPPED) {
+        return PROC_STATE_STOPPED;
     }
     return PROC_STATE_ZOMBIE;
 }
@@ -1247,7 +1795,7 @@ static int sys_getprocs(void *user_buffer, size_t max_size)
     uint32_t count = scheduler_task_count();
     for (uint32_t i = 0; i < count && written < capacity; i++) {
         task_t *task = scheduler_task_at(i);
-        if (task == 0 || task->state == TASK_ZOMBIE) {
+        if (task == 0 || task->state == TASK_UNUSED || task->state == TASK_DEAD) {
             continue;
         }
 
@@ -1298,13 +1846,14 @@ static int sys_readdir(int fd, vfs_dir_entry_t *buf, uint32_t count)
         return -1;
     }
 
-    vfs_node_t *node = task->file_descriptors[fd];
-    if (node->type != VFS_NODE_DIRECTORY) {
+    file_description_t *fdesc = task->file_descriptors[fd];
+    vfs_node_t *node = fdesc->node;
+    if (node == 0 || node->type != VFS_NODE_DIRECTORY) {
         return -1;
     }
 
     uint32_t read_count = 0;
-    uint32_t index = (uint32_t)task->fd_offsets[fd];
+    uint32_t index = (uint32_t)fdesc->offset;
 
     while (read_count < count) {
         vfs_dir_entry_t entry;
@@ -1320,7 +1869,7 @@ static int sys_readdir(int fd, vfs_dir_entry_t *buf, uint32_t count)
         index++;
     }
 
-    task->fd_offsets[fd] = index;
+    fdesc->offset = index;
     return (int)read_count;
 }
 
@@ -1394,6 +1943,9 @@ uint64_t syscall_handler(uint64_t number, uint64_t arg1, uint64_t arg2,
         if (arg2 > 0 && !vmm_validate_user_ptr((void *)arg1, (size_t)arg2, 1)) return (uint64_t)-1;
         ret = (uint64_t)sys_getprocs((void *)arg1, (size_t)arg2);
     }
+    else if (number == SYS_DUP) {
+        ret = (uint64_t)sys_dup((int)arg1);
+    }
     else if (number == SYS_DUP2) {
         ret = (uint64_t)sys_dup2((int)arg1, (int)arg2);
     }
@@ -1460,28 +2012,28 @@ uint64_t syscall_handler(uint64_t number, uint64_t arg1, uint64_t arg2,
     }
     else if (number == SYS_CHMOD) {
         if (!vmm_validate_user_string((const char *)arg1, 256)) return (uint64_t)-1;
-        ret = (uint64_t)vfs_chmod((const char *)arg1, (uint32_t)arg2);
+        ret = (uint64_t)sys_chmod((const char *)arg1, (uint32_t)arg2);
     }
     else if (number == SYS_CHOWN) {
         if (!vmm_validate_user_string((const char *)arg1, 256)) return (uint64_t)-1;
-        ret = (uint64_t)vfs_chown((const char *)arg1, (uint32_t)arg2, (uint32_t)arg3);
+        ret = (uint64_t)sys_chown((const char *)arg1, (uint32_t)arg2, (uint32_t)arg3);
     }
     else if (number == SYS_LINK) {
         if (!vmm_validate_user_string((const char *)arg1, 256) || !vmm_validate_user_string((const char *)arg2, 256)) return (uint64_t)-1;
-        ret = (uint64_t)vfs_link((const char *)arg1, (const char *)arg2);
+        ret = (uint64_t)sys_link((const char *)arg1, (const char *)arg2);
     }
     else if (number == SYS_UNLINK) {
         if (!vmm_validate_user_string((const char *)arg1, 256)) return (uint64_t)-1;
-        ret = (uint64_t)vfs_unlink((const char *)arg1);
+        ret = (uint64_t)sys_unlink((const char *)arg1);
     }
     else if (number == SYS_SYMLINK) {
         if (!vmm_validate_user_string((const char *)arg1, 256) || !vmm_validate_user_string((const char *)arg2, 256)) return (uint64_t)-1;
-        ret = (uint64_t)vfs_symlink((const char *)arg1, (const char *)arg2);
+        ret = (uint64_t)sys_symlink((const char *)arg1, (const char *)arg2);
     }
     else if (number == SYS_READLINK) {
         if (!vmm_validate_user_string((const char *)arg1, 256)) return (uint64_t)-1;
         if (arg3 > 0 && !vmm_validate_user_ptr((void *)arg2, (size_t)arg3, 1)) return (uint64_t)-1;
-        ret = (uint64_t)vfs_readlink((const char *)arg1, (char *)arg2, (size_t)arg3);
+        ret = (uint64_t)sys_readlink((const char *)arg1, (char *)arg2, (size_t)arg3);
     }
     else if (number == SYS_MOUNT) {
         if (!vmm_validate_user_string((const char *)arg1, 256) || !vmm_validate_user_string((const char *)arg2, 256) || !vmm_validate_user_string((const char *)arg3, 256)) return (uint64_t)-1;
@@ -1490,6 +2042,67 @@ uint64_t syscall_handler(uint64_t number, uint64_t arg1, uint64_t arg2,
     else if (number == SYS_UMOUNT) {
         if (!vmm_validate_user_string((const char *)arg1, 256)) return (uint64_t)-1;
         ret = (uint64_t)vfs_umount((const char *)arg1);
+    }
+    else if (number == SYS_LSEEK) {
+        ret = (uint64_t)sys_lseek((int)arg1, (long)arg2, (int)arg3);
+    }
+    else if (number == SYS_STAT) {
+        if (!vmm_validate_user_string((const char *)arg1, 256)) return (uint64_t)-1;
+        if (!vmm_validate_user_ptr((void *)arg2, sizeof(struct stat), 1)) return (uint64_t)-1;
+        ret = (uint64_t)sys_stat((const char *)arg1, (struct stat *)arg2);
+    }
+    else if (number == SYS_FSTAT) {
+        if (!vmm_validate_user_ptr((void *)arg2, sizeof(struct stat), 1)) return (uint64_t)-1;
+        ret = (uint64_t)sys_fstat((int)arg1, (struct stat *)arg2);
+    }
+    else if (number == SYS_MKDIR) {
+        if (!vmm_validate_user_string((const char *)arg1, 256)) return (uint64_t)-1;
+        ret = (uint64_t)sys_mkdir((const char *)arg1, (uint32_t)arg2);
+    }
+    else if (number == SYS_RMDIR) {
+        if (!vmm_validate_user_string((const char *)arg1, 256)) return (uint64_t)-1;
+        ret = (uint64_t)sys_rmdir((const char *)arg1);
+    }
+    else if (number == SYS_CHDIR) {
+        if (!vmm_validate_user_string((const char *)arg1, 256)) return (uint64_t)-1;
+        ret = (uint64_t)sys_chdir((const char *)arg1);
+    }
+    else if (number == SYS_GETCWD) {
+        if (arg2 == 0 || !vmm_validate_user_ptr((void *)arg1, (size_t)arg2, 1)) return (uint64_t)-1;
+        ret = (uint64_t)sys_getcwd((char *)arg1, (size_t)arg2);
+    }
+    else if (number == SYS_TRUNCATE) {
+        if (!vmm_validate_user_string((const char *)arg1, 256)) return (uint64_t)-1;
+        ret = (uint64_t)sys_truncate((const char *)arg1, (size_t)arg2);
+    }
+    else if (number == SYS_FTRUNCATE) {
+        ret = (uint64_t)sys_ftruncate((int)arg1, (size_t)arg2);
+    }
+    else if (number == SYS_SYNC) {
+        ret = (uint64_t)sys_sync();
+    }
+    else if (number == SYS_UMASK) {
+        ret = (uint64_t)sys_umask((uint32_t)arg1);
+    }
+    else if (number == SYS_FLOCK) {
+        ret = (uint64_t)sys_flock((int)arg1, (int)arg2);
+    }
+    else if (number == SYS_FCNTL) {
+        ret = (uint64_t)sys_fcntl((int)arg1, (int)arg2, arg3);
+    }
+    else if (number == SYS_SIGACTION) {
+        if (arg2 != 0 && !vmm_validate_user_ptr((const void *)arg2, sizeof(struct sigaction), 0)) return (uint64_t)-1;
+        if (arg3 != 0 && !vmm_validate_user_ptr((void *)arg3, sizeof(struct sigaction), 1)) return (uint64_t)-1;
+        ret = (uint64_t)sys_sigaction((int)arg1, (const struct sigaction *)arg2, (struct sigaction *)arg3);
+    }
+    else if (number == SYS_SIGPROCMASK) {
+        if (arg2 != 0 && !vmm_validate_user_ptr((const void *)arg2, sizeof(sigset_t), 0)) return (uint64_t)-1;
+        if (arg3 != 0 && !vmm_validate_user_ptr((void *)arg3, sizeof(sigset_t), 1)) return (uint64_t)-1;
+        ret = (uint64_t)sys_sigprocmask((int)arg1, (const sigset_t *)arg2, (sigset_t *)arg3);
+    }
+    else if (number == SYS_WAITPID) {
+        if (arg2 != 0 && !vmm_validate_user_ptr((void *)arg2, sizeof(int), 1)) return (uint64_t)-1;
+        ret = (uint64_t)sys_waitpid((int)arg1, (int *)arg2, (int)arg3);
     }
 
     scheduler_handle_syscall_signals(arg6, ret);
@@ -1667,8 +2280,9 @@ void gpf_handler(uint64_t error_code, uint64_t rip, uint64_t cs)
     /* Ring 0 GPF is unrecoverable — kernel panic. */
     __asm__ volatile ("cli");
     klog("\n*** KERNEL PANIC: GENERAL PROTECTION FAULT (INT 0x0D) ***\n");
-    (void)error_code;
-    (void)rip;
+    klog("   RIP: "); klog_hex(rip); klog("\n");
+    klog("   CS:  "); klog_hex(cs);  klog("\n");
+    klog("   Error Code: "); klog_hex(error_code); klog("\n");
 
     for (;;) {
         __asm__ volatile ("hlt");
@@ -1907,6 +2521,7 @@ void kmain(void)
     klog("Heap: kmalloc/kfree inicializados.\n");
     
     vfs_init();
+    bcache_init();
     initrd_init();
     if (ata_init()) {
         ata_vfs_init();

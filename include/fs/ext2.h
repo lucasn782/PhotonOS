@@ -117,6 +117,7 @@ struct ext2_node_data {
 };
 
 int ext2_mount(uint32_t partition_lba);
+int ext2_mount_at(vfs_node_t *mount_point, uint32_t partition_lba);
 int ext2_read_inode(uint32_t inode_num, struct ext2_inode *out_inode);
 int ext2_write_inode(uint32_t inode_num, struct ext2_inode *inode);
 uint32_t ext2_alloc_inode(void);

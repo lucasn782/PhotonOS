@@ -1,6 +1,7 @@
 #include "fs/ext2.h"
 
 #include "ata.h"
+#include "bcache.h"
 #include "heap.h"
 #include "mutex.h"
 #include "serial.h"
@@ -54,12 +55,12 @@ static const char *path_basename(const char *path)
 
 static int ext2_read_block(uint32_t block, uint8_t *buf)
 {
-    return ata_read_sectors(partition_lba + block * (block_size / 512), block_size / 512, buf);
+    return bcache_read_sectors(partition_lba + block * (block_size / 512), block_size / 512, buf);
 }
 
 static int ext2_write_block(uint32_t block, const uint8_t *buf)
 {
-    return ata_write_sectors(partition_lba + block * (block_size / 512), block_size / 512, buf);
+    return bcache_write_sectors(partition_lba + block * (block_size / 512), block_size / 512, buf);
 }
 
 static uint32_t ext2_get_phys_block(struct ext2_inode *inode, uint32_t file_block_num)
@@ -117,7 +118,7 @@ int ext2_read_inode(uint32_t inode_num, struct ext2_inode *out_inode)
     uint8_t *block_buf = kmalloc(block_size);
     if (!block_buf) return 0;
     
-    if (!ata_read_sectors(partition_lba + block * (block_size / 512), block_size / 512, block_buf)) {
+    if (!bcache_read_sectors(partition_lba + block * (block_size / 512), block_size / 512, block_buf)) {
         kfree(block_buf);
         return 0;
     }
@@ -144,14 +145,14 @@ int ext2_write_inode(uint32_t inode_num, struct ext2_inode *inode)
     uint8_t *block_buf = kmalloc(block_size);
     if (!block_buf) return 0;
     
-    if (!ata_read_sectors(partition_lba + block * (block_size / 512), block_size / 512, block_buf)) {
+    if (!bcache_read_sectors(partition_lba + block * (block_size / 512), block_size / 512, block_buf)) {
         kfree(block_buf);
         return 0;
     }
     
     memory_copy(block_buf + offset_in_block, inode, sizeof(struct ext2_inode));
     
-    if (!ata_write_sectors(partition_lba + block * (block_size / 512), block_size / 512, block_buf)) {
+    if (!bcache_write_sectors(partition_lba + block * (block_size / 512), block_size / 512, block_buf)) {
         kfree(block_buf);
         return 0;
     }
@@ -166,37 +167,48 @@ int ext2_vfs_open(vfs_node_t *node)
     return 0;
 }
 
+void ext2_vfs_close(vfs_node_t *node)
+{
+    (void)node;
+}
+
 int ext2_vfs_read(vfs_node_t *node, uint64_t offset, uint32_t size, uint8_t *buffer)
 {
-    if (!node || !node->data || !buffer) return 0;
+    if (!ext2_mounted || node == NULL || node->data == NULL || buffer == NULL) return 0;
+    
     struct ext2_node_data *data = node->data;
+    uint32_t inode_num = data->inode_num;
+    if (inode_num == 0) return 0;
+    
     struct ext2_inode inode;
-    if (!ext2_read_inode(data->inode_num, &inode)) {
-        return 0;
-    }
+    if (!ext2_read_inode(inode_num, &inode)) return 0;
     
-    if (offset >= inode.i_size) {
-        return 0;
-    }
+    if (offset >= inode.i_size) return 0;
     if (offset + size > inode.i_size) {
-        size = inode.i_size - offset;
+        size = (uint32_t)(inode.i_size - offset);
     }
     
+    uint32_t start_block = (uint32_t)(offset / block_size);
+    uint32_t end_block = (uint32_t)((offset + size - 1) / block_size);
     uint32_t bytes_read = 0;
+    
     uint8_t *block_buf = kmalloc(block_size);
     if (!block_buf) return 0;
     
-    while (bytes_read < size) {
-        uint64_t cur_offset = offset + bytes_read;
-        uint32_t file_block = cur_offset / block_size;
-        uint32_t block_offset = cur_offset % block_size;
-        uint32_t chunk_size = block_size - block_offset;
-        if (chunk_size > size - bytes_read) {
-            chunk_size = size - bytes_read;
+    for (uint32_t b = start_block; b <= end_block; b++) {
+        if (!ext2_read_file_block(&inode, b, block_buf)) {
+            break;
         }
         
-        if (!ext2_read_file_block(&inode, file_block, block_buf)) {
-            break;
+        uint32_t block_offset = 0;
+        uint32_t chunk_size = block_size;
+        
+        if (b == start_block) {
+            block_offset = (uint32_t)(offset % block_size);
+            chunk_size = block_size - block_offset;
+        }
+        if (bytes_read + chunk_size > size) {
+            chunk_size = size - bytes_read;
         }
         
         memory_copy(buffer + bytes_read, block_buf + block_offset, chunk_size);
@@ -212,7 +224,7 @@ static int ext2_write_bg_descriptors(void)
     uint32_t bg_desc_block = sb.s_first_data_block + 1;
     uint32_t size_desc_table = num_groups * sizeof(struct ext2_group_desc);
     uint32_t sectors_to_write = (size_desc_table + 511) / 512;
-    return ata_write_sectors(partition_lba + bg_desc_block * (block_size / 512), sectors_to_write, (const uint8_t *)bg_desc);
+    return bcache_write_sectors(partition_lba + bg_desc_block * (block_size / 512), sectors_to_write, (const uint8_t *)bg_desc);
 }
 
 static int ext2_write_superblock(void)
@@ -221,7 +233,7 @@ static int ext2_write_superblock(void)
     if (!sb_buf) return 0;
     memory_zero(sb_buf, 1024);
     memory_copy(sb_buf, &sb, sizeof(struct ext2_superblock));
-    int res = ata_write_sectors(partition_lba + 2, 2, sb_buf);
+    int res = bcache_write_sectors(partition_lba + 2, 2, sb_buf);
     kfree(sb_buf);
     return res;
 }
@@ -533,15 +545,19 @@ static void ext2_mount_dir(vfs_node_t *parent_node, uint32_t inode_num)
     kfree(block_buf);
 }
 
-int ext2_mount(uint32_t partition_lba_val)
+int ext2_mount_at(vfs_node_t *mount_point, uint32_t partition_lba_val)
 {
+    if (mount_point == NULL) {
+        return 0;
+    }
+
     partition_lba = partition_lba_val;
     mutex_init(&ext2_mutex);
     
     uint8_t *sb_buf = kmalloc(1024);
     if (!sb_buf) return 0;
     
-    if (!ata_read_sectors(partition_lba + 2, 2, sb_buf)) {
+    if (!bcache_read_sectors(partition_lba + 2, 2, sb_buf)) {
         kfree(sb_buf);
         klog("EXT2: Falha ao ler o superbloco.\n");
         return 0;
@@ -568,7 +584,7 @@ int ext2_mount(uint32_t partition_lba_val)
     }
     
     uint32_t bg_desc_block = sb.s_first_data_block + 1;
-    if (!ata_read_sectors(partition_lba + bg_desc_block * (block_size / 512), sectors_to_read, (uint8_t *)bg_desc)) {
+    if (!bcache_read_sectors(partition_lba + bg_desc_block * (block_size / 512), sectors_to_read, (uint8_t *)bg_desc)) {
         kfree(bg_desc);
         bg_desc = NULL;
         klog("EXT2: Falha ao ler descritores de grupo.\n");
@@ -578,27 +594,28 @@ int ext2_mount(uint32_t partition_lba_val)
     ext2_mounted = 1;
     klog("EXT2: Sistema de ficheiros montado com sucesso.\n");
     
-    vfs_node_t *root = vfs_root();
-    if (root != 0) {
-        root->size = 0;
-        struct ext2_inode root_inode;
-        if (ext2_read_inode(2, &root_inode)) {
-            root->size = root_inode.i_size;
-        }
-        struct ext2_node_data *root_data = kmalloc(sizeof(struct ext2_node_data));
-        if (root_data != 0) {
-            root_data->inode_num = 2;
-            root->data = root_data;
-        }
-        root->read = ext2_vfs_read;
-        root->write = ext2_vfs_write;
-        root->open = ext2_vfs_open;
-        root->readdir = ext2_vfs_readdir;
-        
-        ext2_mount_dir(root, 2);
+    mount_point->size = 0;
+    struct ext2_inode root_inode;
+    if (ext2_read_inode(2, &root_inode)) {
+        mount_point->size = root_inode.i_size;
     }
+    struct ext2_node_data *root_data = kmalloc(sizeof(struct ext2_node_data));
+    if (root_data != 0) {
+        root_data->inode_num = 2;
+        mount_point->data = root_data;
+    }
+    mount_point->read = ext2_vfs_read;
+    mount_point->write = ext2_vfs_write;
+    mount_point->open = ext2_vfs_open;
+    mount_point->readdir = ext2_vfs_readdir;
     
+    ext2_mount_dir(mount_point, 2);
     return 1;
+}
+
+int ext2_mount(uint32_t partition_lba_val)
+{
+    return ext2_mount_at(vfs_root(), partition_lba_val);
 }
 
 uint32_t ext2_alloc_inode(void)

@@ -31,10 +31,10 @@ void apic_write(uint32_t reg, uint32_t value) {
 }
 
 void apic_init(void) {
-    // 1. Disable legacy PIC by masking all interrupts (sending 0xFF to 0x21 and 0xA1)
-    outb(0x21, 0xFF);
+    // 1. Configure legacy PIC masks (Timer IRQ0, Keyboard IRQ1, Cascade IRQ2 on PIC1; Mouse IRQ12 on PIC2)
+    outb(0x21, 0xF8);
     io_wait();
-    outb(0xA1, 0xFF);
+    outb(0xA1, 0xEF);
     io_wait();
 
     // 2. Get Local APIC Base Address from MSR 0x1B
@@ -60,9 +60,9 @@ void apic_init_ap(void) {
     uint32_t sivr = apic_read(APIC_REG_SIVR);
     apic_write(APIC_REG_SIVR, sivr | 0x100 | 0xFF);
 
-    // Configure LINT0 and LINT1 on secondary cores
-    apic_write(APIC_REG_LVT_LINT0, 0x700);
-    apic_write(APIC_REG_LVT_LINT1, 0x400);
+    // Mask LINT0 and LINT1 on secondary cores (bit 16 = 0x10000) so legacy PIC interrupts only route to BSP
+    apic_write(APIC_REG_LVT_LINT0, 0x10000);
+    apic_write(APIC_REG_LVT_LINT1, 0x10000);
 }
 
 int apic_is_enabled(void) {

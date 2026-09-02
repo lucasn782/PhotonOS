@@ -14,6 +14,7 @@ enum proc_state {
     PROC_STATE_WAITING,
     PROC_STATE_BLOCKED,
     PROC_STATE_ZOMBIE,
+    PROC_STATE_STOPPED,
 };
 
 typedef struct proc_info {

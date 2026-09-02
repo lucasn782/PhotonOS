@@ -51,9 +51,16 @@ typedef struct __attribute__((packed)) fat16_entry {
     uint32_t size;
 } fat16_entry_t;
 
+struct vfs_node;
+
 int fat16_mount(uint32_t partition_lba);
+int fat16_is_mounted(void);
 int fat16_read_file(const char *filename, void *buffer);
 int fat16_write_file(const char *filename, const void *buffer, size_t size);
 int fat16_vfs_create(const char *path);
+int fat16_vfs_mkdir(const char *path, uint32_t mode);
+int fat16_vfs_rmdir(const char *path);
+int fat16_vfs_unlink(const char *path);
+int fat16_vfs_truncate(struct vfs_node *node, size_t length);
 
 #endif

@@ -4,6 +4,7 @@
 #include <stdint.h>
 
 #include "fat16.h"
+#include "bcache.h"
 #include "mutex.h"
 #include "serial.h"
 #include "vfs.h"
@@ -208,7 +209,7 @@ static int ata_block_read(vfs_node_t *node, uint64_t offset, uint32_t size,
     if ((offset % 512U) != 0 || (size % 512U) != 0 || size == 0) {
         return 0;
     }
-    if (!ata_read_sectors((uint32_t)(offset / 512U), (uint8_t)(size / 512U),
+    if (!bcache_read_sectors((uint32_t)(offset / 512U), (uint32_t)(size / 512U),
         buffer)) {
         return 0;
     }
@@ -224,7 +225,7 @@ static size_t ata_block_write(vfs_node_t *node, size_t offset, size_t size,
     if ((offset % 512U) != 0 || (size % 512U) != 0 || size == 0) {
         return 0;
     }
-    if (!ata_write_sectors((uint32_t)(offset / 512U), (uint8_t)(size / 512U),
+    if (!bcache_write_sectors((uint32_t)(offset / 512U), (uint32_t)(size / 512U),
         buffer)) {
         return 0;
     }

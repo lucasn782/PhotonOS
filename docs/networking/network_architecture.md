@@ -121,5 +121,5 @@ O PhotonOS implementa a infraestrutura base do protocolo TCP (RFC 793 / RFC 1071
 *   **Máquina de Estados RFC 793**: Definição completa dos 10 estados (`CLOSED`, `LISTEN`, `SYN_SENT`, `SYN_RECEIVED`, `ESTABLISHED`, `FIN_WAIT1`, `FIN_WAIT2`, `CLOSE_WAIT`, `LAST_ACK`, `TIME_WAIT`).
 *   **Checksum TCP RFC 793 / 1071**: Soma de verificação com pseudo-cabeçalho IPv4 (src_ip, dest_ip, proto=6, tcp_length) em palavras de 16-bits.
 *   **Parser e Serializador**: Funções reusáveis `tcp_parse_header` e `tcp_serialize_header` com validação de offset e flags.
-*   **Integração Socket Stream**: Suporte a `socket(AF_INET, SOCK_STREAM, IP_PROTO_TCP)` com alocação automática de PCB.
+*   **Integração Socket Stream**: Suporte a `socket(AF_INET, SOCK_STREAM, IPPROTO_TCP)` com alocação automática de PCB, gerenciamento de descritores no contexto do kernel e suporte transparente em Ring 3.
 

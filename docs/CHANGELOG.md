@@ -3,6 +3,38 @@
 Histórico completo de mudanças do sistema operacional, organizado por versão.
 Convenções: cada entrada lista data, commit (quando aplicável), resumo, arquivos alterados, bugs corrigidos, novas funcionalidades, breaking changes e impacto arquitetural.
 
+## `v4.3` — POSIX Signals, Process Lifecycle & Pipe IPC ⚡
+**Data:** 2026-09-01
+**Status:** Released
+
+### Novas Funcionalidades
+- **Subsistema de Sinais POSIX:** Implementação de `sigaction`, `sigprocmask`, envio de sinais via `kill`/`sys_kill`, tratamento assíncrono em Ring 3 via trampoline (`SIGNAL_TRAMPOLINE_ADDR`) e retorno seguro `sys_sigreturn`.
+- **Ciclo de Vida de Processos Robusto:** Estados `TASK_READY`, `TASK_RUNNING`, `TASK_SLEEPING`, `TASK_WAITING`, `TASK_BLOCKED`, `TASK_STOPPED`, `TASK_ZOMBIE`, `TASK_DEAD`, gerador monotônico de PID, reparenting automático de filhos órfãos para o PID 1 com emissão atômica de `SIGCHLD`, e colheita por `waitpid` com suporte a `WNOHANG`.
+- **Pipes Anônimos (IPC):** Buffer circular de 4 KiB com rastreamento atômico de descritores de leitura e escrita, emissão automática de `SIGPIPE` e retorno `-1` em escritas em pipes órfãos, e sinalização de EOF (`0`) em leituras.
+- **Camada VFS Expandida e Buffer Cache (`bcache`):** Buffer cache de 32 KiB (64 blocos), chamadas `getcwd`, `chdir`, caminhos relativos, `truncate`, `ftruncate`, `dup`, `dup2`, `fcntl` (`F_DUPFD`, `F_GETFL`, `F_SETFL`), `flock` e `umask`.
+
+---
+
+## `v4.2.2` — BIOS LBA 64 KiB Window Bootloader Stabilization & Recovery 🚀
+**Data:** 2026-09-01
+**Status:** Released
+
+### Correções de Bugs (Bug Fixes)
+- **Correção do Carregamento LBA no Bootloader BIOS:** Corrigida regressão em que o kernel ultrapassava 256 setores e o terceiro pacote DAP solicitava 224 setores em uma única operação `INT 13h, AH=42h`, excedendo o limite de 64 KiB do offset de 16 bits em Modo Real.
+- **Fragmentação em 4 Janelas DAP de 128 Setores:** O carregamento de 480 setores (240 KiB) foi particionado em 4 janelas (`128 + 128 + 128 + 96` setores) nos segmentos `0x0800`, `0x1800`, `0x2800` e `0x3800`, eliminando qualquer overflow de buffer e garantindo leitura contínua em `0x08000`–`0x43FFF`.
+- **Prevenção de Falha em Fallback CHS para Discos Rígidos:** Documentada e mitigada a premissa de geometria de disquete (`SECTORS_TRACK = 18`) que causava travamento em `disk_error` quando o dispositivo de boot era apresentado como disco rígido (`DL=0x80`).
+- **Validação de Não-Regressão de Boot:** Validados 10 boots consecutivos automatizados (10/10 PASS), modo manual QEMU com `-d int,cpu_reset,guest_errors` e `make run-fat16`.
+
+### Arquivos Alterados
+| Arquivo | Tipo | Resumo |
+|---------|------|--------|
+| `src/boot/boot.asm` | Corrigido | Particionamento do LBA em 4 pacotes DAP de até 128 setores cada |
+| `Makefile` | Atualizado | Ajuste de `KERNEL_SECTORS := 480` e validação estrita de tamanho |
+| `docs/BOOT.md` | **Novo** | Especificação técnica completa da arquitetura do bootloader multiestágio |
+| `docs/BOOT_TROUBLESHOOTING.md` | **Novo** | Análise de causa raiz da regressão LBA e guia de interpretação de traces do QEMU |
+| `docs/architecture/boot_process.md` | Atualizado | Sincronização do fluxo de boot com a implementação real |
+| `docs/DOCUMENTATION_INDEX.md` | Atualizado | Inclusão de referências para `BOOT.md` e `BOOT_TROUBLESHOOTING.md` |
+
 ---
 
 ## `v4.3-fs` — Filesystem Infrastructure, Permissions & Mount Manager (Sprint 3) 📂

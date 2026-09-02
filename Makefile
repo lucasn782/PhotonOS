@@ -24,7 +24,7 @@ USER_PING_OBJ := build/user/ping_blob.o
 IMG := build/photon.img
 DISK_IMG := build/disk.img
 FLOPPY_BYTES := 1474560
-KERNEL_SECTORS := 352
+KERNEL_SECTORS := 480
 KERNEL_MAX_BYTES := $(shell expr $(KERNEL_SECTORS) \* 512)
 KERNEL_OBJS := build/boot/kernel_asm.o build/user/shell_blob.o build/user/hello_blob.o build/user/upper_blob.o \
                build/user/rev_blob.o build/user/hang_blob.o build/user/spin_blob.o build/user/ping_blob.o \
@@ -33,7 +33,7 @@ KERNEL_OBJS := build/boot/kernel_asm.o build/user/shell_blob.o build/user/hello_
                build/kernel/vfs.o build/kernel/initrd.o build/kernel/elf.o build/kernel/net.o build/kernel/tcp.o build/drivers/fat16.o \
                build/drivers/ata.o build/drivers/pci.o build/drivers/e1000.o \
                build/kernel/apic.o build/kernel/smp.o build/kernel/trampoline_blob.o \
-               build/fs/ext2.o
+               build/kernel/bcache.o build/fs/ext2.o
 
 CFLAGS := -ffreestanding -m64 -nostdlib -mno-red-zone -fno-pic -fno-pie \
           -fstack-protector-strong -Wall -Wextra -Iinclude
@@ -110,7 +110,10 @@ build/kernel/net.o: src/kernel/net.c include/net.h include/tcp.h include/e1000.h
 build/kernel/tcp.o: src/kernel/tcp.c include/tcp.h include/net.h include/heap.h include/mutex.h include/scheduler.h include/serial.h include/sys/socket.h
 	@mkdir -p $(dir $@) && $(CC) $(CFLAGS) -c $< -o $@
 
-build/drivers/fat16.o: src/drivers/fat16.c include/fat16.h include/ata.h include/heap.h include/serial.h include/vfs.h
+build/kernel/bcache.o: src/kernel/bcache.c include/bcache.h include/ata.h include/mutex.h include/serial.h
+	@mkdir -p $(dir $@) && $(CC) $(CFLAGS) -c $< -o $@
+
+build/drivers/fat16.o: src/drivers/fat16.c include/fat16.h include/ata.h include/bcache.h include/heap.h include/serial.h include/vfs.h
 	@mkdir -p $(dir $@) && $(CC) $(CFLAGS) -c $< -o $@
 
 build/drivers/ata.o: src/drivers/ata.c include/ata.h include/fat16.h include/serial.h include/vfs.h include/fs/ext2.h

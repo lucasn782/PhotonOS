@@ -4,6 +4,9 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#define VMM_USER_BASE 0x1000ULL
+#define VMM_USER_LIMIT 0x0000800000000000ULL
+
 #define PAGE_PRESENT  (1U << 0)
 #define PAGE_WRITABLE (1U << 1)
 #define PAGE_USER     (1U << 2)

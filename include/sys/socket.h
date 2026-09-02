@@ -17,6 +17,10 @@
 
 #define IP_PROTO_TCP 6U
 
+#define IPPROTO_ICMP IP_PROTO_ICMP
+#define IPPROTO_UDP  IP_PROTO_UDP
+#define IPPROTO_TCP  IP_PROTO_TCP
+
 struct sockaddr {
     uint16_t sa_family;
     char sa_data[14];

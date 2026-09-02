@@ -1,8 +1,10 @@
 #include "fat16.h"
 
 #include "ata.h"
+#include "bcache.h"
 #include "heap.h"
 #include "mutex.h"
+#include "scheduler.h"
 #include "serial.h"
 #include "vfs.h"
 
@@ -142,12 +144,12 @@ static int is_fat16_partition_type(uint8_t type)
 
 static int read_sector(uint32_t lba, uint8_t *buffer)
 {
-    return ata_read_sectors(lba, 1, buffer);
+    return bcache_read_sector(lba, buffer);
 }
 
 static int write_sector(uint32_t lba, const uint8_t *buffer)
 {
-    return ata_write_sectors(lba, 1, buffer);
+    return bcache_write_sector(lba, buffer);
 }
 
 static uint32_t root_dir_sectors(const fat16_bpb_t *bpb)
@@ -387,29 +389,36 @@ static int make_83_name(const char *filename, char out[11])
     const char *name = path_basename(filename);
     size_t input = 0;
     size_t output = 0;
+    size_t base_length = 0;
+    size_t ext_length = 0;
 
     for (size_t i = 0; i < 11; i++) {
         out[i] = ' ';
     }
 
-    while (name[input] != '\0' && name[input] != '.' &&
-        output < 8) {
-        out[output++] = to_upper(name[input++]);
-    }
-
     while (name[input] != '\0' && name[input] != '.') {
-        input++;
+        if (base_length >= 8 || name[input] == ' ' || name[input] == '/' ||
+            (uint8_t)name[input] < 0x20U) {
+            return 0;
+        }
+        out[output++] = to_upper(name[input++]);
+        base_length++;
     }
 
     if (name[input] == '.') {
         input++;
         output = 8;
-        while (name[input] != '\0' && output < 11) {
+        while (name[input] != '\0') {
+            if (ext_length >= 3 || name[input] == '.' || name[input] == ' ' ||
+                name[input] == '/' || (uint8_t)name[input] < 0x20U) {
+                return 0;
+            }
             out[output++] = to_upper(name[input++]);
+            ext_length++;
         }
     }
 
-    return name[0] != '\0';
+    return base_length != 0;
 }
 
 static int entry_matches_name(const fat16_entry_t *entry, const char *filename)
@@ -961,6 +970,7 @@ static void mount_file(vfs_node_t *parent, const char *name,
     node->read = fat16_read;
     node->open = fat16_open;
     node->write = fat16_vfs_write;
+    node->truncate = fat16_vfs_truncate;
 }
 
 static int get_subdir_entry(uint16_t first_cluster, uint32_t entry_index, fat16_entry_t *out_entry)
@@ -993,6 +1003,304 @@ static int get_subdir_entry(uint16_t first_cluster, uint32_t entry_index, fat16_
     fat16_entry_t *entries = (fat16_entry_t *)sector_buffer;
     *out_entry = entries[index_in_sector];
     return 1;
+}
+
+static int fat16_dir_entry_unlocked(vfs_node_t *dir, uint32_t entry_index,
+    fat16_entry_t *entry, struct fat16_entry_location *location)
+{
+    uint32_t entries_per_sector = FAT16_SECTOR_SIZE / sizeof(fat16_entry_t);
+    uint32_t sector_lba;
+    uint32_t index_in_sector;
+
+    if (dir == 0 || entry == 0) return -1;
+    if (dir == vfs_root()) {
+        if (entry_index >= fat16.bpb.root_entry_count) return 0;
+        sector_lba = fat16.partition_lba + fat16.root_lba +
+            (entry_index / entries_per_sector);
+        index_in_sector = entry_index % entries_per_sector;
+    } else {
+        struct fat16_node_data *data = dir->data;
+        uint32_t entries_per_cluster;
+        uint32_t cluster_skip;
+        uint32_t index_in_cluster;
+        uint16_t cluster;
+
+        if (dir->type != VFS_NODE_DIRECTORY || data == 0 ||
+            !cluster_is_data(data->first_cluster)) return -1;
+        entries_per_cluster = entries_per_sector * fat16.bpb.sectors_per_cluster;
+        if (entries_per_cluster == 0 || entry_index >=
+            max_data_cluster() * entries_per_cluster) return 0;
+        cluster_skip = entry_index / entries_per_cluster;
+        index_in_cluster = entry_index % entries_per_cluster;
+        cluster = data->first_cluster;
+        for (uint32_t i = 0; i < cluster_skip; i++) {
+            uint16_t next;
+            if (!read_fat_entry(cluster, &next)) return -1;
+            if (!cluster_is_data(next) || next >= FAT16_EOC ||
+                next == FAT16_BAD_CLUSTER) return 0;
+            cluster = next;
+        }
+        sector_lba = cluster_to_lba(cluster) +
+            (index_in_cluster / entries_per_sector);
+        index_in_sector = index_in_cluster % entries_per_sector;
+    }
+    if (!read_sector(sector_lba, sector_buffer)) return -1;
+    *entry = ((fat16_entry_t *)sector_buffer)[index_in_sector];
+    if (location != 0) {
+        location->sector_lba = sector_lba;
+        location->index = index_in_sector;
+    }
+    return 1;
+}
+
+static int fat16_entry_is_visible(const fat16_entry_t *entry)
+{
+    return (uint8_t)entry->name[0] != 0x00U &&
+        (uint8_t)entry->name[0] != FAT16_DELETED_ENTRY &&
+        (entry->attributes & FAT16_ATTR_VOLUME_ID) == 0 &&
+        (entry->attributes & FAT16_ATTR_LONG_NAME) != FAT16_ATTR_LONG_NAME;
+}
+
+static int fat16_lookup_dir_entry_unlocked(vfs_node_t *dir, const char *name,
+    fat16_entry_t *entry_out, struct fat16_entry_location *location_out)
+{
+    for (uint32_t index = 0;; index++) {
+        fat16_entry_t entry;
+        struct fat16_entry_location location;
+        int result = fat16_dir_entry_unlocked(dir, index, &entry, &location);
+        if (result <= 0 || (uint8_t)entry.name[0] == 0x00U) return 0;
+        if (fat16_entry_is_visible(&entry) && entry_matches_name(&entry, name)) {
+            if (entry_out != 0) *entry_out = entry;
+            if (location_out != 0) *location_out = location;
+            return 1;
+        }
+    }
+}
+
+static int fat16_find_free_dir_slot_unlocked(vfs_node_t *dir,
+    struct fat16_entry_location *location_out)
+{
+    for (uint32_t index = 0;; index++) {
+        fat16_entry_t entry;
+        struct fat16_entry_location location;
+        int result = fat16_dir_entry_unlocked(dir, index, &entry, &location);
+        if (result <= 0) return 0;
+        if ((uint8_t)entry.name[0] == 0x00U ||
+            (uint8_t)entry.name[0] == FAT16_DELETED_ENTRY) {
+            *location_out = location;
+            return 1;
+        }
+    }
+}
+
+static int fat16_store_dir_entry_unlocked(
+    const struct fat16_entry_location *location, const fat16_entry_t *entry)
+{
+    if (location == 0 || entry == 0 ||
+        location->index >= FAT16_SECTOR_SIZE / sizeof(fat16_entry_t) ||
+        !read_sector(location->sector_lba, sector_buffer)) return 0;
+    ((fat16_entry_t *)sector_buffer)[location->index] = *entry;
+    return write_sector(location->sector_lba, sector_buffer);
+}
+
+static int fat16_directory_empty_unlocked(vfs_node_t *dir)
+{
+    for (uint32_t index = 0;; index++) {
+        fat16_entry_t entry;
+        int result = fat16_dir_entry_unlocked(dir, index, &entry, 0);
+        if (result <= 0 || (uint8_t)entry.name[0] == 0x00U) return result >= 0;
+        if (fat16_entry_is_visible(&entry)) {
+            char name[VFS_NAME_MAX];
+            entry_to_vfs_name(&entry, name);
+            if (!(name[0] == '.' && (name[1] == '\0' ||
+                (name[1] == '.' && name[2] == '\0')))) return 0;
+        }
+    }
+}
+
+static int fat16_split_path(const char *path, vfs_node_t **parent_out,
+    char name[VFS_NAME_MAX])
+{
+    size_t length = 0;
+    size_t last_slash = 0;
+    size_t name_start;
+    char parent_path[VFS_NAME_MAX];
+
+    if (path == 0 || parent_out == 0 || name == 0) return 0;
+    while (path[length] != '\0') {
+        if (path[length] == '/') last_slash = length;
+        length++;
+    }
+    name_start = (last_slash == 0 && path[0] != '/') ? 0 : last_slash + 1;
+    if (length == 0 || name_start >= length || length - name_start >= VFS_NAME_MAX) {
+        return 0;
+    }
+    if (last_slash == 0) {
+        parent_path[0] = '/';
+        parent_path[1] = '\0';
+    } else {
+        if (last_slash >= sizeof(parent_path)) return 0;
+        for (size_t i = 0; i < last_slash; i++) parent_path[i] = path[i];
+        parent_path[last_slash] = '\0';
+    }
+    for (size_t i = 0; i < length - name_start; i++) name[i] = path[name_start + i];
+    name[length - name_start] = '\0';
+    *parent_out = vfs_find(parent_path);
+    return *parent_out != 0 && (*parent_out == vfs_root() ||
+        ((*parent_out)->type == VFS_NODE_DIRECTORY && (*parent_out)->data != 0));
+}
+
+static int fat16_readdir(vfs_node_t *node, uint32_t index, vfs_dir_entry_t *entry);
+
+static int fat16_vfs_create_path(const char *path)
+{
+    char name[VFS_NAME_MAX];
+    vfs_node_t *parent;
+    fat16_entry_t entry;
+    struct fat16_entry_location location;
+    int result = -1;
+
+    if (!fat16.mounted || !fat16_split_path(path, &parent, name)) return -1;
+    mutex_lock(&fat16_mutex);
+    if (fat16_lookup_dir_entry_unlocked(parent, name, &entry, &location)) {
+        result = (entry.attributes & FAT16_ATTR_DIRECTORY) ? -1 : 0;
+    } else if (fat16_find_free_dir_slot_unlocked(parent, &location) &&
+        fill_entry(&entry, name, 0, 0) &&
+        fat16_store_dir_entry_unlocked(&location, &entry)) {
+        result = 0;
+    }
+    mutex_unlock(&fat16_mutex);
+    if (result != 0) return -1;
+
+    vfs_node_t *node = vfs_find(path);
+    if (node == 0) {
+        mount_file(parent, name, &entry, &location);
+        node = vfs_find(path);
+    }
+    if (node != 0) {
+        task_t *task = scheduler_current_task();
+        uint32_t umask = task ? task->umask : 0022;
+        node->mode = (0666 & ~umask) & 0777;
+        node->uid = task ? task->uid : 0;
+        node->gid = task ? task->gid : 0;
+    }
+    return node != 0 && node->type == VFS_NODE_FILE ? 0 : -1;
+}
+
+static void fat16_init_dot_entry(fat16_entry_t *entry, int parent,
+    uint16_t cluster)
+{
+    memory_zero(entry, sizeof(*entry));
+    for (size_t i = 0; i < 8; i++) entry->name[i] = ' ';
+    for (size_t i = 0; i < 3; i++) entry->ext[i] = ' ';
+    entry->name[0] = '.';
+    if (parent) entry->name[1] = '.';
+    entry->attributes = FAT16_ATTR_DIRECTORY;
+    entry->starting_cluster = cluster;
+}
+
+static int fat16_vfs_mkdir_path(const char *path, uint32_t mode)
+{
+    char name[VFS_NAME_MAX];
+    vfs_node_t *parent;
+    fat16_entry_t entry;
+    fat16_entry_t dot;
+    fat16_entry_t dotdot;
+    struct fat16_entry_location location;
+    uint16_t cluster = 0;
+    uint16_t parent_cluster = 0;
+    int result = -1;
+
+    if (!fat16.mounted || !fat16_split_path(path, &parent, name)) return -1;
+    mutex_lock(&fat16_mutex);
+    if (fat16_lookup_dir_entry_unlocked(parent, name, 0, 0) ||
+        !allocate_cluster_unlocked(&cluster)) goto done;
+    if (parent != vfs_root()) parent_cluster =
+        ((struct fat16_node_data *)parent->data)->first_cluster;
+    fat16_init_dot_entry(&dot, 0, cluster);
+    fat16_init_dot_entry(&dotdot, 1, parent_cluster);
+    memory_zero(sector_buffer, FAT16_SECTOR_SIZE);
+    ((fat16_entry_t *)sector_buffer)[0] = dot;
+    ((fat16_entry_t *)sector_buffer)[1] = dotdot;
+    if (!write_sector(cluster_to_lba(cluster), sector_buffer) ||
+        !fat16_find_free_dir_slot_unlocked(parent, &location) ||
+        !fill_entry(&entry, name, cluster, 0)) goto rollback;
+    entry.attributes = FAT16_ATTR_DIRECTORY;
+    if (!fat16_store_dir_entry_unlocked(&location, &entry)) goto rollback;
+    result = 0;
+    goto done;
+rollback:
+    (void)free_chain_from(cluster);
+done:
+    mutex_unlock(&fat16_mutex);
+    if (result != 0) return -1;
+
+    vfs_node_t *node = vfs_find(path);
+    if (node == 0) node = vfs_create_node(parent, name, VFS_NODE_DIRECTORY);
+    if (node == 0) return -1;
+    task_t *task = scheduler_current_task();
+    uint32_t umask = task ? task->umask : 0022;
+    node->mode = mode ? ((mode & ~umask) & 0777) : ((0777 & ~umask) & 0777);
+    node->uid = task ? task->uid : 0;
+    node->gid = task ? task->gid : 0;
+    node->data = create_node_data(&entry, &location);
+    if (node->data == 0) return -1;
+    node->size = 0;
+    node->readdir = fat16_readdir;
+    return 0;
+}
+
+static int fat16_vfs_rmdir_path(const char *path)
+{
+    char name[VFS_NAME_MAX];
+    vfs_node_t *parent;
+    fat16_entry_t entry;
+    struct fat16_entry_location location;
+    struct fat16_node_data data;
+    vfs_node_t temporary;
+    int result = -1;
+
+    if (!fat16.mounted || !fat16_split_path(path, &parent, name)) return -1;
+    mutex_lock(&fat16_mutex);
+    if (!fat16_lookup_dir_entry_unlocked(parent, name, &entry, &location) ||
+        (entry.attributes & FAT16_ATTR_DIRECTORY) == 0) goto done;
+    memory_zero(&temporary, sizeof(temporary));
+    data.first_cluster = entry.starting_cluster;
+    temporary.type = VFS_NODE_DIRECTORY;
+    temporary.data = &data;
+    if (!fat16_directory_empty_unlocked(&temporary)) goto done;
+    entry.name[0] = (char)FAT16_DELETED_ENTRY;
+    if (!fat16_store_dir_entry_unlocked(&location, &entry)) goto done;
+    if (cluster_is_data(data.first_cluster) && !free_chain_from(data.first_cluster)) {
+        goto done;
+    }
+    result = 0;
+done:
+    mutex_unlock(&fat16_mutex);
+    return result;
+}
+
+static int fat16_vfs_unlink_path(const char *path)
+{
+    char name[VFS_NAME_MAX];
+    vfs_node_t *parent;
+    fat16_entry_t entry;
+    struct fat16_entry_location location;
+    int result = -1;
+
+    if (!fat16.mounted || !fat16_split_path(path, &parent, name)) return -1;
+    mutex_lock(&fat16_mutex);
+    if (!fat16_lookup_dir_entry_unlocked(parent, name, &entry, &location) ||
+        (entry.attributes & FAT16_ATTR_DIRECTORY) != 0) goto done;
+    entry.name[0] = (char)FAT16_DELETED_ENTRY;
+    if (!fat16_store_dir_entry_unlocked(&location, &entry)) goto done;
+    if (cluster_is_data(entry.starting_cluster) && !free_chain_from(entry.starting_cluster)) {
+        goto done;
+    }
+    result = 0;
+done:
+    mutex_unlock(&fat16_mutex);
+    return result;
 }
 
 static int fat16_readdir(vfs_node_t *node, uint32_t index, vfs_dir_entry_t *entry)
@@ -1273,6 +1581,11 @@ int fat16_mount(uint32_t partition_lba)
     return 1;
 }
 
+int fat16_is_mounted(void)
+{
+    return fat16.mounted;
+}
+
 int fat16_read_file(const char *filename, void *buffer)
 {
     if (!fat16.mounted || filename == 0 || buffer == 0) {
@@ -1483,51 +1796,59 @@ done:
 
 int fat16_vfs_create(const char *path)
 {
-    const char empty = '\0';
-    fat16_entry_t entry;
-    struct fat16_entry_location location = {0};
-    const char *name;
+    return fat16_vfs_create_path(path);
+}
 
-    if (!fat16.mounted || path == 0) {
+int fat16_vfs_mkdir(const char *path, uint32_t mode)
+{
+    return fat16_vfs_mkdir_path(path, mode);
+}
+
+int fat16_vfs_rmdir(const char *path)
+{
+    return fat16_vfs_rmdir_path(path);
+}
+
+int fat16_vfs_unlink(const char *path)
+{
+    return fat16_vfs_unlink_path(path);
+}
+
+int fat16_vfs_truncate(vfs_node_t *node, size_t length)
+{
+    if (node == 0 || node->type != VFS_NODE_FILE) {
+        return -1;
+    }
+    struct fat16_node_data *data = node->data;
+    if (data == 0) {
         return -1;
     }
 
-    name = path_basename(path);
-    if (name[0] == '\0') {
-        return -1;
-    }
-
-    if (fat16_write_file(name, &empty, 0) < 0) {
+    if (!fat16.mounted || length > 0xFFFFFFFFULL) {
         return -1;
     }
 
     mutex_lock(&fat16_mutex);
-    int found = lookup_root_entry(name, &entry, &location);
-    mutex_unlock(&fat16_mutex);
-    if (!found) {
+
+    uint32_t req_clusters = file_clusters_required(length);
+    if (req_clusters == 0xFFFFFFFFU) {
+        mutex_unlock(&fat16_mutex);
         return -1;
     }
 
-    vfs_node_t *node = vfs_find(path);
-    if (node == 0) {
-        mount_file(vfs_root(), name, &entry, &location);
-        node = vfs_find(path);
+    if (!resize_chain_unlocked(&data->first_cluster, req_clusters)) {
+        mutex_unlock(&fat16_mutex);
+        return -1;
     }
 
-    if (node != 0 && node->type == VFS_NODE_FILE) {
-        struct fat16_node_data *data = node->data;
+    data->size = (uint32_t)length;
+    node->size = length;
 
-        if (data != 0) {
-            data->first_cluster = entry.starting_cluster;
-            data->size = entry.size;
-            data->dir_entry_lba = location.sector_lba;
-            data->dir_entry_index = location.index;
-        }
-        node->size = entry.size;
-        node->read = fat16_read;
-        node->open = fat16_open;
-        node->write = fat16_vfs_write;
+    if (!update_entry_unlocked(data)) {
+        mutex_unlock(&fat16_mutex);
+        return -1;
     }
 
+    mutex_unlock(&fat16_mutex);
     return 0;
 }

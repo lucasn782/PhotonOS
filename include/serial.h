@@ -4,6 +4,8 @@
 void serial_init(void);
 void serial_putc(char c);
 void serial_print(char *str);
+int serial_received(void);
+char serial_getc(void);
 void klog(char *msg);
 
 #endif

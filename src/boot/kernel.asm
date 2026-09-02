@@ -91,12 +91,11 @@ _start:
     je .vbe_ok
 
 .vbe_fail:
-    mov ax, 0xB800
-    mov es, ax
-    mov word [es:0], 0x4F56 ; Red 'V'
-.vbe_halt:
-    hlt
-    jmp .vbe_halt
+    mov dword [boot_params], 0
+    mov word [boot_params + 4], 0
+    mov word [boot_params + 6], 0
+    mov word [boot_params + 8], 0
+    jmp .vbe_ok
 
 .vbe_ok:
     xor ax, ax

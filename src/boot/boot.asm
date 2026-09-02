@@ -19,11 +19,13 @@
 KERNEL_SEG     equ 0x0800
 KERNEL_SEG2    equ 0x1800
 KERNEL_SEG3    equ 0x2800
+KERNEL_SEG4    equ 0x3800
 KERNEL_OFF     equ 0x0000
-KERNEL_SECTORS equ 352
+KERNEL_SECTORS equ 480
 KERNEL_FIRST_SECTORS equ 128
 KERNEL_SECOND_SECTORS equ 128
-KERNEL_THIRD_SECTORS equ KERNEL_SECTORS - KERNEL_FIRST_SECTORS - KERNEL_SECOND_SECTORS
+KERNEL_THIRD_SECTORS equ 128
+KERNEL_FOURTH_SECTORS equ KERNEL_SECTORS - KERNEL_FIRST_SECTORS - KERNEL_SECOND_SECTORS - KERNEL_THIRD_SECTORS
 SECTORS_TRACK  equ 18
 
 start:
@@ -89,7 +91,15 @@ load_kernel_lba:
     pop ds
     jc .fail
 
-    mov si, disk_packet3        ; Load the tail after the second 64K window.
+    mov si, disk_packet3        ; Load the third 64K window.
+    mov ah, 0x42
+    mov dl, [boot_drive]
+    push ds
+    int 0x13
+    pop ds
+    jc .fail
+
+    mov si, disk_packet4        ; Load the fourth window (tail).
     mov ah, 0x42
     mov dl, [boot_drive]
     push ds
@@ -176,6 +186,14 @@ disk_packet3:
     dw KERNEL_OFF
     dw KERNEL_SEG3
     dq 0x0000000000000101
+
+disk_packet4:
+    db 0x10
+    db 0x00
+    dw KERNEL_FOURTH_SECTORS
+    dw KERNEL_OFF
+    dw KERNEL_SEG4
+    dq 0x0000000000000181
 
 times 510 - ($ - $$) db 0       ; Pad to byte offset 510.
 dw 0xAA55                       ; BIOS boot signature: bytes 55 AA on disk.

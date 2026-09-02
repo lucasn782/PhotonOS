@@ -1,10 +1,16 @@
 # 📚 Índice Geral de Documentação Técnica do PhotonOS
 
-Este documento serve como o mapa central da documentação técnica do PhotonOS v4.1, categorizando cada arquivo explicativo e especificações técnicas de acordo com seu assunto e subsistema.
+Este documento serve como o mapa central da documentação técnica do PhotonOS v4.2.1, categorizando cada arquivo explicativo e especificações técnicas de acordo com seu assunto e subsistema.
 
 ---
 
 ## 🎯 Arquivos de Controle e Gerenciamento
+
+### 0. [PHOTONOS_V4.2.1_BASELINE_AUDIT.md](PHOTONOS_V4.2.1_BASELINE_AUDIT.md)
+*   **Descrição**: Relatório completo de auditoria de baseline, hardening, sincronização SMP e validação de regressões do PhotonOS v4.2.1.
+*   **Objetivo**: Consolidar as evidências técnicas comprovadas em testes (10/10 boots, VFS, SMP stress, Pipes, Redirecionamento, TCP, Persistência) para preparar o início da v4.3.
+*   **Dependências**: Todas as camadas do sistema operacional.
+*   **Público-Alvo**: Engenheiros principais, arquitetos de sistemas e revisores de código.
 
 ### 1. [ARCHITECTURAL_DECISIONS.md](ARCHITECTURAL_DECISIONS.md)
 *   **Descrição**: Registro de decisões de design técnico críticas tomadas no projeto.
@@ -72,7 +78,20 @@ Este documento serve como o mapa central da documentação técnica do PhotonOS 
 *   **Dependências**: Bootloader, GDT, IDT, PMM, VMM, Heap, SMP, Framebuffer.
 *   **Público-Alvo**: Engenheiros de kernel, especialistas de boot e mantenedores do sistema.
 
-### 11. Subsistema TCP v4.2 & Arquitetura de Rede
+### 12. [BOOT.md](BOOT.md)
+*   **Descrição**: Especificação técnica e arquitetura do processo de bootloader multiestágio do PhotonOS.
+*   **Objetivo**: Detalhar layout da imagem (LBA 0/LBA 1..480), carregamento LBA em 4 pacotes DAP com respeito ao limite de 64 KiB do Real Mode, A20, VBE VESA, GDT, paginação de 128 MiB e salto para Long Mode 64-bit.
+*   **Dependências**: `src/boot/boot.asm`, `src/boot/kernel.asm`, `Makefile`.
+*   **Público-Alvo**: Engenheiros de sistemas, especialistas em assembly x86 e desenvolvedores de kernel.
+
+### 13. [BOOT_TROUBLESHOOTING.md](BOOT_TROUBLESHOOTING.md)
+*   **Descrição**: Guia de resolução de problemas de boot, histórico de regressão LBA e interpretação de traces do QEMU.
+*   **Objetivo**: Documentar a causa raiz do limite de 64 KiB em transferências BIOS LBA, o efeito secundário no fallback CHS em discos rígidos (DL=0x80), a correção em 4 janelas e como diferenciar eventos de firmware/SMM de exceções do PhotonOS no `task_debug.log`.
+*   **Dependências**: QEMU, SeaBIOS, Bootloader.
+*   **Público-Alvo**: Desenvolvedores e engenheiros de depuração.
+
+### 14. Subsistema TCP v4.2 & Arquitetura de Rede
+*   **[tcp_socket_integration_fix.md](tcp_socket_integration_fix.md)**: Relatório da correção da integração `sys_socket()` com a camada de Sockets TCP no boot, causa raiz (`current_task == NULL`), alocação de descritores no contexto do kernel e testes de não-regressão.
 *   **[tcp_architecture.md](tcp_architecture.md)**: Arquitetura completa do subsistema TCP, estrutura dos PCBs, máquina de estados, serialização/checksum, fluxos RX/TX e diagrama completo da pilha de rede.
 *   **[network_architecture.md](network_architecture.md)** (e **[networking/network_architecture.md](networking/network_architecture.md)**): Arquitetura global da pilha de rede, barramento PCI, DMA físico e suporte a sockets.
 *   **[tcp_socket_layer.md](tcp_socket_layer.md)**: Abstração VFS, nós de socket, mapeamento de syscalls (`connect`, `listen`, `accept`) e desativação de espera ocupada no escalonador.
@@ -82,6 +101,14 @@ Este documento serve como o mapa central da documentação técnica do PhotonOS 
 *   **[tcp_design.md](tcp_design.md)**: Princípios de design, desacoplamento modular, ausência de busy-wait e roadmap de evolução.
 *   **[tcp_state_machine.md](tcp_state_machine.md)**: Especificação da máquina de estados TCP RFC 793 (10 estados).
 *   **Público-Alvo**: Arquitetos de sistemas operacionais, engenheiros de rede e desenvolvedores do kernel.
+
+### 15. Sinais POSIX, Processos e IPC v4.3
+*   **[process_lifecycle.md](process_lifecycle.md)**: Arquitetura completa do ciclo de vida de processos, máquina de estados estrita (`TASK_READY`, `TASK_RUNNING`, `TASK_SLEEPING`, `TASK_WAITING`, `TASK_BLOCKED`, `TASK_STOPPED`, `TASK_ZOMBIE`, `TASK_DEAD`), gerador de PID monotônico, reparenting automático de órfãos para PID 1 e colheita atômica por `waitpid(WNOHANG)`.
+*   **[signals.md](signals.md)**: Arquitetura do subsistema de sinais POSIX, tabela de sinais, bitmasks de bloqueio/pendência, trampoline em Ring 3 (`SIGNAL_TRAMPOLINE_ADDR`), preservação de contexto e retorno seguro com `sigreturn`.
+*   **[process_signals.md](process_signals.md)**: Guia de desenvolvimento e uso das chamadas de sistema `sigaction`, `sigprocmask`, `kill`, e exemplos em Ring 3 para captura de `SIGCHLD`, `SIGPIPE`, `SIGSTOP` e `SIGCONT`.
+*   **[IPC.md](IPC.md)**: Arquitetura de Comunicação Inter-Processos (IPC), pipes anônimos com contagem de leitores e escritores ativos, detecção de Broken Pipe (`SIGPIPE`), sinalização de EOF (`0`) e sincronização de buffer circular.
+*   **[SCHEDULER.md](SCHEDULER.md)**: Escalonador preemptivo Round-Robin multi-core (SMP), gerenciamento atômico de estados de tarefas, preempção por timer e entrega assíncrona de sinais na transição para Ring 3.
+*   **Público-Alvo**: Engenheiros de kernel, desenvolvedores de sistemas operacionais e programadores de userspace.
 
 ---
 

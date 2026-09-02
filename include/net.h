@@ -70,6 +70,7 @@ int sys_bind(int fd, const struct sockaddr *addr, uint32_t addrlen);
 int sys_connect(int fd, const struct sockaddr *addr, uint32_t addrlen);
 int sys_listen(int fd, int backlog);
 int sys_accept(int fd, struct sockaddr *addr, uint32_t *addrlen);
+int sys_close(int fd);
 
 void net_init(void);
 

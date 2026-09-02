@@ -681,18 +681,22 @@ int vmm_validate_user_ptr(const void *ptr, size_t size, int write_intent)
         return 0;
     }
 
-    /* Check canonical user-space limit (0 to 0x00007FFFFFFFFFFF) */
-    if (end >= 0x0000800000000000ULL) {
+    /* User processes are loaded in the high user-half; low addresses are
+     * never part of the Ring 3 ABI and must not be accepted for syscalls. */
+    if (start < VMM_USER_BASE || end >= 0x0000800000000000ULL) {
         return 0;
     }
 
-    uint64_t *pml4 = (uint64_t *)(read_cr3() & VMM_ENTRY_ADDR_MASK);
+    task_t *task = scheduler_current_task();
+    uint64_t *pml4 = (task != 0 && task->cr3 != 0) ?
+        (uint64_t *)(task->cr3 & VMM_ENTRY_ADDR_MASK) :
+        (uint64_t *)(read_cr3() & VMM_ENTRY_ADDR_MASK);
     if (!valid_table_pointer(pml4)) {
         return 0;
     }
 
     uintptr_t page_start = start & VMM_PAGE_MASK;
-    uintptr_t page_end = (end + VMM_PAGE_SIZE - 1ULL) & VMM_PAGE_MASK;
+    uintptr_t page_end = ((start + size - 1ULL) & VMM_PAGE_MASK) + VMM_PAGE_SIZE;
 
     for (uintptr_t vaddr = page_start; vaddr < page_end; vaddr += VMM_PAGE_SIZE) {
         uintptr_t pml4_index = (vaddr >> 39) & 0x1FFULL;
@@ -748,7 +752,7 @@ int vmm_validate_user_string(const char *str, size_t max_len)
     }
 
     uintptr_t addr = (uintptr_t)str;
-    if (addr >= 0x0000800000000000ULL) {
+    if (addr < VMM_USER_BASE || addr >= 0x0000800000000000ULL) {
         return 0;
     }
 

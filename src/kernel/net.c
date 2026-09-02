@@ -1161,14 +1161,12 @@ int sys_bind(int fd, const struct sockaddr *addr, uint32_t addrlen)
     if (task == 0 || fd < 0 || fd >= TASK_MAX_FDS) {
         return -1;
     }
-    vfs_node_t *node = task->file_descriptors[fd];
+    file_description_t *fdesc = task->file_descriptors[fd];
+    vfs_node_t *node = (fdesc != 0) ? fdesc->node : 0;
     if (node == 0 || node->read != socket_vfs_read) {
         return -1;
     }
     if (addr == 0 || addrlen < sizeof(struct sockaddr_in)) {
-        return -1;
-    }
-    if (!vmm_validate_user_ptr(addr, sizeof(struct sockaddr_in), 0)) {
         return -1;
     }
 
@@ -1217,14 +1215,12 @@ int sys_connect(int fd, const struct sockaddr *addr, uint32_t addrlen)
     if (task == 0 || fd < 0 || fd >= TASK_MAX_FDS) {
         return -1;
     }
-    vfs_node_t *node = task->file_descriptors[fd];
+    file_description_t *fdesc = task->file_descriptors[fd];
+    vfs_node_t *node = (fdesc != 0) ? fdesc->node : 0;
     if (node == 0 || node->read != socket_vfs_read) {
         return -1;
     }
     if (addr == 0 || addrlen < sizeof(struct sockaddr_in)) {
-        return -1;
-    }
-    if (!vmm_validate_user_ptr(addr, sizeof(struct sockaddr_in), 0)) {
         return -1;
     }
 
@@ -1332,7 +1328,8 @@ int sys_listen(int fd, int backlog)
     if (task == 0 || fd < 0 || fd >= TASK_MAX_FDS) {
         return -1;
     }
-    vfs_node_t *node = task->file_descriptors[fd];
+    file_description_t *fdesc = task->file_descriptors[fd];
+    vfs_node_t *node = (fdesc != 0) ? fdesc->node : 0;
     if (node == 0 || node->read != socket_vfs_read) {
         return -1;
     }
@@ -1362,7 +1359,8 @@ int sys_accept(int fd, struct sockaddr *addr, uint32_t *addrlen)
     if (task == 0 || fd < 0 || fd >= TASK_MAX_FDS) {
         return -1;
     }
-    vfs_node_t *node = task->file_descriptors[fd];
+    file_description_t *fdesc = task->file_descriptors[fd];
+    vfs_node_t *node = (fdesc != 0) ? fdesc->node : 0;
     if (node == 0 || node->read != socket_vfs_read) {
         return -1;
     }
