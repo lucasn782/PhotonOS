@@ -73,6 +73,9 @@ int bind(int fd, const struct sockaddr *addr, uint32_t addrlen);
 int connect(int fd, const struct sockaddr *addr, uint32_t addrlen);
 int listen(int fd, int backlog);
 int accept(int fd, struct sockaddr *addr, uint32_t *addrlen);
+int recv(int fd, void *buf, size_t len, int flags);
+int send(int fd, const void *buf, size_t len, int flags);
+
 
 int socket_send(uint32_t dest_ip, uint8_t protocol, const void *payload,
     size_t len);

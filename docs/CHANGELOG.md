@@ -3,9 +3,96 @@
 Histórico completo de mudanças do sistema operacional, organizado por versão.
 Convenções: cada entrada lista data, commit (quando aplicável), resumo, arquivos alterados, bugs corrigidos, novas funcionalidades, breaking changes e impacto arquitetural.
 
+## `v4.4-tcp2b` — Milestone TCP Phase 2B: Passive Open, RX & TX Data Plane 🌐
+**Data:** 2026-09-17
+**Status:** Consolidado e validado em WSL/Ubuntu/QEMU com inspeção PCAP.
+
+### Resumo do Milestone
+Consolidação completa da Fase 2B do subsistema TCP do PhotonOS, cobrindo o ciclo de abertura passiva (Phase 2B.1), o plano de dados de recepção (Phase 2B.2A) e o plano de dados de transmissão (Phase 2B.2B). O subsistema foi integrado de ponta a ponta com a camada de sockets BSD, subsistema VFS, gerenciamento de memória virtual (VMM) e escalonador cooperativo/preemptivo.
+
+### Funcionalidades Consolidadas
+- **TCP Phase 2B.1 (Passive Open / Listen / Accept):** Implementação completa do estado `TCP_LISTEN`, syscalls `listen()` e `accept()`, fila de backlog com saturação e descarte controlado (`TCP_MAX_BACKLOG = 16`), ciclo de vida independente de child PCBs com tuplas de 4 elementos, demultiplexação de entrada prioritária e bloqueio cooperativo no escalonador (`TASK_WAIT_SOCKET_RECV`) com despertar imediato sem busy-wait.
+- **TCP Phase 2B.2A (Receive Path / RX Buffer):** Buffer circular de recepção (`tcp_rx_buffer_t`) de 8192 bytes por conexão, ingestão in-order de payload (`seq == rcv_nxt`), avanço monotônico de `rcv_nxt`, cálculo dinâmico da advertised window (`rcv_wnd`), descarte com re-ACK de dados duplicados e fora de ordem, syscall `recv()` (SYS_RECV = 54) com suporte a leituras parciais, eliminação de lost wakeups e semântica POSIX de EOF (`TCP_CLOSE_WAIT` / `TCP_PCB_FLAG_EOF`) e RST (`TCP_PCB_FLAG_RESET`).
+- **TCP Phase 2B.2B (Transmit Path / TX Buffer):** Buffer de transmissão (`tcp_tx_buffer_t`) de 8192 bytes com isolamento entre filas `unsent` e `unacked`, cópia segura de payload Ring 3 para memória pertencente ao kernel, segmentação em MSS 1460, avanço de `SND.NXT` e rastreamento de `SND.UNA`, reconhecimento cumulativo e parcial de dados, temporizador RTO de dados com backoff exponencial e limite de retransmissões (`TCP_MAX_DATA_RETRIES = 5`), e syscall `send()` (SYS_SEND = 55) com semântica de escrita parcial não-bloqueante.
+
+### Validação de Integração e Regressões
+- **Validações Específicas de RX:** Confirmação de bloqueio cooperativo (`recv_block`), recepção concorrente em múltiplas conexões (`recv_multi`), herança de descritor pós-`fork()` (`recv_fork`), leitura por descritor duplicado via `dup()` (`recv_dup`) e estabilidade em bateria de recepção repetida (5/5 iterações consecutivas aprovadas).
+- **Validações Específicas de TX:** Segmentação MSS 1460, validação de buffers de 1 byte a 16384 bytes, tratamento de escrita parcial, inspeção wire de flags `ACK|PSH` e correspondência estrita de sequências no fio (`ACK == SEQ + LEN`).
+- **Regressão Global do Sistema:** Passagem integral de 10/10 boots consecutivos (`test_10_boots.py`), SMP, VFS, sinais POSIX e pipes (`test_signals_suite.py`), persistência em disco FAT16, ciclo de vida de processos (`fork`, `exec`, `waitpid`), conectividade ICMP e suíte TCP Phase 2A (`test_tcp_phase2a.py`).
+
+### Otimização de Compilação e Métricas de Build
+- **Otimização `-Os`:** Ativação da flag `-Os` em CFLAGS no `Makefile`, reduzindo significativamente a pegada de memória do executável.
+- **Tamanho do Kernel:** `build/photon.bin` compilado em 137.772 bytes contra o teto arquitetural de 245.760 bytes (`KERNEL_MAX_BYTES`), garantindo uma margem de segurança de 107.988 bytes livres.
+- **Gate de Build:** Verificação automatizada `test $(stat -c%s build/photon.bin) -le 245760` mantida ativa como barreira obrigatória no Makefile.
+
+---
+
+## `v4.4-tcp2b2b` — TCP Phase 2B.2B: Transmit Path & `send()` 🌐
+**Data:** 2026-09-15
+**Status:** Validado localmente no WSL com QEMU e PCAP (2026-09-15).
+
+### Novas Funcionalidades
+- **`send()` / `SYS_SEND = 55`:** Wrapper ulibc e syscall que validam descritor, socket TCP ativo, estado `ESTABLISHED`, `flags`, ponteiro de usuário e intervalo completo antes da cópia.
+- **TX State por PCB:** `tcp_tx_buffer_t` de 8192 bytes separa dados pendentes de dados enviados/não confirmados. Cada segmento mantém uma cópia própria do payload no kernel, sequência, offset, timestamp e contador de retransmissões.
+- **Segmentação e Sequências:** Payload é segmentado em `TCP_DEFAULT_MSS = 1460`, transmitido com checksum TCP/pseudo-header IPv4 e avança `SND.NXT` somente quando passa para a fila `unacked`.
+- **Processamento de ACK de Dados:** ACK cumulativo, parcial, duplicado, antigo e além de `SND.NXT` são tratados sem liberar dados indevidos. ACK válido avança `SND.UNA` e libera apenas os bytes confirmados.
+- **Retransmissão Básica de Dados:** Timer RTO de dados, backoff limitado, retransmissão com o mesmo `SEQ` e encerramento/limpeza após `TCP_MAX_DATA_RETRIES`.
+- **Testes TX:** A suíte `test_tcp_phase2b2_tx.py` e os subcomandos `tcptest send_*` cobrem payloads de 1 byte a 16384 bytes, segmentação, escrita parcial, múltiplas conexões, `fork`, `dup`, casos negativos e análise PCAP.
+
+### Correções de Segurança e Concorrência
+- **Capacidade TX Atômica:** A decisão de espaço disponível ocorre sob `pcb->lock`, prevenindo sobrecarga do buffer por envios concorrentes.
+- **Sem I/O de Rede Sob Locks TCP:** O pacote é montado antes de liberar o lock; `net_send_ipv4()` é chamado sem `tcp_pcbs_lock` nem `pcb->lock`.
+- **Ownership durante TX:** `send()` e a escrita VFS retêm `sock->mutex` enquanto emprestam o PCB a `tcp_send()`, serializando corretamente com o fechamento final (`sock -> pcb`) e removendo uma janela de use-after-free.
+- **Limpeza Terminal:** RST recebido, timeout de retries e destruição de PCB liberam ambas as filas TX. O fechamento local remove o PCB da demultiplexação sem reentrar a rede sob o lock do socket, e o armazenamento estático de transmissão diferida do timer é serializado por mutex próprio.
+
+---
+
+## `v4.4-tcp2b2a` — TCP Phase 2B.2A: Receive Path & RX Buffer 🌐
+**Data:** 2026-09-09
+**Status:** Released
+
+### Novas Funcionalidades
+- **Buffer Circular de Recepção (RX Buffer):** Implementação de `tcp_rx_buffer_t` com capacidade de 8192 bytes por PCB TCP, suportando escrita e leitura circular com wrap-around sem cópias intermediárias redundantes.
+- **Ingestão de Dados em `ESTABLISHED`:** Processamento estrito de segmentos com payload recebidos no estado `ESTABLISHED`. Avanço seguro e monotônico de `rcv_nxt` somente para dados em ordem (`seq == rcv_nxt`).
+- **Emissão Imediata de ACK de Dados:** Resposta com pacote ACK contendo `ack_number = rcv_nxt` e janela atualizada após o armazenamento seguro dos dados no buffer circular.
+- **Política de Descarte e Re-ACK de Duplicados e Fora de Ordem:** Descarte seguro do payload para segmentos duplicados (`seq < rcv_nxt`) e out-of-order (`seq > rcv_nxt`), com re-emissão de ACK duplicado contendo o `rcv_nxt` esperado para ressincronização do transmissor remoto.
+- **Syscall `recv()` com Bloqueio Cooperativo (SYS_RECV = 54):** Syscall para consumo seguro de dados do RX buffer pelo espaço de usuário. Suporte a leituras completas e parciais, retorno de bytes lidos e atualização da janela de recepção anunciada.
+- **Eliminação de Lost Wakeups:** Desativação atômica de interrupções via `pushcli`/`popcli` durante a verificação de buffer vazio e suspensão no escalonador (`TASK_WAIT_SOCKET_RECV`), assegurando que interrupções de rede concorrentes não percam o `scheduler_wake_matching_tasks`.
+- **Validação Estrita de Memória em Syscall:** Validação completa de ponteiros e limites do usuário com `vmm_validate_user_ptr(buffer, len, 1)` prevenindo acessos nulos, ponteiros não mapeados e buffers de kernel.
+- **Tratamento de EOF e RST:** Detecção de encerramento remoto (`FIN` -> `TCP_CLOSE_WAIT` e flag `TCP_PCB_FLAG_EOF`) retornando 0 (EOF padrão POSIX) na exaustão do buffer, e aborto da conexão (`RST` / `TCP_PCB_FLAG_RESET`) retornando erro `-1`.
+- **Concorrência e Herança Pós-`fork()` e `dup()`:** Validação de compartilhamento e leitura concorrente de descritores clonados sem corrupção de buffer ou de PCBs.
+- **Suite Completa de Testes Automatizados e PCAP:** Implementação de `scripts/test_tcp_phase2b2_rx.py` com 17 verificações automatizadas de wire e userspace, além de 7 subcomandos novos no binário Ring 3 `tcptest.elf`.
+
+### Correções de Bugs (Bug Fixes)
+- **Eliminação de Avanço Indevido de `rcv_nxt` no Preâmbulo de `tcp_input`:** Removida a atribuição incondicional `pcb->rcv_nxt = header->sequence + payload_len` no preâmbulo de `tcp_input()`, que corrompia o rastreamento de sequência antes de checagens de estado e duplicação.
+- **Retorno de EOF em `socket_vfs_read()`:** Ajustada a integração VFS para retornar 0 em caso de socket em `TCP_CLOSE_WAIT` / `TCP_PCB_FLAG_EOF` com buffer esgotado.
+
+---
+
+## `v4.4-tcp2b1` — TCP Phase 2B.1: Passive Open, Listen, Accept & Backlog 🌐
+**Data:** 2026-09-09
+**Status:** Released
+
+### Novas Funcionalidades
+- **Abertura Passiva RFC 793 (Passive Open):** Suporte completo a servidores TCP no estado `LISTEN`, permitindo o recebimento de conexões remotas iniciadas por clientes externos.
+- **Syscall `listen()` (SYS_LISTEN = 35):** Validação de descritores de socket `SOCK_STREAM`, verificação de porta local vinculada e saturação segura de backlog entre 1 e 16 (`TCP_MAX_BACKLOG`).
+- **Syscall `accept()` com Bloqueio Cooperativo (SYS_ACCEPT = 36):** Desenfileiramento de conexões prontas do backlog e espera cooperativa no escalonador (`TASK_WAIT_NETWORK`) com despertar imediato (`tcp_socket_notify`) na chegada do `ACK` final (zero *busy-wait*).
+- **Ciclo de Vida Independente de Child PCBs:** Ao receber um `SYN`, o listener aloca um PCB filho independente com tupla de 4 elementos, Initial Sequence Number (`ISS`) próprio e monotônico, transicionando para `SYN_RECEIVED` e emitindo `SYN+ACK`. O listener permanece indefinidamente em `LISTEN`.
+- **Fila de Backlog com Prevenção de Saturação:** Enfileiramento de PCBs promovidos a `ESTABLISHED`. Caso o backlog esteja cheio, novos `SYN`s são descartados sem alocação órfã de PCBs.
+- **Demultiplexação de Entrada Prioritária:** `tcp_lookup_locked` prioriza correspondências exatas de 4-tuple para conexões ativas (`ESTABLISHED`/`SYN_RECEIVED`) antes de repassar pacotes aos listeners.
+- **Isolamento de Descritores Pós-`fork()`:** Validação de herança de descritores clonados pós-`accept()`, permitindo que o processo filho processe o socket cliente enquanto o pai continua aceitando conexões.
+- **Suite de Testes Automatizados e PCAP:** Implementação de `scripts/test_tcp_phase2b_passive.py` e comandos `listen`, `server_multi`, `server_fork`, `errors` em `tcptest.c`, cobrindo 15 casos de teste e validando traços reais no PCAP.
+
+### Correções de Bugs (Bug Fixes)
+- **Eliminação de Double Free em `socket_vfs_close()`:** Removida chamada redundante de `kfree(node)` na liberação de sockets VFS, prevenindo corrupção no heap durante `close()`.
+- **Inicialização Completa de `vfs_node_t`:** Garante zeramento integral da estrutura `vfs_node_t` em `sys_socket()` e `sys_accept()` antes da inicialização de campos específicos.
+
+---
+
 ## `v4.4-tcp2a` — TCP Phase 2A: 3-Way Handshake, State Machine & Connect() 🌐
 **Data:** 2026-09-02
 **Status:** Released
+
 
 ### Novas Funcionalidades
 - **Three-Way Handshake RFC 793:** Implementação ativa do handshake completo (`SYN -> SYN+ACK -> ACK`) com validação de números de sequência (`ISS`), números de reconhecimento (`ack_num`), flags e cálculo de checksum.

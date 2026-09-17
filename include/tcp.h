@@ -32,13 +32,28 @@
 #define TCP_PCB_FLAG_TIMER_RTO    (1U << 4)
 #define TCP_PCB_FLAG_TIMER_KEEP   (1U << 5)
 #define TCP_PCB_FLAG_TIMER_DACK   (1U << 6)
+#define TCP_PCB_FLAG_RESET        (1U << 7)
+#define TCP_PCB_FLAG_EOF          (1U << 8)
+
+#define TCP_RX_BUFFER_CAPACITY    8192U
+#define TCP_TX_BUFFER_CAPACITY    8192U
+
+/* RFC 1982 Sequence Number Arithmetic */
+#define TCP_SEQ_LT(a, b)  ((int32_t)((uint32_t)(a) - (uint32_t)(b)) < 0)
+#define TCP_SEQ_LE(a, b)  ((int32_t)((uint32_t)(a) - (uint32_t)(b)) <= 0)
+#define TCP_SEQ_GT(a, b)  ((int32_t)((uint32_t)(a) - (uint32_t)(b)) > 0)
+#define TCP_SEQ_GE(a, b)  ((int32_t)((uint32_t)(a) - (uint32_t)(b)) >= 0)
+#define TCP_SEQ_EQ(a, b)  ((uint32_t)(a) == (uint32_t)(b))
 
 /* Default timer budgets in kernel ticks (infrastructure; armed later). */
+
 #define TCP_RTO_TICKS_DEFAULT     100ULL
+#define TCP_DATA_RTO_TICKS_DEFAULT 100ULL
 #define TCP_KEEPALIVE_TICKS       72000ULL
 #define TCP_DELAYED_ACK_TICKS     20ULL
 #define TCP_CONNECT_TIMEOUT_TICKS 500ULL
 #define TCP_MAX_SYN_RETRIES       3U
+#define TCP_MAX_DATA_RETRIES      5U
 
 struct socket;
 
@@ -71,13 +86,15 @@ enum tcp_state {
 };
 typedef enum tcp_state tcp_state_t;
 
-/* Queued application payload (receive) or unacknowledged data (send). */
+/* Queued application payload.  TX entries keep their own kernel copy. */
 struct tcp_segment {
     struct tcp_segment *next;
     uint32_t sequence;
     size_t length;
     size_t offset;
     uint8_t *data;
+    uint64_t sent_at;
+    uint32_t retransmit_count;
 };
 
 struct tcp_queue {
@@ -86,6 +103,26 @@ struct tcp_queue {
     size_t bytes;
     size_t segments;
 };
+
+/* Bounded ring buffer for in-order received TCP payload. */
+typedef struct tcp_rx_buffer {
+    uint8_t *data;
+    size_t capacity;
+    size_t head;
+    size_t tail;
+    size_t used;
+} tcp_rx_buffer_t;
+
+/*
+ * Per-connection transmit state.  Data enters unsent first, then moves to
+ * unacked immediately before its packet is handed to IPv4.  Capacity covers
+ * both queues, so concurrent senders cannot over-commit the PCB.
+ */
+typedef struct tcp_tx_buffer {
+    struct tcp_queue unsent;
+    struct tcp_queue unacked;
+    size_t capacity;
+} tcp_tx_buffer_t;
 
 /*
  * Timer slots prepared for retransmission, keep-alive and delayed ACK.
@@ -115,6 +152,7 @@ typedef struct tcp_pcb {
     uint16_t remote_port;
 
     uint32_t iss;
+    uint32_t irs;
     uint32_t snd_una;
     uint32_t snd_nxt;
 
@@ -136,9 +174,11 @@ typedef struct tcp_pcb {
     uint64_t retransmission_timer;
 
     struct tcp_queue receive_queue;
-    struct tcp_queue send_queue;
+    tcp_rx_buffer_t rx_buf;
+    tcp_tx_buffer_t tx_buf;
     uint32_t flags;
     struct tcp_timers timers;
+
 
     /* Passive open / accept infrastructure. */
     int backlog;
@@ -170,6 +210,7 @@ void tcp_release_port(struct tcp_pcb *pcb);
 
 int tcp_listen(struct tcp_pcb *pcb, int backlog);
 struct tcp_pcb *tcp_accept(struct tcp_pcb *listener);
+struct tcp_pcb *tcp_accept_locked(struct tcp_pcb *listener);
 
 /* Header Serialization / Parsing (Phase 3) */
 int tcp_serialize_header(const struct tcp_header *hdr, uint8_t *buffer, size_t buf_size);
@@ -189,6 +230,14 @@ int tcp_output(struct tcp_pcb *pcb, uint8_t flags, const void *payload,
 
 int tcp_receive_read(struct tcp_pcb *pcb, uint8_t *buffer, size_t length);
 size_t tcp_receive_available(struct tcp_pcb *pcb);
+size_t tcp_rx_buffer_write_locked(struct tcp_pcb *pcb, const uint8_t *src, size_t len);
+size_t tcp_rx_buffer_read_locked(struct tcp_pcb *pcb, uint8_t *dst, size_t len);
+size_t tcp_rx_buffer_available_locked(struct tcp_pcb *pcb);
+size_t tcp_rx_buffer_free_space_locked(struct tcp_pcb *pcb);
+
+int tcp_send(struct tcp_pcb *pcb, const uint8_t *buffer, size_t len);
+void tcp_tx_ack_received_locked(struct tcp_pcb *pcb, uint32_t ack);
+size_t tcp_tx_buffer_available_locked(struct tcp_pcb *pcb);
 
 /* Arm / clear timer slots */
 void tcp_timer_arm_rto(struct tcp_pcb *pcb, uint64_t now_ticks);
@@ -203,4 +252,3 @@ const char *tcp_state_name(enum tcp_state state);
 void tcp_run_tests(void);
 
 #endif
-

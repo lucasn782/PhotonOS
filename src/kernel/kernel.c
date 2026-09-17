@@ -98,8 +98,11 @@
 #define SYS_SIGACTION 51ULL
 #define SYS_SIGPROCMASK 52ULL
 #define SYS_WAITPID 53ULL
+#define SYS_RECV 54ULL
+#define SYS_SEND 55ULL
 
 #define F_DUPFD 0
+
 #define F_GETFD 1
 #define F_SETFD 2
 #define F_GETFL 3
@@ -2009,6 +2012,12 @@ uint64_t syscall_handler(uint64_t number, uint64_t arg1, uint64_t arg2,
             return (uint64_t)-1;
         }
         ret = (uint64_t)sys_accept((int)arg1, (struct sockaddr *)arg2, (uint32_t *)arg3);
+    }
+    else if (number == SYS_RECV) {
+        ret = (uint64_t)sys_recv((int)arg1, (void *)arg2, (size_t)arg3, (int)arg4);
+    }
+    else if (number == SYS_SEND) {
+        ret = (uint64_t)sys_send((int)arg1, (const void *)arg2, (size_t)arg3, (int)arg4);
     }
     else if (number == SYS_CHMOD) {
         if (!vmm_validate_user_string((const char *)arg1, 256)) return (uint64_t)-1;

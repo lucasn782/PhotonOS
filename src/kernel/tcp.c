@@ -12,6 +12,15 @@ static mutex_t tcp_pcbs_lock __attribute__((section(".network_state")));
 static uint16_t tcp_next_ephemeral __attribute__((section(".network_state"))) =
     TCP_EPHEMERAL_PORT_FIRST;
 
+struct deferred_tx_pkt {
+    uint8_t  packet[TCP_HEADER_MIN_SIZE + TCP_DEFAULT_MSS];
+    size_t   packet_len;
+    uint32_t remote_ip;
+};
+static struct deferred_tx_pkt tcp_deferred_tx[4] __attribute__((section(".network_state")));
+/* Serializes use of the fixed deferred packet storage after list locks drop. */
+static mutex_t tcp_deferred_tx_lock __attribute__((section(".network_state")));
+
 /* Socket layer wakes sleepers only after TCP unlocks. */
 extern void tcp_socket_notify(void *socket);
 extern volatile uint64_t kernel_ticks;
@@ -105,7 +114,8 @@ static int tcp_port_in_use_locked(const struct tcp_pcb *except,
 static struct tcp_pcb *tcp_lookup_locked(uint32_t local_ip, uint32_t remote_ip,
     uint16_t local_port, uint16_t remote_port)
 {
-    struct tcp_pcb *listener = 0;
+    struct tcp_pcb *exact_listener = 0;
+    struct tcp_pcb *wildcard_listener = 0;
 
     for (struct tcp_pcb *pcb = tcp_pcbs; pcb != 0; pcb = pcb->next) {
         if (pcb->local_port != local_port) {
@@ -114,17 +124,22 @@ static struct tcp_pcb *tcp_lookup_locked(uint32_t local_ip, uint32_t remote_ip,
         if (pcb->local_ip != 0U && pcb->local_ip != local_ip) {
             continue;
         }
-        /* Exact 4-tuple match wins over a listening wildcard. */
+        /* Exact 4-tuple match (active/established/syn-received connection) wins unconditionally. */
         if (pcb->remote_ip == remote_ip && pcb->remote_port == remote_port &&
             pcb->state != TCP_LISTEN) {
             return pcb;
         }
+        /* Match listener */
         if (pcb->state == TCP_LISTEN && pcb->remote_ip == 0U &&
             pcb->remote_port == 0U) {
-            listener = pcb;
+            if (pcb->local_ip == local_ip) {
+                exact_listener = pcb;
+            } else if (pcb->local_ip == 0U && wildcard_listener == 0) {
+                wildcard_listener = pcb;
+            }
         }
     }
-    return listener;
+    return exact_listener != 0 ? exact_listener : wildcard_listener;
 }
 
 static void tcp_queue_clear_locked(struct tcp_queue *queue)
@@ -140,38 +155,46 @@ static void tcp_queue_clear_locked(struct tcp_queue *queue)
     queue->segments = 0;
 }
 
-static int tcp_queue_append_locked(struct tcp_queue *queue,
-    uint32_t sequence, const uint8_t *data, size_t length)
+static void tcp_queue_append_locked(struct tcp_queue *queue,
+    struct tcp_segment *entry)
 {
-    struct tcp_segment *entry;
-
-    if (length == 0U) {
-        return 0;
-    }
-    entry = kmalloc(sizeof(*entry));
-    if (entry == 0) {
-        return -1;
-    }
-    entry->data = kmalloc(length);
-    if (entry->data == 0) {
-        kfree(entry);
-        return -1;
-    }
-    tcp_copy(entry->data, data, length);
     entry->next = 0;
-    entry->sequence = sequence;
-    entry->length = length;
-    entry->offset = 0;
-
     if (queue->tail != 0) {
         queue->tail->next = entry;
     } else {
         queue->head = entry;
     }
     queue->tail = entry;
-    queue->bytes += length;
+    queue->bytes += entry->length;
     queue->segments++;
-    return 0;
+}
+
+static struct tcp_segment *tcp_queue_take_head_locked(struct tcp_queue *queue)
+{
+    struct tcp_segment *entry = queue->head;
+
+    if (entry == 0) {
+        return 0;
+    }
+    queue->head = entry->next;
+    if (queue->head == 0) {
+        queue->tail = 0;
+    }
+    entry->next = 0;
+    if (queue->bytes >= entry->length) {
+        queue->bytes -= entry->length;
+    } else {
+        queue->bytes = 0;
+    }
+    if (queue->segments != 0) {
+        queue->segments--;
+    }
+    return entry;
+}
+
+static size_t tcp_tx_buffer_used_locked(const struct tcp_pcb *pcb)
+{
+    return pcb->tx_buf.unsent.bytes + pcb->tx_buf.unacked.bytes;
 }
 
 /* Detach pending accepted children; caller destroys them without listener lock. */
@@ -256,8 +279,9 @@ static int tcp_build_output_locked(struct tcp_pcb *pcb, uint8_t flags,
     header->src_port = htons(pcb->local_port);
     header->dest_port = htons(pcb->remote_port);
 
-    uint32_t current_seq = pcb->seq_number;
-    if ((flags & TCP_FLAG_SYN) != 0U && pcb->state == TCP_SYN_SENT) {
+    uint32_t current_seq = pcb->snd_nxt;
+    if ((flags & TCP_FLAG_SYN) != 0U &&
+        (pcb->state == TCP_SYN_SENT || pcb->state == TCP_SYN_RECEIVED)) {
         current_seq = pcb->iss;
     }
 
@@ -281,13 +305,13 @@ static int tcp_build_output_locked(struct tcp_pcb *pcb, uint8_t flags,
     if ((flags & TCP_FLAG_SYN) != 0U) {
         pcb->snd_nxt = pcb->iss + 1U;
         pcb->snd_una = pcb->iss;
-        pcb->seq_number = pcb->iss + 1U;
+        pcb->seq_number = pcb->snd_nxt;
     } else if ((flags & TCP_FLAG_FIN) != 0U) {
-        pcb->seq_number++;
-        pcb->snd_nxt = pcb->seq_number;
+        pcb->snd_nxt++;
+        pcb->seq_number = pcb->snd_nxt;
     }
-    pcb->seq_number += (uint32_t)payload_len;
-    pcb->snd_nxt = pcb->seq_number;
+    pcb->snd_nxt += (uint32_t)payload_len;
+    pcb->seq_number = pcb->snd_nxt;
     *remote_ip = pcb->remote_ip;
     return 0;
 }
@@ -300,6 +324,18 @@ tcp_pcb_t *tcp_alloc(void)
         return 0;
     }
     tcp_zero(pcb, sizeof(*pcb));
+    pcb->rx_buf.data = kmalloc(TCP_RX_BUFFER_CAPACITY);
+    if (pcb->rx_buf.data == 0) {
+        kfree(pcb);
+        return 0;
+    }
+    tcp_zero(pcb->rx_buf.data, TCP_RX_BUFFER_CAPACITY);
+    pcb->rx_buf.capacity = TCP_RX_BUFFER_CAPACITY;
+    pcb->rx_buf.head = 0;
+    pcb->rx_buf.tail = 0;
+    pcb->rx_buf.used = 0;
+    pcb->tx_buf.capacity = TCP_TX_BUFFER_CAPACITY;
+
     pcb->window = TCP_DEFAULT_WINDOW;
     pcb->snd_wnd = (uint16_t)TCP_DEFAULT_WINDOW;
     pcb->rcv_wnd = (uint16_t)TCP_DEFAULT_WINDOW;
@@ -319,7 +355,17 @@ void tcp_free(tcp_pcb_t *pcb)
     tcp_unregister(pcb);
     mutex_lock(&pcb->lock);
     tcp_queue_clear_locked(&pcb->receive_queue);
-    tcp_queue_clear_locked(&pcb->send_queue);
+    tcp_queue_clear_locked(&pcb->tx_buf.unsent);
+    tcp_queue_clear_locked(&pcb->tx_buf.unacked);
+    if (pcb->rx_buf.data != 0) {
+        kfree(pcb->rx_buf.data);
+        pcb->rx_buf.data = 0;
+    }
+    pcb->rx_buf.capacity = 0;
+    pcb->rx_buf.head = 0;
+    pcb->rx_buf.tail = 0;
+    pcb->rx_buf.used = 0;
+    pcb->tx_buf.capacity = 0;
     tcp_timers_reset(pcb);
     pcb->socket = 0;
     pcb->state = TCP_CLOSED;
@@ -405,13 +451,12 @@ void tcp_timer_tick(uint64_t now_ticks)
 {
     /* Deferred TX queue: we must NOT call net_send_ipv4 while holding
      * tcp_pcbs_lock, because net_send_ipv4 → net_poll_packets → tcp_input
-     * would try to re-acquire tcp_pcbs_lock → deadlock. */
-    struct {
-        uint8_t  packet[TCP_HEADER_MIN_SIZE];
-        size_t   packet_len;
-        uint32_t remote_ip;
-    } deferred[4];
+     * would try to re-acquire tcp_pcbs_lock → deadlock.
+     * Uses static tcp_deferred_tx in .network_state to prevent kernel stack bloat. */
     int deferred_count = 0;
+
+    /* The packet array is static to keep 8 KiB kernel stacks shallow. */
+    mutex_lock(&tcp_deferred_tx_lock);
 
     mutex_lock(&tcp_pcbs_lock);
     for (struct tcp_pcb *pcb = tcp_pcbs; pcb != 0; pcb = pcb->next) {
@@ -452,18 +497,133 @@ void tcp_timer_tick(uint64_t now_ticks)
                 pcb->retransmission_timer = pcb->timers.retransmission;
 
                 if (deferred_count < 4) {
-                    deferred[deferred_count].packet_len = 0;
-                    deferred[deferred_count].remote_ip = 0;
+                    tcp_deferred_tx[deferred_count].packet_len = 0;
+                    tcp_deferred_tx[deferred_count].remote_ip = 0;
                     int res = tcp_build_output_locked(pcb, TCP_FLAG_SYN, 0, 0,
-                        deferred[deferred_count].packet,
-                        &deferred[deferred_count].packet_len,
-                        &deferred[deferred_count].remote_ip);
+                        tcp_deferred_tx[deferred_count].packet,
+                        &tcp_deferred_tx[deferred_count].packet_len,
+                        &tcp_deferred_tx[deferred_count].remote_ip);
                     if (res == 0) {
                         deferred_count++;
                     }
                 }
                 mutex_unlock(&pcb->lock);
                 continue;
+            }
+        } else if (pcb->state == TCP_SYN_RECEIVED) {
+            /* Passive child timeout check */
+            if (pcb->timers.timeout != 0 && now_ticks >= pcb->timers.timeout) {
+                pcb->state = TCP_CLOSED;
+                tcp_timers_reset(pcb);
+                mutex_unlock(&pcb->lock);
+                continue;
+            }
+            /* Passive child SYN+ACK RTO retransmission */
+            if ((pcb->flags & TCP_PCB_FLAG_TIMER_RTO) != 0 &&
+                pcb->timers.retransmission != 0 &&
+                now_ticks >= pcb->timers.retransmission) {
+                if (pcb->timers.retransmit_count >= TCP_MAX_SYN_RETRIES) {
+                    pcb->state = TCP_CLOSED;
+                    tcp_timers_reset(pcb);
+                    mutex_unlock(&pcb->lock);
+                    continue;
+                }
+
+                pcb->timers.retransmit_count++;
+                pcb->timers.rto_ticks = (uint32_t)(pcb->timers.rto_ticks * 2U);
+                if (pcb->timers.rto_ticks > 1000U) {
+                    pcb->timers.rto_ticks = 1000U;
+                }
+                pcb->timers.retransmission = now_ticks + pcb->timers.rto_ticks;
+                pcb->retransmission_timer = pcb->timers.retransmission;
+
+                if (deferred_count < 4) {
+                    tcp_deferred_tx[deferred_count].packet_len = 0;
+                    tcp_deferred_tx[deferred_count].remote_ip = 0;
+                    int res = tcp_build_output_locked(pcb,
+                        (uint8_t)(TCP_FLAG_SYN | TCP_FLAG_ACK), 0, 0,
+                        tcp_deferred_tx[deferred_count].packet,
+                        &tcp_deferred_tx[deferred_count].packet_len,
+                        &tcp_deferred_tx[deferred_count].remote_ip);
+                    if (res == 0) {
+                        deferred_count++;
+                    }
+                }
+                mutex_unlock(&pcb->lock);
+                continue;
+            }
+        } else if (pcb->state == TCP_ESTABLISHED) {
+            /* Check data RTO retransmission */
+            if ((pcb->flags & TCP_PCB_FLAG_TIMER_RTO) != 0 &&
+                pcb->timers.retransmission != 0 &&
+                now_ticks >= pcb->timers.retransmission) {
+                if (pcb->tx_buf.unacked.head != 0) {
+                    if (pcb->timers.retransmit_count >= TCP_MAX_DATA_RETRIES) {
+                        /* Retransmission limit reached: reset connection */
+                        pcb->state = TCP_CLOSED;
+                        pcb->flags |= TCP_PCB_FLAG_RESET;
+                        tcp_timers_reset(pcb);
+                        tcp_queue_clear_locked(&pcb->tx_buf.unsent);
+                        tcp_queue_clear_locked(&pcb->tx_buf.unacked);
+                        void *sock = pcb->socket;
+                        mutex_unlock(&pcb->lock);
+                        if (sock != 0) {
+                            tcp_socket_notify(sock);
+                        }
+                        continue;
+                    }
+
+                    /* Increment retry count & apply exponential backoff */
+                    pcb->timers.retransmit_count++;
+                    pcb->timers.rto_ticks = (uint32_t)(pcb->timers.rto_ticks * 2U);
+                    if (pcb->timers.rto_ticks > 1000U) {
+                        pcb->timers.rto_ticks = 1000U;
+                    }
+                    pcb->timers.retransmission = now_ticks + pcb->timers.rto_ticks;
+                    pcb->retransmission_timer = pcb->timers.retransmission;
+
+                    /* Retransmit oldest unacknowledged segment with original SEQ */
+                    struct tcp_segment *seg = pcb->tx_buf.unacked.head;
+                    if (seg != 0 && seg->data != 0 && deferred_count < 4) {
+                        size_t seg_len = seg->length;
+                        if (seg_len > TCP_DEFAULT_MSS) {
+                            seg_len = TCP_DEFAULT_MSS;
+                        }
+                        uint32_t local_ip = tcp_effective_local_ip(pcb);
+                        uint32_t remote_ip = pcb->remote_ip;
+                        uint8_t *pkt = tcp_deferred_tx[deferred_count].packet;
+                        struct tcp_header *hdr = (struct tcp_header *)pkt;
+
+                        hdr->src_port = htons(pcb->local_port);
+                        hdr->dest_port = htons(pcb->remote_port);
+                        hdr->seq_num = htonl(seg->sequence);
+                        hdr->ack_num = htonl(pcb->rcv_nxt);
+                        hdr->data_offset_flags = htons((5U << 12) | TCP_FLAG_ACK | TCP_FLAG_PSH);
+                        hdr->window_size = htons((uint16_t)(pcb->window & 0xFFFFU));
+                        hdr->checksum = 0;
+                        hdr->urgent_ptr = 0;
+                        if (seg_len != 0) {
+                            tcp_copy(pkt + sizeof(struct tcp_header), seg->data + seg->offset, seg_len);
+                        }
+                        size_t total_len = sizeof(struct tcp_header) + seg_len;
+                        uint16_t csum = tcp_checksum(local_ip, remote_ip, pkt, total_len);
+                        if (csum == 0U) {
+                            csum = 0xFFFFU;
+                        }
+                        hdr->checksum = htons(csum);
+
+                        tcp_deferred_tx[deferred_count].packet_len = total_len;
+                        tcp_deferred_tx[deferred_count].remote_ip = remote_ip;
+                        seg->sent_at = now_ticks;
+                        seg->retransmit_count++;
+                        deferred_count++;
+                    }
+                } else {
+                    /* No unacknowledged data in queue, disarm RTO timer */
+                    pcb->flags &= ~TCP_PCB_FLAG_TIMER_RTO;
+                    pcb->timers.retransmission = 0;
+                    pcb->retransmission_timer = 0;
+                }
             }
         }
         mutex_unlock(&pcb->lock);
@@ -472,10 +632,11 @@ void tcp_timer_tick(uint64_t now_ticks)
 
     /* Transmit deferred packets with NO locks held. */
     for (int i = 0; i < deferred_count; i++) {
-        klog("[TCP TX] SYN retransmitido\n");
-        net_send_ipv4(deferred[i].remote_ip, IP_PROTO_TCP,
-            deferred[i].packet, deferred[i].packet_len);
+        klog("[TCP TX] segmento retransmitido\n");
+        net_send_ipv4(tcp_deferred_tx[i].remote_ip, IP_PROTO_TCP,
+            tcp_deferred_tx[i].packet, tcp_deferred_tx[i].packet_len);
     }
+    mutex_unlock(&tcp_deferred_tx_lock);
 }
 
 void tcp_init(void)
@@ -483,6 +644,7 @@ void tcp_init(void)
     tcp_pcbs = 0;
     tcp_next_ephemeral = TCP_EPHEMERAL_PORT_FIRST;
     mutex_init(&tcp_pcbs_lock);
+    mutex_init(&tcp_deferred_tx_lock);
     klog("TCP: Subsistema PCB inicializado (fase 1).\n");
 }
 
@@ -494,7 +656,7 @@ struct tcp_pcb *tcp_socket_create(void *socket)
         return 0;
     }
     if (tcp_register(pcb) != 0) {
-        kfree(pcb);
+        tcp_free(pcb);
         return 0;
     }
     return pcb;
@@ -504,10 +666,28 @@ void tcp_socket_destroy(struct tcp_pcb *pcb)
 {
     struct tcp_pcb *orphans[TCP_MAX_BACKLOG];
     int orphan_count = 0;
+    struct tcp_pcb *syn_orphans[TCP_MAX_BACKLOG];
+    int syn_orphan_count = 0;
 
     if (pcb == 0) {
         return;
     }
+
+
+
+    /* If destroying a listener, identify half-open children */
+    mutex_lock(&tcp_pcbs_lock);
+    if (pcb->state == TCP_LISTEN) {
+        for (struct tcp_pcb *c = tcp_pcbs; c != 0; c = c->next) {
+            if (c->parent == pcb && c->state == TCP_SYN_RECEIVED &&
+                syn_orphan_count < (int)TCP_MAX_BACKLOG) {
+                syn_orphans[syn_orphan_count++] = c;
+                c->parent = 0;
+            }
+        }
+    }
+    mutex_unlock(&tcp_pcbs_lock);
+
     tcp_unregister(pcb);
     mutex_lock(&pcb->lock);
     if (pcb->state == TCP_LISTEN) {
@@ -515,14 +695,28 @@ void tcp_socket_destroy(struct tcp_pcb *pcb)
             (int)TCP_MAX_BACKLOG);
     }
     tcp_queue_clear_locked(&pcb->receive_queue);
-    tcp_queue_clear_locked(&pcb->send_queue);
+    tcp_queue_clear_locked(&pcb->tx_buf.unsent);
+    tcp_queue_clear_locked(&pcb->tx_buf.unacked);
+    if (pcb->rx_buf.data != 0) {
+        kfree(pcb->rx_buf.data);
+        pcb->rx_buf.data = 0;
+    }
+    pcb->rx_buf.capacity = 0;
+    pcb->rx_buf.head = 0;
+    pcb->rx_buf.tail = 0;
+    pcb->rx_buf.used = 0;
+    pcb->tx_buf.capacity = 0;
     tcp_timers_reset(pcb);
     pcb->socket = 0;
+    pcb->parent = 0;
     pcb->state = TCP_CLOSED;
     mutex_unlock(&pcb->lock);
 
     for (int i = 0; i < orphan_count; i++) {
         tcp_socket_destroy(orphans[i]);
+    }
+    for (int i = 0; i < syn_orphan_count; i++) {
+        tcp_socket_destroy(syn_orphans[i]);
     }
     kfree(pcb);
 }
@@ -532,6 +726,7 @@ int tcp_register(struct tcp_pcb *pcb)
     if (pcb == 0) {
         return -1;
     }
+
     mutex_lock(&tcp_pcbs_lock);
     for (struct tcp_pcb *entry = tcp_pcbs; entry != 0; entry = entry->next) {
         if (entry == pcb) {
@@ -552,6 +747,7 @@ void tcp_unregister(struct tcp_pcb *pcb)
     if (pcb == 0) {
         return;
     }
+
     mutex_lock(&tcp_pcbs_lock);
     entry = &tcp_pcbs;
     while (*entry != 0) {
@@ -703,6 +899,14 @@ struct tcp_pcb *tcp_accept(struct tcp_pcb *listener)
     return child;
 }
 
+struct tcp_pcb *tcp_accept_locked(struct tcp_pcb *listener)
+{
+    if (listener == 0 || listener->state != TCP_LISTEN) {
+        return 0;
+    }
+    return tcp_accept_dequeue_locked(listener);
+}
+
 int tcp_serialize_header(const struct tcp_header *hdr, uint8_t *buffer, size_t buf_size)
 {
     if (hdr == 0 || buffer == 0 || buf_size < sizeof(struct tcp_header)) {
@@ -763,7 +967,8 @@ int tcp_send_segment(struct tcp_pcb *pcb, uint32_t seq, uint32_t ack, uint8_t fl
         return -1;
     }
     uint8_t buffer[TCP_HEADER_MIN_SIZE + TCP_DEFAULT_MSS];
-    if (len > TCP_DEFAULT_MSS) {
+    /* Application data must pass through tcp_send() so it is retained for ACK/RTO. */
+    if (len != 0U || payload != 0 || len > TCP_DEFAULT_MSS) {
         return -1;
     }
 
@@ -797,8 +1002,6 @@ int tcp_send_segment(struct tcp_pcb *pcb, uint32_t seq, uint32_t ack, uint8_t fl
 
     klog("[TCP TX] segmento transmitido\n");
 
-    pcb->snd_nxt = seq + (uint32_t)len + (((flags & (TCP_FLAG_SYN | TCP_FLAG_FIN)) != 0U) ? 1U : 0U);
-
     return net_send_ipv4(pcb->remote_ip, IP_PROTO_TCP, buffer, total_len);
 }
 
@@ -812,6 +1015,10 @@ int tcp_output(struct tcp_pcb *pcb, uint8_t flags, const void *payload,
     if (pcb == 0 || payload_len > TCP_DEFAULT_MSS ||
         (payload_len != 0U && payload == 0)) {
         return -1;
+    }
+    if (payload_len != 0U) {
+        int accepted = tcp_send(pcb, (const uint8_t *)payload, payload_len);
+        return accepted == (int)payload_len ? 0 : -1;
     }
     mutex_lock(&pcb->lock);
     if (payload_len != 0U && pcb->state != TCP_ESTABLISHED) {
@@ -847,9 +1054,13 @@ static int tcp_handle_listen_syn(struct tcp_pcb *listener, uint32_t src_ip,
     int result;
 
     mutex_lock(&listener->lock);
-    if (listener->state != TCP_LISTEN ||
-        listener->accept_count >= listener->backlog) {
+    if (listener->state != TCP_LISTEN) {
         mutex_unlock(&listener->lock);
+        return -1;
+    }
+    if (listener->accept_count >= listener->backlog) {
+        mutex_unlock(&listener->lock);
+        klog("TCP: Backlog do listener cheio, descartando SYN.\n");
         return -1;
     }
     uint32_t local_ip = listener->local_ip != 0U ? listener->local_ip : dest_ip;
@@ -864,16 +1075,33 @@ static int tcp_handle_listen_syn(struct tcp_pcb *listener, uint32_t src_ip,
     child->remote_ip = src_ip;
     child->local_port = local_port;
     child->remote_port = remote_port;
-    child->seq_number = (uint32_t)kernel_ticks;
+
+    /* Generate unique Initial Sequence Number (ISS) for child connection */
+    uint32_t iss = (uint32_t)(kernel_ticks + 1000ULL + ((uint32_t)remote_port << 8));
+    if (iss == 0U) {
+        iss = 1000U;
+    }
+    child->iss = iss;
+    child->irs = sequence;
+    child->seq_number = iss;
+    child->snd_una = iss;
+    child->snd_nxt = iss + 1U;
     child->ack_number = sequence + 1U;
+    child->rcv_nxt = sequence + 1U;
     child->window = TCP_DEFAULT_WINDOW;
+    child->snd_wnd = (uint16_t)TCP_DEFAULT_WINDOW;
+    child->rcv_wnd = (uint16_t)TCP_DEFAULT_WINDOW;
     child->state = TCP_SYN_RECEIVED;
     child->parent = listener;
-    child->flags = TCP_PCB_FLAG_BOUND | TCP_PCB_FLAG_PASSIVE;
+    child->flags = TCP_PCB_FLAG_BOUND | TCP_PCB_FLAG_PASSIVE | TCP_PCB_FLAG_TIMER_RTO;
+    child->timers.rto_ticks = (uint32_t)TCP_RTO_TICKS_DEFAULT;
+    child->timers.retransmit_count = 0;
+    child->timers.retransmission = kernel_ticks + child->timers.rto_ticks;
     child->timers.timeout = kernel_ticks + TCP_CONNECT_TIMEOUT_TICKS;
+    child->retransmission_timer = child->timers.retransmission;
 
     if (tcp_register(child) != 0) {
-        kfree(child);
+        tcp_free(child);
         return -1;
     }
 
@@ -883,12 +1111,13 @@ static int tcp_handle_listen_syn(struct tcp_pcb *listener, uint32_t src_ip,
         &remote_ip);
     mutex_unlock(&child->lock);
 
-    if (result != 0 ||
-        net_send_ipv4(remote_ip, IP_PROTO_TCP, packet, packet_len) != 0) {
+    if (result != 0) {
         tcp_socket_destroy(child);
         return -1;
     }
 
+    (void)net_send_ipv4(remote_ip, IP_PROTO_TCP, packet, packet_len);
+    klog("[TCP TX] SYN+ACK transmitido do child PCB\n");
     return 0;
 }
 
@@ -953,9 +1182,7 @@ int tcp_input(uint32_t src_ip, uint32_t dest_ip, const uint8_t *segment,
     mutex_lock(&pcb->lock);
     mutex_unlock(&tcp_pcbs_lock);
 
-    pcb->rcv_nxt = sequence + (uint32_t)payload_len + (((flags & (TCP_FLAG_SYN | TCP_FLAG_FIN)) != 0U) ? 1U : 0U);
-    pcb->snd_una = acknowledgement;
-    pcb->rcv_wnd = hdr.window_size;
+    pcb->snd_wnd = hdr.window_size;
 
     /* Passive open: demux landed on a LISTEN PCB. */
     if (pcb->state == TCP_LISTEN) {
@@ -975,6 +1202,9 @@ int tcp_input(uint32_t src_ip, uint32_t dest_ip, const uint8_t *segment,
     if ((flags & TCP_FLAG_RST) != 0U) {
         int half_open_child = (pcb->parent != 0 && pcb->socket == 0);
         pcb->state = TCP_CLOSED;
+        pcb->flags |= TCP_PCB_FLAG_RESET;
+        tcp_queue_clear_locked(&pcb->tx_buf.unsent);
+        tcp_queue_clear_locked(&pcb->tx_buf.unacked);
         tcp_timers_reset(pcb);
         socket = pcb->socket;
         mutex_unlock(&pcb->lock);
@@ -1004,109 +1234,424 @@ int tcp_input(uint32_t src_ip, uint32_t dest_ip, const uint8_t *segment,
         (void)tcp_build_output_locked(pcb, TCP_FLAG_ACK, 0, 0, out_packet,
             &out_packet_len, &out_remote_ip);
         klog("[TCP RX] SYN+ACK recebido -> conexao ESTABLISHED, ACK transmitido\n");
-    } else if (pcb->state == TCP_SYN_RECEIVED &&
-        (flags & TCP_FLAG_ACK) != 0U &&
-        (flags & TCP_FLAG_SYN) == 0U &&
-        acknowledgement == pcb->seq_number) {
-        struct tcp_pcb *listener = pcb->parent;
-        pcb->state = TCP_ESTABLISHED;
-        tcp_timers_reset(pcb);
-        pcb->timers.keepalive = kernel_ticks + TCP_KEEPALIVE_TICKS;
-        pcb->flags |= TCP_PCB_FLAG_TIMER_KEEP;
-        if (listener != 0) {
-            mutex_unlock(&pcb->lock);
-            mutex_lock(&listener->lock);
-            mutex_lock(&pcb->lock);
-            if (listener->state == TCP_LISTEN &&
-                tcp_accept_enqueue_locked(listener, pcb) == 0) {
-                listener_socket = listener->socket;
-            } else {
-                /* Backlog full or listener closed: drop the child. */
+    } else if (pcb->state == TCP_SYN_RECEIVED) {
+        if ((flags & TCP_FLAG_SYN) != 0U && (flags & TCP_FLAG_ACK) == 0U) {
+            /* Client retransmitted SYN: retransmit SYN+ACK */
+            send_out = 1;
+            (void)tcp_build_output_locked(pcb,
+                (uint8_t)(TCP_FLAG_SYN | TCP_FLAG_ACK), 0, 0,
+                out_packet, &out_packet_len, &out_remote_ip);
+            klog("[TCP TX] SYN+ACK retransmitido para SYN duplicado\n");
+        } else if ((flags & TCP_FLAG_ACK) != 0U && (flags & TCP_FLAG_SYN) == 0U &&
+            (acknowledgement == pcb->iss + 1U || acknowledgement == pcb->seq_number)) {
+            struct tcp_pcb *listener = pcb->parent;
+            pcb->state = TCP_ESTABLISHED;
+
+            tcp_timers_reset(pcb);
+            pcb->timers.keepalive = kernel_ticks + TCP_KEEPALIVE_TICKS;
+            pcb->flags |= TCP_PCB_FLAG_TIMER_KEEP | TCP_PCB_FLAG_ACTIVE;
+            pcb->snd_una = acknowledgement;
+            pcb->snd_nxt = acknowledgement;
+            pcb->seq_number = acknowledgement;
+
+            if (listener != 0) {
+                mutex_unlock(&pcb->lock);
+                mutex_lock(&listener->lock);
+                mutex_lock(&pcb->lock);
+                if (listener->state == TCP_LISTEN &&
+                    tcp_accept_enqueue_locked(listener, pcb) == 0) {
+                    listener_socket = listener->socket;
+                    klog("[TCP RX] ACK recebido -> conexao ESTABLISHED inserida no backlog\n");
+                } else {
+                    /* Backlog full or listener closed: drop the child */
+                    mutex_unlock(&pcb->lock);
+                    mutex_unlock(&listener->lock);
+                    tcp_socket_destroy(pcb);
+                    return -1;
+                }
                 mutex_unlock(&pcb->lock);
                 mutex_unlock(&listener->lock);
-                tcp_socket_destroy(pcb);
-                return -1;
+                if (listener_socket != 0) {
+                    tcp_socket_notify(listener_socket);
+                }
+                return 0;
             }
-            mutex_unlock(&pcb->lock);
-            mutex_unlock(&listener->lock);
-            if (listener_socket != 0) {
-                tcp_socket_notify(listener_socket);
+        }
+    } else if (pcb->state == TCP_ESTABLISHED) {
+        /* If ACK flag is present, process data acknowledgements */
+        if ((flags & TCP_FLAG_ACK) != 0U) {
+            tcp_tx_ack_received_locked(pcb, acknowledgement);
+        }
+
+        /* 1. Incoming data payload processing */
+        if (payload_len != 0U) {
+            if (TCP_SEQ_EQ(sequence, pcb->rcv_nxt)) {
+                /* In-order data */
+                size_t space = tcp_rx_buffer_free_space_locked(pcb);
+                size_t to_write = (payload_len < space) ? payload_len : space;
+                if (to_write > 0) {
+                    size_t written = tcp_rx_buffer_write_locked(pcb, payload, to_write);
+                    pcb->rcv_nxt += (uint32_t)written;
+                    pcb->ack_number = pcb->rcv_nxt;
+                }
+                size_t free_sp = tcp_rx_buffer_free_space_locked(pcb);
+                pcb->window = (uint32_t)free_sp;
+                pcb->rcv_wnd = (uint16_t)(free_sp & 0xFFFFU);
+
+                send_out = 1;
+                (void)tcp_build_output_locked(pcb, TCP_FLAG_ACK, 0, 0, out_packet,
+                    &out_packet_len, &out_remote_ip);
+                klog("[TCP RX] In-order data armazenado no rx_buf, ACK transmitido\n");
+            } else if (TCP_SEQ_LT(sequence, pcb->rcv_nxt)) {
+                /* Duplicate segment: drop payload, re-send ACK with current rcv_nxt */
+                size_t free_sp = tcp_rx_buffer_free_space_locked(pcb);
+                pcb->window = (uint32_t)free_sp;
+                pcb->rcv_wnd = (uint16_t)(free_sp & 0xFFFFU);
+                pcb->ack_number = pcb->rcv_nxt;
+                send_out = 1;
+                (void)tcp_build_output_locked(pcb, TCP_FLAG_ACK, 0, 0, out_packet,
+                    &out_packet_len, &out_remote_ip);
+                klog("[TCP RX] Data duplicado descartado, ACK retransmitido\n");
+            } else {
+                /* Out-of-order segment: drop payload per Phase 7 policy, re-send ACK with current rcv_nxt */
+                size_t free_sp = tcp_rx_buffer_free_space_locked(pcb);
+                pcb->window = (uint32_t)free_sp;
+                pcb->rcv_wnd = (uint16_t)(free_sp & 0xFFFFU);
+                pcb->ack_number = pcb->rcv_nxt;
+                send_out = 1;
+                (void)tcp_build_output_locked(pcb, TCP_FLAG_ACK, 0, 0, out_packet,
+                    &out_packet_len, &out_remote_ip);
+                klog("[TCP RX] Data fora de ordem descartado, ACK retransmitido\n");
             }
-            return 0;
         }
-    } else if (pcb->state == TCP_ESTABLISHED && payload_len != 0U) {
-        if (sequence != pcb->ack_number ||
-            tcp_queue_append_locked(&pcb->receive_queue, sequence, payload,
-                payload_len) != 0) {
-            mutex_unlock(&pcb->lock);
-            return -1;
+
+        /* 2. FIN handling */
+        if ((flags & TCP_FLAG_FIN) != 0U) {
+            if (TCP_SEQ_EQ(sequence + (uint32_t)payload_len, pcb->rcv_nxt)) {
+                pcb->rcv_nxt += 1U;
+                pcb->ack_number = pcb->rcv_nxt;
+                pcb->flags |= TCP_PCB_FLAG_EOF;
+                pcb->state = TCP_CLOSE_WAIT;
+
+                size_t free_sp = tcp_rx_buffer_free_space_locked(pcb);
+                pcb->window = (uint32_t)free_sp;
+                pcb->rcv_wnd = (uint16_t)(free_sp & 0xFFFFU);
+                send_out = 1;
+                (void)tcp_build_output_locked(pcb, TCP_FLAG_ACK, 0, 0, out_packet,
+                    &out_packet_len, &out_remote_ip);
+                klog("[TCP RX] FIN recebido -> CLOSE_WAIT, ACK transmitido\n");
+            }
         }
-        pcb->ack_number += (uint32_t)payload_len;
-        /* Immediate ACK for Phase 1; delayed ACK timer is armed for Phase 2. */
-        pcb->timers.delayed_ack = kernel_ticks + TCP_DELAYED_ACK_TICKS;
-        pcb->flags |= TCP_PCB_FLAG_TIMER_DACK;
-        send_out = 1;
-        (void)tcp_build_output_locked(pcb, TCP_FLAG_ACK, 0, 0, out_packet,
-            &out_packet_len, &out_remote_ip);
     }
 
     socket = pcb->socket;
     mutex_unlock(&pcb->lock);
 
+    if (socket != 0) {
+        tcp_socket_notify(socket);
+    }
     if (send_out) {
         (void)net_send_ipv4(out_remote_ip, IP_PROTO_TCP, out_packet,
             out_packet_len);
     }
-    if (socket != 0) {
-        tcp_socket_notify(socket);
-    }
     return 0;
+}
+
+size_t tcp_rx_buffer_available_locked(struct tcp_pcb *pcb)
+{
+    if (pcb == 0) {
+        return 0;
+    }
+    return pcb->rx_buf.used;
+}
+
+size_t tcp_rx_buffer_free_space_locked(struct tcp_pcb *pcb)
+{
+    if (pcb == 0 || pcb->rx_buf.data == 0) {
+        return 0;
+    }
+    if (pcb->rx_buf.used >= pcb->rx_buf.capacity) {
+        return 0;
+    }
+    return pcb->rx_buf.capacity - pcb->rx_buf.used;
+}
+
+size_t tcp_rx_buffer_write_locked(struct tcp_pcb *pcb, const uint8_t *src, size_t len)
+{
+    if (pcb == 0 || src == 0 || len == 0 || pcb->rx_buf.data == 0) {
+        return 0;
+    }
+    size_t space = tcp_rx_buffer_free_space_locked(pcb);
+    size_t to_write = (len < space) ? len : space;
+    if (to_write == 0) {
+        return 0;
+    }
+
+    size_t cap = pcb->rx_buf.capacity;
+    size_t tail = pcb->rx_buf.tail;
+    size_t first_chunk = cap - tail;
+    if (to_write <= first_chunk) {
+        tcp_copy(pcb->rx_buf.data + tail, src, to_write);
+        pcb->rx_buf.tail = (tail + to_write) % cap;
+    } else {
+        tcp_copy(pcb->rx_buf.data + tail, src, first_chunk);
+        tcp_copy(pcb->rx_buf.data, src + first_chunk, to_write - first_chunk);
+        pcb->rx_buf.tail = to_write - first_chunk;
+    }
+    pcb->rx_buf.used += to_write;
+    return to_write;
+}
+
+size_t tcp_rx_buffer_read_locked(struct tcp_pcb *pcb, uint8_t *dst, size_t len)
+{
+    if (pcb == 0 || dst == 0 || len == 0 || pcb->rx_buf.data == 0) {
+        return 0;
+    }
+    size_t available = pcb->rx_buf.used;
+    size_t to_read = (len < available) ? len : available;
+    if (to_read == 0) {
+        return 0;
+    }
+
+    size_t cap = pcb->rx_buf.capacity;
+    size_t head = pcb->rx_buf.head;
+    size_t first_chunk = cap - head;
+    if (to_read <= first_chunk) {
+        tcp_copy(dst, pcb->rx_buf.data + head, to_read);
+        pcb->rx_buf.head = (head + to_read) % cap;
+    } else {
+        tcp_copy(dst, pcb->rx_buf.data + head, first_chunk);
+        tcp_copy(dst + first_chunk, pcb->rx_buf.data, to_read - first_chunk);
+        pcb->rx_buf.head = to_read - first_chunk;
+    }
+    pcb->rx_buf.used -= to_read;
+    return to_read;
 }
 
 int tcp_receive_read(struct tcp_pcb *pcb, uint8_t *buffer, size_t length)
 {
-    struct tcp_segment *entry;
-    size_t available;
-    size_t copied;
-
     if (pcb == 0 || buffer == 0 || length == 0U) {
         return -1;
     }
     mutex_lock(&pcb->lock);
-    entry = pcb->receive_queue.head;
-    if (entry == 0) {
-        mutex_unlock(&pcb->lock);
-        return 0;
-    }
-    available = entry->length - entry->offset;
-    copied = available < length ? available : length;
-    tcp_copy(buffer, entry->data + entry->offset, copied);
-    entry->offset += copied;
-    pcb->receive_queue.bytes -= copied;
-    if (entry->offset == entry->length) {
-        pcb->receive_queue.head = entry->next;
-        if (pcb->receive_queue.head == 0) {
-            pcb->receive_queue.tail = 0;
-        }
-        pcb->receive_queue.segments--;
-        kfree(entry->data);
-        kfree(entry);
-    }
+    size_t read_bytes = tcp_rx_buffer_read_locked(pcb, buffer, length);
+    size_t free_sp = tcp_rx_buffer_free_space_locked(pcb);
+    pcb->window = (uint32_t)free_sp;
+    pcb->rcv_wnd = (uint16_t)(free_sp & 0xFFFFU);
     mutex_unlock(&pcb->lock);
-    return (int)copied;
+    return (int)read_bytes;
 }
 
 size_t tcp_receive_available(struct tcp_pcb *pcb)
 {
-    size_t bytes;
-
     if (pcb == 0) {
         return 0;
     }
     mutex_lock(&pcb->lock);
-    bytes = pcb->receive_queue.bytes;
+    size_t bytes = tcp_rx_buffer_available_locked(pcb);
     mutex_unlock(&pcb->lock);
     return bytes;
+}
+
+size_t tcp_tx_buffer_available_locked(struct tcp_pcb *pcb)
+{
+    if (pcb == 0) {
+        return 0;
+    }
+    size_t used = tcp_tx_buffer_used_locked(pcb);
+    if (used >= pcb->tx_buf.capacity) {
+        return 0;
+    }
+    return pcb->tx_buf.capacity - used;
+}
+
+void tcp_tx_ack_received_locked(struct tcp_pcb *pcb, uint32_t ack)
+{
+    if (pcb == 0) {
+        return;
+    }
+
+    /* 1. Invalid ACK: acknowledges sequence space beyond what we sent */
+    if (TCP_SEQ_GT(ack, pcb->snd_nxt)) {
+        klog("TCP: ACK invalido ignorado (ACK > SND.NXT)\n");
+        return;
+    }
+
+    /* 2. Duplicate ACK: ACK == SND.UNA (no new data confirmed) */
+    if (TCP_SEQ_EQ(ack, pcb->snd_una)) {
+        return;
+    }
+
+    /* 3. Stale ACK: ACK < SND.UNA */
+    if (TCP_SEQ_LT(ack, pcb->snd_una)) {
+        return;
+    }
+
+    /* 4. Valid new ACK: SND.UNA < ACK <= SND.NXT */
+    pcb->snd_una = ack;
+
+    /* Free confirmed segments or adjust partially confirmed segment */
+    while (pcb->tx_buf.unacked.head != 0) {
+        struct tcp_segment *seg = pcb->tx_buf.unacked.head;
+        uint32_t seg_end = seg->sequence + (uint32_t)seg->length;
+
+        if (TCP_SEQ_LE(seg_end, ack)) {
+            /* Entire segment is acknowledged */
+            (void)tcp_queue_take_head_locked(&pcb->tx_buf.unacked);
+            if (seg->data != 0) {
+                kfree(seg->data);
+                seg->data = 0;
+            }
+            kfree(seg);
+        } else if (TCP_SEQ_LT(seg->sequence, ack)) {
+            /* Partial ACK within this segment */
+            size_t bytes_acked = (size_t)(uint32_t)(ack - seg->sequence);
+            if (bytes_acked >= seg->length) {
+                /* Defensive guard: complete ACKs are handled by the branch above. */
+                break;
+            }
+            seg->sequence = ack;
+            seg->length -= bytes_acked;
+            seg->offset += bytes_acked;
+            if (pcb->tx_buf.unacked.bytes >= bytes_acked) {
+                pcb->tx_buf.unacked.bytes -= bytes_acked;
+            } else {
+                pcb->tx_buf.unacked.bytes = 0;
+            }
+            break;
+        } else {
+            /* seg->sequence >= ack: unacknowledged segment */
+            break;
+        }
+    }
+
+    /* Timer management */
+    if (pcb->tx_buf.unacked.head == 0) {
+        /* All data acknowledged: clear retransmission timer */
+        pcb->flags &= ~TCP_PCB_FLAG_TIMER_RTO;
+        pcb->timers.retransmission = 0;
+        pcb->retransmission_timer = 0;
+        pcb->timers.retransmit_count = 0;
+        pcb->timers.rto_ticks = (uint32_t)TCP_DATA_RTO_TICKS_DEFAULT;
+    } else {
+        /* Reset retransmission timer for remaining unacknowledged data */
+        pcb->timers.rto_ticks = (uint32_t)TCP_DATA_RTO_TICKS_DEFAULT;
+        pcb->timers.retransmit_count = 0;
+        pcb->timers.retransmission = kernel_ticks + pcb->timers.rto_ticks;
+        pcb->retransmission_timer = pcb->timers.retransmission;
+        pcb->flags |= TCP_PCB_FLAG_TIMER_RTO;
+    }
+}
+
+int tcp_send(struct tcp_pcb *pcb, const uint8_t *buffer, size_t len)
+{
+    if (pcb == 0 || buffer == 0) {
+        return -1;
+    }
+    if (len == 0) {
+        return 0;
+    }
+
+    size_t accepted = 0;
+    while (accepted < len) {
+        size_t requested = len - accepted;
+        if (requested > TCP_DEFAULT_MSS) {
+            requested = TCP_DEFAULT_MSS;
+        }
+
+        /* Allocate the private kernel copy before taking the PCB mutex. */
+        struct tcp_segment *seg = (struct tcp_segment *)kmalloc(sizeof(*seg));
+        if (seg == 0) {
+            return accepted != 0 ? (int)accepted : -1;
+        }
+        seg->data = (uint8_t *)kmalloc(requested);
+        if (seg->data == 0) {
+            kfree(seg);
+            return accepted != 0 ? (int)accepted : -1;
+        }
+        tcp_copy(seg->data, buffer + accepted, requested);
+
+        mutex_lock(&pcb->lock);
+        if (pcb->state != TCP_ESTABLISHED ||
+            (pcb->flags & TCP_PCB_FLAG_RESET) != 0) {
+            mutex_unlock(&pcb->lock);
+            kfree(seg->data);
+            kfree(seg);
+            return accepted != 0 ? (int)accepted : -1;
+        }
+
+        size_t space = tcp_tx_buffer_available_locked(pcb);
+        if (space == 0) {
+            mutex_unlock(&pcb->lock);
+            kfree(seg->data);
+            kfree(seg);
+            return accepted != 0 ? (int)accepted : -1;
+        }
+        size_t chunk_len = requested < space ? requested : space;
+        seg->sequence = pcb->snd_nxt;
+        seg->length = chunk_len;
+        seg->offset = 0;
+        seg->sent_at = 0;
+        seg->retransmit_count = 0;
+        tcp_queue_append_locked(&pcb->tx_buf.unsent, seg);
+
+        /*
+         * Send immediately in this phase.  Moving the entry before dropping
+         * pcb->lock makes a synchronous peer ACK safe: tcp_input can only
+         * acknowledge data already represented in the unacked queue.
+         */
+        seg = tcp_queue_take_head_locked(&pcb->tx_buf.unsent);
+        uint32_t cur_seq = seg->sequence;
+        int queue_was_empty = pcb->tx_buf.unacked.head == 0;
+        tcp_queue_append_locked(&pcb->tx_buf.unacked, seg);
+        pcb->snd_nxt += (uint32_t)chunk_len;
+        pcb->seq_number = pcb->snd_nxt;
+        seg->sent_at = kernel_ticks;
+
+        if (queue_was_empty) {
+            pcb->timers.rto_ticks = (uint32_t)TCP_DATA_RTO_TICKS_DEFAULT;
+            pcb->timers.retransmission = kernel_ticks + pcb->timers.rto_ticks;
+            pcb->retransmission_timer = pcb->timers.retransmission;
+            pcb->timers.retransmit_count = 0;
+            pcb->flags |= TCP_PCB_FLAG_TIMER_RTO;
+        }
+
+        /* Build the wire packet under the lock, then release it before IPv4. */
+        uint8_t packet[TCP_HEADER_MIN_SIZE + TCP_DEFAULT_MSS];
+        size_t packet_len = sizeof(struct tcp_header) + chunk_len;
+        uint32_t local_ip = tcp_effective_local_ip(pcb);
+        uint32_t remote_ip = pcb->remote_ip;
+
+        struct tcp_header *hdr = (struct tcp_header *)packet;
+        hdr->src_port = htons(pcb->local_port);
+        hdr->dest_port = htons(pcb->remote_port);
+        hdr->seq_num = htonl(cur_seq);
+        hdr->ack_num = htonl(pcb->rcv_nxt);
+        hdr->data_offset_flags = htons((5U << 12) | TCP_FLAG_ACK | TCP_FLAG_PSH);
+        hdr->window_size = htons((uint16_t)(pcb->window & 0xFFFFU));
+        hdr->checksum = 0;
+        hdr->urgent_ptr = 0;
+
+        tcp_copy(packet + sizeof(struct tcp_header), seg->data, chunk_len);
+        uint16_t csum = tcp_checksum(local_ip, remote_ip, packet, packet_len);
+        if (csum == 0U) {
+            csum = 0xFFFFU;
+        }
+        hdr->checksum = htons(csum);
+
+        mutex_unlock(&pcb->lock);
+
+        /* Transmit with NO locks held */
+        klog("[TCP TX] DATA transmitido\n");
+        if (net_send_ipv4(remote_ip, IP_PROTO_TCP, packet, packet_len) != 0) {
+            /* The private unacked copy remains queued for the data RTO. */
+            klog("[TCP TX] DATA enfileirado para retransmissao apos falha de IPv4\n");
+        }
+
+        accepted += chunk_len;
+    }
+
+    return (int)accepted;
 }
 
 void tcp_run_tests(void)
@@ -1298,6 +1843,303 @@ void tcp_run_tests(void)
             klog("[TCP TEST] FAIL: tcp_timer_tick timeout\n");
         }
         tcp_free(tm_pcb);
+    }
+
+    /* Test 11: Passive Open - tcp_listen and backlog verification */
+    tcp_pcb_t *lst_pcb = tcp_alloc();
+    if (lst_pcb != 0) {
+        lst_pcb->local_ip = htonl(0x0A00020FU);
+        lst_pcb->local_port = 8888;
+        tcp_register(lst_pcb);
+
+        int lis_res = tcp_listen(lst_pcb, 100); /* Exceeds MAX_BACKLOG, should clamp */
+        if (lis_res == 0 && lst_pcb->state == TCP_LISTEN &&
+            lst_pcb->backlog == (int)TCP_MAX_BACKLOG &&
+            (lst_pcb->flags & TCP_PCB_FLAG_PASSIVE) != 0) {
+            klog("[TCP TEST] PASS: tcp_listen (estado LISTEN, flag PASSIVE, backlog clamp)\n");
+        } else {
+            klog("[TCP TEST] FAIL: tcp_listen\n");
+        }
+        tcp_socket_destroy(lst_pcb);
+    }
+
+    /* Test 12: Passive Open - Handshake, child PCB, backlog enqueue & accept */
+    tcp_pcb_t *srv_pcb = tcp_alloc();
+    if (srv_pcb != 0) {
+        srv_pcb->local_ip = htonl(0x0A00020FU);
+        srv_pcb->local_port = 8889;
+        tcp_register(srv_pcb);
+        tcp_listen(srv_pcb, 4);
+
+        /* Simulates incoming SYN from remote client */
+        struct tcp_header syn_hdr;
+        uint8_t syn_buf[TCP_HEADER_MIN_SIZE];
+        syn_hdr.src_port = 54321;
+        syn_hdr.dest_port = 8889;
+        syn_hdr.seq_num = 10000; /* Client ISS */
+        syn_hdr.ack_num = 0;
+        syn_hdr.data_offset_flags = (5U << 12) | TCP_FLAG_SYN;
+        syn_hdr.window_size = 65535;
+        syn_hdr.checksum = 0;
+        syn_hdr.urgent_ptr = 0;
+
+        tcp_serialize_header(&syn_hdr, syn_buf, sizeof(syn_buf));
+        uint16_t syn_csum = tcp_checksum(htonl(0x0A000202U), htonl(0x0A00020FU), syn_buf, sizeof(syn_buf));
+        ((struct tcp_header *)syn_buf)->checksum = htons(syn_csum);
+
+        int syn_res = tcp_input(htonl(0x0A000202U), htonl(0x0A00020FU), syn_buf, sizeof(syn_buf));
+        tcp_pcb_t *child = tcp_lookup(htonl(0x0A00020FU), htonl(0x0A000202U), 8889, 54321);
+
+        if (syn_res == 0 && child != 0 && child->state == TCP_SYN_RECEIVED &&
+            child->ack_number == 10001 && child->parent == srv_pcb &&
+            srv_pcb->state == TCP_LISTEN) {
+            klog("[TCP TEST] PASS: Passive Handshake SYN (Child criado em SYN_RECEIVED, listener permanece LISTEN)\n");
+
+            /* Simulates incoming final ACK from client */
+            struct tcp_header ack_hdr;
+            uint8_t ack_buf[TCP_HEADER_MIN_SIZE];
+            ack_hdr.src_port = 54321;
+            ack_hdr.dest_port = 8889;
+            ack_hdr.seq_num = 10001;
+            ack_hdr.ack_num = child->iss + 1U;
+            ack_hdr.data_offset_flags = (5U << 12) | TCP_FLAG_ACK;
+            ack_hdr.window_size = 65535;
+            ack_hdr.checksum = 0;
+            ack_hdr.urgent_ptr = 0;
+
+            tcp_serialize_header(&ack_hdr, ack_buf, sizeof(ack_buf));
+            uint16_t ack_csum = tcp_checksum(htonl(0x0A000202U), htonl(0x0A00020FU), ack_buf, sizeof(ack_buf));
+            ((struct tcp_header *)ack_buf)->checksum = htons(ack_csum);
+
+            int ack_res = tcp_input(htonl(0x0A000202U), htonl(0x0A00020FU), ack_buf, sizeof(ack_buf));
+            if (ack_res == 0 && child->state == TCP_ESTABLISHED && srv_pcb->accept_count == 1) {
+                klog("[TCP TEST] PASS: Final ACK (Child ESTABLISHED e inserido no backlog do listener)\n");
+
+                tcp_pcb_t *accepted = tcp_accept(srv_pcb);
+                if (accepted == child && accepted->parent == 0 && srv_pcb->accept_count == 0) {
+                    klog("[TCP TEST] PASS: tcp_accept (Child desempilhado com sucesso, parent desvinculado)\n");
+                } else {
+                    klog("[TCP TEST] FAIL: tcp_accept dequeue\n");
+                }
+            } else {
+                klog("[TCP TEST] FAIL: Final ACK processing\n");
+            }
+            tcp_socket_destroy(child);
+        } else {
+            klog("[TCP TEST] FAIL: Passive Handshake SYN\n");
+            if (child != 0) tcp_socket_destroy(child);
+        }
+        tcp_socket_destroy(srv_pcb);
+    }
+
+    /* Test 13: Ring Buffer operations (tcp_rx_buffer) */
+    tcp_pcb_t *rb_pcb = tcp_alloc();
+    if (rb_pcb != 0) {
+        const char *t_data = "ABCDEFGH";
+        size_t wr = tcp_rx_buffer_write_locked(rb_pcb, (const uint8_t *)t_data, 8);
+        uint8_t r_buf[16];
+        size_t rd1 = tcp_rx_buffer_read_locked(rb_pcb, r_buf, 4);
+        size_t rd2 = tcp_rx_buffer_read_locked(rb_pcb, r_buf + 4, 4);
+        r_buf[8] = '\0';
+
+        if (wr == 8 && rd1 == 4 && rd2 == 4 && rb_pcb->rx_buf.used == 0 &&
+            r_buf[0] == 'A' && r_buf[3] == 'D' && r_buf[4] == 'E' && r_buf[7] == 'H') {
+            klog("[TCP TEST] PASS: tcp_rx_buffer (escrita circular, leitura parcial e used tracking)\n");
+        } else {
+            klog("[TCP TEST] FAIL: tcp_rx_buffer\n");
+        }
+        tcp_free(rb_pcb);
+    }
+
+    /* Test 14: Receive Path Simulation (in-order data, duplicate, out-of-order, FIN) */
+    tcp_pcb_t *rx_pcb = tcp_alloc();
+    if (rx_pcb != 0) {
+        rx_pcb->local_ip = htonl(0x0A00020FU);
+        rx_pcb->remote_ip = htonl(0x0A000202U);
+        rx_pcb->local_port = 7777;
+        rx_pcb->remote_port = 55555;
+        rx_pcb->iss = 50000;
+        rx_pcb->snd_una = 50001;
+        rx_pcb->snd_nxt = 50001;
+        rx_pcb->seq_number = 50001;
+        rx_pcb->rcv_nxt = 10000;
+        rx_pcb->ack_number = 10000;
+        rx_pcb->state = TCP_ESTABLISHED;
+        tcp_register(rx_pcb);
+
+        /* Simulates in-order incoming DATA: seq=10000, len=5 ("HELLO") */
+        uint8_t data_pkt[TCP_HEADER_MIN_SIZE + 5];
+        struct tcp_header d_hdr;
+        d_hdr.src_port = 55555;
+        d_hdr.dest_port = 7777;
+        d_hdr.seq_num = 10000;
+        d_hdr.ack_num = 50001;
+        d_hdr.data_offset_flags = (5U << 12) | TCP_FLAG_ACK;
+        d_hdr.window_size = 65535;
+        d_hdr.checksum = 0;
+        d_hdr.urgent_ptr = 0;
+        tcp_serialize_header(&d_hdr, data_pkt, sizeof(data_pkt));
+        tcp_copy(data_pkt + TCP_HEADER_MIN_SIZE, "HELLO", 5);
+        uint16_t d_csum = tcp_checksum(htonl(0x0A000202U), htonl(0x0A00020FU), data_pkt, sizeof(data_pkt));
+        ((struct tcp_header *)data_pkt)->checksum = htons(d_csum);
+
+        int d_res = tcp_input(htonl(0x0A000202U), htonl(0x0A00020FU), data_pkt, sizeof(data_pkt));
+        uint8_t read_out[10];
+        int rd_bytes = tcp_receive_read(rx_pcb, read_out, sizeof(read_out));
+
+        if (d_res == 0 && rx_pcb->rcv_nxt == 10005 && rd_bytes == 5 &&
+            read_out[0] == 'H' && read_out[4] == 'O') {
+            klog("[TCP TEST] PASS: Receive Path (DATA in-order recebido, rcv_nxt avancado e lido do buffer)\n");
+        } else {
+            klog("[TCP TEST] FAIL: Receive Path DATA in-order\n");
+        }
+
+        /* Simulates duplicate DATA (seq=10000 < rcv_nxt=10005): should be dropped */
+        int dup_res = tcp_input(htonl(0x0A000202U), htonl(0x0A00020FU), data_pkt, sizeof(data_pkt));
+        if (dup_res == 0 && rx_pcb->rcv_nxt == 10005 && rx_pcb->rx_buf.used == 0) {
+            klog("[TCP TEST] PASS: Receive Path (DATA duplicado descartado sem poluir rx_buf)\n");
+        } else {
+            klog("[TCP TEST] FAIL: Receive Path DATA duplicate\n");
+        }
+
+        /* Simulates out-of-order DATA (seq=10020 > rcv_nxt=10005): should be dropped */
+        d_hdr.seq_num = 10020;
+        tcp_serialize_header(&d_hdr, data_pkt, sizeof(data_pkt));
+        tcp_copy(data_pkt + TCP_HEADER_MIN_SIZE, "WORLD", 5);
+        d_csum = tcp_checksum(htonl(0x0A000202U), htonl(0x0A00020FU), data_pkt, sizeof(data_pkt));
+        ((struct tcp_header *)data_pkt)->checksum = htons(d_csum);
+
+        int ooo_res = tcp_input(htonl(0x0A000202U), htonl(0x0A00020FU), data_pkt, sizeof(data_pkt));
+        if (ooo_res == 0 && rx_pcb->rcv_nxt == 10005 && rx_pcb->rx_buf.used == 0) {
+            klog("[TCP TEST] PASS: Receive Path (DATA out-of-order descartado por politica sem avancar rcv_nxt)\n");
+        } else {
+            klog("[TCP TEST] FAIL: Receive Path DATA out-of-order\n");
+        }
+
+        /* Simulates FIN (seq=10005 == rcv_nxt=10005): should advance rcv_nxt to 10006 and set CLOSE_WAIT */
+        uint8_t fin_pkt[TCP_HEADER_MIN_SIZE];
+        struct tcp_header fin_hdr;
+        fin_hdr.src_port = 55555;
+        fin_hdr.dest_port = 7777;
+        fin_hdr.seq_num = 10005;
+        fin_hdr.ack_num = 50001;
+        fin_hdr.data_offset_flags = (5U << 12) | TCP_FLAG_ACK | TCP_FLAG_FIN;
+        fin_hdr.window_size = 65535;
+        fin_hdr.checksum = 0;
+        fin_hdr.urgent_ptr = 0;
+        tcp_serialize_header(&fin_hdr, fin_pkt, sizeof(fin_pkt));
+        uint16_t fin_csum = tcp_checksum(htonl(0x0A000202U), htonl(0x0A00020FU), fin_pkt, sizeof(fin_pkt));
+        ((struct tcp_header *)fin_pkt)->checksum = htons(fin_csum);
+
+        int fin_res = tcp_input(htonl(0x0A000202U), htonl(0x0A00020FU), fin_pkt, sizeof(fin_pkt));
+        if (fin_res == 0 && rx_pcb->rcv_nxt == 10006 && rx_pcb->state == TCP_CLOSE_WAIT &&
+            (rx_pcb->flags & TCP_PCB_FLAG_EOF) != 0) {
+            klog("[TCP TEST] PASS: Receive Path (FIN recebido, transicao para CLOSE_WAIT e flag EOF)\n");
+        } else {
+            klog("[TCP TEST] FAIL: Receive Path FIN\n");
+        }
+
+        tcp_socket_destroy(rx_pcb);
+    }
+
+    /* Test 15: TX Buffer & Unacknowledged Queue operations */
+    tcp_pcb_t *tx_pcb = tcp_alloc();
+    if (tx_pcb != 0) {
+        tx_pcb->local_ip = htonl(0x0A00020FU);
+        tx_pcb->remote_ip = htonl(0x0A000202U);
+        tx_pcb->local_port = 6666;
+        tx_pcb->remote_port = 44444;
+        tx_pcb->iss = 1000;
+        tx_pcb->snd_una = 1001;
+        tx_pcb->snd_nxt = 1001;
+        tx_pcb->seq_number = 1001;
+        tx_pcb->rcv_nxt = 2000;
+        tx_pcb->ack_number = 2000;
+        tx_pcb->state = TCP_ESTABLISHED;
+        tcp_register(tx_pcb);
+
+        /* Send 10 bytes: seq 1001..1011 */
+        int s1 = tcp_send(tx_pcb, (const uint8_t *)"0123456789", 10);
+        /* Send another 10 bytes: seq 1011..1021 */
+        int s2 = tcp_send(tx_pcb, (const uint8_t *)"ABCDEFGHIJ", 10);
+
+        int q_ok = (s1 == 10 && s2 == 10 && tx_pcb->snd_nxt == 1021 &&
+                    tx_pcb->tx_buf.unsent.bytes == 0 &&
+                    tx_pcb->tx_buf.unacked.bytes == 20 &&
+                    tx_pcb->tx_buf.unacked.segments == 2);
+
+        /* Test Invalid ACK (ack = 1050 > snd_nxt=1021): should be rejected */
+        mutex_lock(&tx_pcb->lock);
+        tcp_tx_ack_received_locked(tx_pcb, 1050);
+        int inv_ok = (tx_pcb->snd_una == 1001 && tx_pcb->tx_buf.unacked.bytes == 20);
+
+        /* Test Duplicate ACK (ack = 1001 == snd_una): should not advance */
+        tcp_tx_ack_received_locked(tx_pcb, 1001);
+        int dup_ok = (tx_pcb->snd_una == 1001 && tx_pcb->tx_buf.unacked.bytes == 20);
+
+        /* Test Partial ACK (ack = 1006): acknowledges 5 bytes of segment 1 */
+        tcp_tx_ack_received_locked(tx_pcb, 1006);
+        int part_ok = (tx_pcb->snd_una == 1006 && tx_pcb->tx_buf.unacked.bytes == 15 &&
+                       tx_pcb->tx_buf.unacked.head != 0 &&
+                       tx_pcb->tx_buf.unacked.head->sequence == 1006 &&
+                       tx_pcb->tx_buf.unacked.head->length == 5 &&
+                       tx_pcb->tx_buf.unacked.head->offset == 5);
+
+        /* Test Full ACK (ack = 1021): acknowledges all remaining bytes */
+        tcp_tx_ack_received_locked(tx_pcb, 1021);
+        int full_ok = (tx_pcb->snd_una == 1021 && tx_pcb->tx_buf.unacked.bytes == 0 &&
+                       tx_pcb->tx_buf.unacked.head == 0 &&
+                       (tx_pcb->flags & TCP_PCB_FLAG_TIMER_RTO) == 0);
+        mutex_unlock(&tx_pcb->lock);
+
+        if (q_ok && inv_ok && dup_ok && part_ok && full_ok) {
+            klog("[TCP TEST] PASS: tcp_tx_buffer (enfileiramento, ACK parcial, cumulativo e validacao de limites)\n");
+        } else {
+            klog("[TCP TEST] FAIL: tcp_tx_buffer\n");
+        }
+        tcp_socket_destroy(tx_pcb);
+    }
+
+    /* Test 16: TX Retransmission & RTO ticks */
+    tcp_pcb_t *rt_pcb = tcp_alloc();
+    if (rt_pcb != 0) {
+        rt_pcb->local_ip = htonl(0x0A00020FU);
+        rt_pcb->remote_ip = htonl(0x0A000202U);
+        rt_pcb->local_port = 6667;
+        rt_pcb->remote_port = 44445;
+        rt_pcb->iss = 5000;
+        rt_pcb->snd_una = 5001;
+        rt_pcb->snd_nxt = 5001;
+        rt_pcb->seq_number = 5001;
+        rt_pcb->rcv_nxt = 7000;
+        rt_pcb->ack_number = 7000;
+        rt_pcb->state = TCP_ESTABLISHED;
+        tcp_register(rt_pcb);
+
+        tcp_send(rt_pcb, (const uint8_t *)"RETRY_ME", 8);
+        uint32_t first_rto = rt_pcb->timers.rto_ticks;
+
+        /* Force tick to expire RTO */
+        tcp_timer_tick(rt_pcb->timers.retransmission + 1);
+
+        int rto_ok = (rt_pcb->timers.retransmit_count == 1 &&
+                      rt_pcb->timers.rto_ticks == first_rto * 2 &&
+                      rt_pcb->tx_buf.unacked.head != 0 &&
+                      rt_pcb->tx_buf.unacked.head->sequence == 5001);
+
+        /* Simulate reaching max retries */
+        rt_pcb->timers.retransmit_count = TCP_MAX_DATA_RETRIES;
+        tcp_timer_tick(rt_pcb->timers.retransmission + 1);
+        int retry_limit_ok = (rt_pcb->state == TCP_CLOSED &&
+                              (rt_pcb->flags & TCP_PCB_FLAG_RESET) != 0 &&
+                              rt_pcb->tx_buf.unacked.head == 0);
+
+        if (rto_ok && retry_limit_ok) {
+            klog("[TCP TEST] PASS: tcp_tx_retransmission (RTO tick, backoff exponencial e limite de retries)\n");
+        } else {
+            klog("[TCP TEST] FAIL: tcp_tx_retransmission\n");
+        }
+        tcp_socket_destroy(rt_pcb);
     }
 
     klog("[TCP TEST] Finalizada Suite de Testes TCP.\n");

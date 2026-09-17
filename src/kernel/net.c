@@ -8,6 +8,7 @@
 #include "vmm.h"
 #include "heap.h"
 #include "vfs.h"
+#include "apic.h"
 
 extern volatile uint64_t kernel_ticks;
 
@@ -483,22 +484,32 @@ int socket_vfs_read(vfs_node_t *node, uint64_t offset, uint32_t size, uint8_t *b
             }
 
             mutex_lock(&pcb->lock);
-            if (pcb->state == TCP_CLOSED) {
+            if (pcb->state == TCP_CLOSED || (pcb->flags & TCP_PCB_FLAG_EOF) != 0 ||
+                pcb->state == TCP_CLOSE_WAIT) {
                 mutex_unlock(&pcb->lock);
                 return 0;
             }
             mutex_unlock(&pcb->lock);
 
-            /* The VFS lock must not be held while the task sleeps. */
-            mutex_unlock(&vfs_mutex);
-            uint64_t rflags_tcp = save_and_disable_interrupts();
+            /* Register the wait while the PCB lock is still held so a peer RX
+             * event cannot arrive in the window between the empty-buffer check
+             * and the blocked transition.
+             */
+            mutex_lock(&pcb->lock);
             if (tcp_receive_available(pcb) == 0) {
                 scheduler_sleep_current(TASK_WAIT_SOCKET_RECV, (uint64_t)sock);
+                mutex_unlock(&pcb->lock);
+                mutex_unlock(&vfs_mutex);
+                uint64_t rflags_tcp = save_and_disable_interrupts();
                 restore_interrupts(rflags_tcp);
                 scheduler_yield();
-            } else {
-                restore_interrupts(rflags_tcp);
+                mutex_lock(&vfs_mutex);
+                continue;
             }
+            mutex_unlock(&pcb->lock);
+            mutex_unlock(&vfs_mutex);
+            uint64_t rflags_tcp = save_and_disable_interrupts();
+            restore_interrupts(rflags_tcp);
             mutex_lock(&vfs_mutex);
             continue;
         }
@@ -565,17 +576,16 @@ size_t socket_vfs_write(vfs_node_t *node, size_t offset, size_t size, const uint
     int result = -1;
     if (sock->type == SOCK_STREAM && sock->tcp != 0) {
         struct tcp_pcb *pcb = sock->tcp;
-        size_t send_len = size;
+        /*
+         * Keep the socket ownership lock until tcp_send() has finished using
+         * the PCB. The final VFS close follows the same sock -> pcb lock
+         * order, so it cannot free the PCB between this lookup and TX.
+         * tcp_send() drops pcb->lock before it enters IPv4, therefore this
+         * does not hold either TCP lock across network I/O.
+         */
+        int sent = tcp_send(pcb, buffer, size);
         mutex_unlock(&sock->mutex);
-        if (send_len > TCP_DEFAULT_MSS) {
-            send_len = TCP_DEFAULT_MSS;
-        }
-        result = tcp_output(pcb, (uint8_t)(TCP_FLAG_ACK | TCP_FLAG_PSH),
-            buffer, send_len);
-        if (result == 0) {
-            return send_len;
-        }
-        return 0;
+        return sent > 0 ? (size_t)sent : 0;
     }
     else if (sock->type == SOCK_DGRAM && sock->protocol == IP_PROTO_UDP) {
         uint16_t src_port = sock->local_port;
@@ -624,13 +634,21 @@ void socket_vfs_close(vfs_node_t *node)
         sock->tx_count = 0;
         
         if (sock->tcp != 0) {
-            tcp_socket_destroy(sock->tcp);
+            struct tcp_pcb *pcb = sock->tcp;
+            /*
+             * FIN shutdown is outside this phase.  Teardown is local and
+             * synchronous: remove the PCB from demultiplexing and release its
+             * RX/TX state without recursively entering the network stack while
+             * sock->mutex is held.  This keeps rapid accept/close cycles from
+             * racing a peer FIN or SYN forwarded by QEMU.
+             */
+            tcp_socket_destroy(pcb);
             sock->tcp = 0;
         }
         mutex_unlock(&sock->mutex);
         restore_interrupts(rflags);
     }
-    kfree(node);
+    node->data = 0;
 }
 
 void net_handle_arp(uint8_t *frame, size_t frame_length)
@@ -1084,6 +1102,7 @@ int sys_socket(int domain, int type, int protocol)
     }
 
     struct socket *sock = &sockets[slot];
+    mutex_init(&sock->mutex);
     sock->domain      = domain;
     sock->type        = type;
     sock->protocol    = protocol;
@@ -1129,8 +1148,9 @@ int sys_socket(int domain, int type, int protocol)
         return -1;
     }
 
-    for (int j = 0; j < VFS_NAME_MAX; j++) {
-        node->name[j] = 0;
+    uint8_t *node_bytes = (uint8_t *)node;
+    for (size_t k = 0; k < sizeof(vfs_node_t); k++) {
+        node_bytes[k] = 0;
     }
     node->name[0] = 's';
     node->type    = VFS_NODE_SOCKET;
@@ -1338,6 +1358,12 @@ int sys_connect(int fd, const struct sockaddr *addr, uint32_t addrlen)
             klog("NET: TCP connect timeout expirado.\n");
             return -1;
         }
+
+        /* Register the wait while the PCB lock is still held so the peer's ACK
+         * cannot slip between the state check and the blocked transition.
+         * The wake path runs under the same PCB lock, so this removes the
+         * lost-wakeup window without holding the TCP lock across context switch.
+         */
         scheduler_sleep_current(TASK_WAIT_NETWORK, (uint64_t)sock);
         mutex_unlock(&pcb->lock);
         restore_interrupts(rflags);
@@ -1404,11 +1430,6 @@ int sys_accept(int fd, struct sockaddr *addr, uint32_t *addrlen)
 
     struct tcp_pcb *child_pcb = 0;
     for (;;) {
-        child_pcb = tcp_accept(listen_pcb);
-        if (child_pcb != 0) {
-            break;
-        }
-
         uint64_t rflags = save_and_disable_interrupts();
         mutex_lock(&listen_pcb->lock);
         if (listen_pcb->state != TCP_LISTEN) {
@@ -1416,7 +1437,8 @@ int sys_accept(int fd, struct sockaddr *addr, uint32_t *addrlen)
             restore_interrupts(rflags);
             return -1;
         }
-        if (listen_pcb->accept_count == 0) {
+        child_pcb = tcp_accept_locked(listen_pcb);
+        if (child_pcb == 0) {
             scheduler_sleep_current(TASK_WAIT_SOCKET_RECV, (uint64_t)listener);
             mutex_unlock(&listen_pcb->lock);
             restore_interrupts(rflags);
@@ -1424,6 +1446,7 @@ int sys_accept(int fd, struct sockaddr *addr, uint32_t *addrlen)
         } else {
             mutex_unlock(&listen_pcb->lock);
             restore_interrupts(rflags);
+            break;
         }
     }
 
@@ -1443,6 +1466,7 @@ int sys_accept(int fd, struct sockaddr *addr, uint32_t *addrlen)
     }
 
     struct socket *accepted = &sockets[slot];
+    mutex_init(&accepted->mutex);
     accepted->domain = AF_INET;
     accepted->type = SOCK_STREAM;
     accepted->protocol = IP_PROTO_TCP;
@@ -1465,6 +1489,7 @@ int sys_accept(int fd, struct sockaddr *addr, uint32_t *addrlen)
         accepted->tx_queue[j].data = 0;
         accepted->tx_queue[j].len = 0;
     }
+
     mutex_unlock(&sockets_mutex);
 
     child_pcb->socket = accepted;
@@ -1478,8 +1503,9 @@ int sys_accept(int fd, struct sockaddr *addr, uint32_t *addrlen)
         tcp_socket_destroy(child_pcb);
         return -1;
     }
-    for (int j = 0; j < VFS_NAME_MAX; j++) {
-        new_node->name[j] = 0;
+    uint8_t *new_node_bytes = (uint8_t *)new_node;
+    for (size_t k = 0; k < sizeof(vfs_node_t); k++) {
+        new_node_bytes[k] = 0;
     }
     new_node->name[0] = 's';
     new_node->type = VFS_NODE_SOCKET;
@@ -1500,10 +1526,7 @@ int sys_accept(int fd, struct sockaddr *addr, uint32_t *addrlen)
     }
     accepted->fd = new_fd;
 
-    if (addr != 0 && addrlen != 0 &&
-        user_buffer_accessible(addr, sizeof(struct sockaddr_in)) &&
-        user_buffer_accessible(addrlen, sizeof(uint32_t)) &&
-        *addrlen >= sizeof(struct sockaddr_in)) {
+    if (addr != 0 && addrlen != 0 && *addrlen >= sizeof(struct sockaddr_in)) {
         struct sockaddr_in peer;
         peer.sin_family = AF_INET;
         peer.sin_port = htons(child_pcb->remote_port);
@@ -1517,4 +1540,149 @@ int sys_accept(int fd, struct sockaddr *addr, uint32_t *addrlen)
 
     klog("NET: TCP accept entregou conexao ESTABLISHED.\n");
     return new_fd;
+}
+
+int sys_recv(int fd, void *buffer, size_t len, int flags)
+{
+    task_t *task = scheduler_current_task();
+    if (task == 0 || fd < 0 || fd >= TASK_MAX_FDS) {
+        return -1;
+    }
+    if (buffer == 0) {
+        return -1;
+    }
+    if (len == 0) {
+        return 0;
+    }
+    if (!vmm_validate_user_ptr(buffer, len, 1)) {
+        return -1;
+    }
+    if (flags != 0) {
+        return -1;
+    }
+
+    file_description_t *fdesc = task->file_descriptors[fd];
+    vfs_node_t *node = (fdesc != 0) ? fdesc->node : 0;
+    if (node == 0 || node->read != socket_vfs_read) {
+        return -1;
+    }
+
+    struct socket *sock = (struct socket *)node->data;
+    if (sock == 0) {
+        return -1;
+    }
+    mutex_lock(&sock->mutex);
+    if (!sock->active || sock->type != SOCK_STREAM || sock->protocol != IP_PROTO_TCP) {
+        mutex_unlock(&sock->mutex);
+        return -1;
+    }
+    struct tcp_pcb *pcb = sock->tcp;
+    if (pcb == 0) {
+        mutex_unlock(&sock->mutex);
+        return -1;
+    }
+    mutex_unlock(&sock->mutex);
+
+    for (;;) {
+        mutex_lock(&sock->mutex);
+        if (!sock->active || sock->tcp != pcb) {
+            mutex_unlock(&sock->mutex);
+            return -1;
+        }
+        mutex_unlock(&sock->mutex);
+
+        mutex_lock(&pcb->lock);
+
+        if (pcb->rx_buf.used > 0) {
+            size_t read_bytes = tcp_rx_buffer_read_locked(pcb, (uint8_t *)buffer, len);
+            size_t free_sp = tcp_rx_buffer_free_space_locked(pcb);
+            pcb->window = (uint32_t)free_sp;
+            pcb->rcv_wnd = (uint16_t)(free_sp & 0xFFFFU);
+            mutex_unlock(&pcb->lock);
+            return (int)read_bytes;
+        }
+
+        if ((pcb->flags & TCP_PCB_FLAG_RESET) != 0) {
+            mutex_unlock(&pcb->lock);
+            return -1;
+        }
+
+        if ((pcb->flags & TCP_PCB_FLAG_EOF) != 0 ||
+            pcb->state == TCP_CLOSE_WAIT ||
+            pcb->state == TCP_CLOSED) {
+            mutex_unlock(&pcb->lock);
+            return 0;
+        }
+
+        if (pcb->state != TCP_ESTABLISHED && pcb->state != TCP_SYN_RECEIVED) {
+            mutex_unlock(&pcb->lock);
+            return -1;
+        }
+
+        uint64_t rflags = save_and_disable_interrupts();
+        if (pcb->rx_buf.used == 0 &&
+            (pcb->flags & (TCP_PCB_FLAG_RESET | TCP_PCB_FLAG_EOF)) == 0 &&
+            pcb->state == TCP_ESTABLISHED) {
+            scheduler_sleep_current(TASK_WAIT_SOCKET_RECV, (uint64_t)sock);
+            mutex_unlock(&pcb->lock);
+            restore_interrupts(rflags);
+            scheduler_yield();
+        } else {
+            mutex_unlock(&pcb->lock);
+            restore_interrupts(rflags);
+        }
+    }
+}
+
+int sys_send(int fd, const void *buffer, size_t len, int flags)
+{
+    task_t *task = scheduler_current_task();
+    if (task == 0 || fd < 0 || fd >= TASK_MAX_FDS) {
+        return -1;
+    }
+    if (len == 0) {
+        return 0;
+    }
+    if (buffer == 0) {
+        return -1;
+    }
+    if (!vmm_validate_user_ptr(buffer, len, 0)) {
+        return -1;
+    }
+    if (flags != 0) {
+        return -1;
+    }
+
+    file_description_t *fdesc = task->file_descriptors[fd];
+    vfs_node_t *node = (fdesc != 0) ? fdesc->node : 0;
+    if (node == 0 || node->write != socket_vfs_write) {
+        return -1;
+    }
+
+    struct socket *sock = (struct socket *)node->data;
+    if (sock == 0) {
+        return -1;
+    }
+    mutex_lock(&sock->mutex);
+    if (!sock->active || sock->type != SOCK_STREAM || sock->protocol != IP_PROTO_TCP) {
+        mutex_unlock(&sock->mutex);
+        return -1;
+    }
+    struct tcp_pcb *pcb = sock->tcp;
+    if (pcb == 0) {
+        mutex_unlock(&sock->mutex);
+        return -1;
+    }
+    /*
+     * TX is deliberately non-blocking in Phase 2B.2B.  tcp_send() makes the
+     * capacity decision while holding pcb->lock, copies only accepted bytes
+     * into kernel-owned memory, and returns a short write when the bounded
+     * buffer fills.  A later phase may add blocking send semantics.
+     * Keep sock->mutex until tcp_send() returns: socket_vfs_close() takes the
+     * same lock before destroying the PCB, so this borrowed PCB pointer stays
+     * valid for the full send operation.
+     */
+    int sent = tcp_send(pcb, (const uint8_t *)buffer, len);
+    mutex_unlock(&sock->mutex);
+    return sent;
 }

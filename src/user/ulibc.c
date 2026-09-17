@@ -60,8 +60,11 @@
 #define SYS_SIGACTION 51
 #define SYS_SIGPROCMASK 52
 #define SYS_WAITPID 53
+#define SYS_RECV 54
+#define SYS_SEND 55
 
 #define PAGE_SIZE 4096UL
+
 #define PRINTF_BUF_SIZE 2048
 
 static inline long _syscall(long num, long a1, long a2, long a3, long a4, long a5, long a6)
@@ -542,6 +545,17 @@ int accept(int fd, struct sockaddr *addr, uint32_t *addrlen)
 {
     return (int)syscall3(SYS_ACCEPT, fd, (long)addr, (long)addrlen);
 }
+
+int recv(int fd, void *buf, size_t len, int flags)
+{
+    return (int)syscall4(SYS_RECV, fd, (long)buf, len, flags);
+}
+
+int send(int fd, const void *buf, size_t len, int flags)
+{
+    return (int)syscall4(SYS_SEND, fd, (long)buf, len, flags);
+}
+
 
 int chmod(const char *path, uint32_t mode)
 {

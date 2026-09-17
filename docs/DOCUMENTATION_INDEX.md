@@ -91,12 +91,15 @@ Este documento serve como o mapa central da documentação técnica do PhotonOS 
 *   **Público-Alvo**: Desenvolvedores e engenheiros de depuração.
 
 ### 14. Subsistema TCP v4.2 / v4.4 & Arquitetura de Rede
+*   **[networking/tcp_phase2b2_tx.md](networking/tcp_phase2b2_tx.md)**: Especificação da **TCP Phase 2B.2B** (TX buffer por PCB de 8192 bytes, `send()`, segmentação MSS, `SND.NXT`/`SND.UNA`, ACK parcial/cumulativo, RTO básico e política de escrita parcial).
+*   **[networking/tcp_phase2b2_rx.md](networking/tcp_phase2b2_rx.md)**: Especificação completa da **TCP Phase 2B.2A** (Receive Path, Buffer Circular RX de 8192 bytes, avanço monotônico de `rcv_nxt`, emissão de ACK de payload, descarte e re-ACK de duplicados e fora de ordem, syscall `recv()` com bloqueio cooperativo, detecção de EOF e RST, e validação por captura PCAP no fio).
+*   **[networking/tcp_phase2b_passive.md](networking/tcp_phase2b_passive.md)**: Especificação completa da **TCP Phase 2B.1** (Abertura Passiva, estado `LISTEN`, child PCBs independentes, transição `SYN_RECEIVED`, fila de backlog com saturação, syscalls `listen()` e `accept()` com bloqueio cooperativo).
 *   **[networking/tcp_phase2a.md](networking/tcp_phase2a.md)**: Especificação completa da **TCP Phase 2A** (3-Way Handshake `SYN -> SYN+ACK -> ACK`, máquina de estados `ESTABLISHED`, temporizadores RTO, tratamento de RST, timeout, integração `connect()` e validação por captura PCAP no fio).
 *   **[tcp_socket_integration_fix.md](tcp_socket_integration_fix.md)**: Relatório da correção da integração `sys_socket()` com a camada de Sockets TCP no boot, causa raiz (`current_task == NULL`), alocação de descritores no contexto do kernel e testes de não-regressão.
 *   **[tcp_architecture.md](tcp_architecture.md)**: Arquitetura completa do subsistema TCP, estrutura dos PCBs, máquina de estados, serialização/checksum, fluxos RX/TX e diagrama completo da pilha de rede.
 *   **[network_architecture.md](network_architecture.md)** (e **[networking/network_architecture.md](networking/network_architecture.md)**): Arquitetura global da pilha de rede, barramento PCI, DMA físico e suporte a sockets.
-*   **[tcp_socket_layer.md](tcp_socket_layer.md)**: Abstração VFS, nós de socket, mapeamento de syscalls (`connect`, `listen`, `accept`) e desativação de espera ocupada no escalonador.
-*   **[tcp_pcb.md](tcp_pcb.md)**: Estrutura detalhada do Protocol Control Block (`struct tcp_pcb`), filas de segmentos dinâmicos e temporizadores.
+*   **[tcp_socket_layer.md](tcp_socket_layer.md)**: Abstração VFS, nós de socket, mapeamento de syscalls (`connect`, `listen`, `accept`, `recv`) e desativação de espera ocupada no escalonador.
+*   **[tcp_pcb.md](tcp_pcb.md)**: Estrutura detalhada do Protocol Control Block (`struct tcp_pcb`), buffer circular RX, filas de segmentos dinâmicos e temporizadores.
 *   **[tcp_port_management.md](tcp_port_management.md)**: Gerenciamento de portas bem conhecidas e efêmeras (49152..65535), prevenção de colisão e liberação.
 *   **[tcp_checksum.md](tcp_checksum.md)**: Especificação do checksum TCP RFC 793 com pseudo-cabeçalho IPv4 e complemento de 1 em soma de 16 bits.
 *   **[tcp_design.md](tcp_design.md)**: Princípios de design, desacoplamento modular, ausência de busy-wait e roadmap de evolução.
@@ -335,6 +338,40 @@ Este documento serve como o mapa central da documentação técnica do PhotonOS 
 
 ### 6.4. [programs.md](userspace/programs.md)
 *   **Descrição**: Catálogo de programas Ring 3 em disco.
-*   **Objetivo**: Catalogar os binários `shell`, `ping`, `hello`, `hang`, `upper`, `rev` e `spin`, detalhando seu código de teste e casos de validação.
+*   **Objetivo**: Catalogar os binários `shell`, `ping`, `hello`, `hang`, `upper`, `rev`, `spin` e `tcptest`, detalhando seu código de teste e casos de validação.
 *   **Dependências**: ulibc.
 *   **Público-Alvo**: Desenvolvedores e usuários finais.
+
+---
+
+## 🌐 7. Subsistema de Rede e TCP (networking/)
+
+### 7.1. [tcp.md](networking/tcp.md)
+*   **Descrição**: Visão geral e mapa de fases do protocolo TCP no PhotonOS.
+*   **Objetivo**: Rastrear o progresso das Fases 1, 2A, 2B.1, 2B.2A, 2B.2B e próximas etapas.
+*   **Dependências**: Pilha de rede IPv4/e1000.
+*   **Público-Alvo**: Engenheiros de rede e desenvolvedores.
+
+### 7.2. [tcp_phase2a.md](networking/tcp_phase2a.md)
+*   **Descrição**: Especificação técnica e validação experimental da TCP Phase 2A (Active Open).
+*   **Objetivo**: Detalhar o handshake 3-way ativo, transições de estado, temporizadores RTO, `connect()` e inspeção PCAP.
+*   **Dependências**: Drivers e1000, IPv4, Sockets.
+*   **Público-Alvo**: Engenheiros de rede e revisores de código.
+
+### 7.3. [tcp_phase2b_passive.md](networking/tcp_phase2b_passive.md)
+*   **Descrição**: Especificação técnica e validação experimental da TCP Phase 2B.1 (Passive Open).
+*   **Objetivo**: Detalhar a abertura passiva (`listen`/`accept`), fila de backlog, ciclo de vida de child PCBs, bloqueio cooperativo e PCAP.
+*   **Dependências**: Drivers e1000, IPv4, Sockets, Escalonador.
+*   **Público-Alvo**: Engenheiros de rede, arquitetos de kernel e desenvolvedores.
+
+### 7.4. [tcp_phase2b2_rx.md](networking/tcp_phase2b2_rx.md)
+*   **Descrição**: Especificação técnica da TCP Phase 2B.2A (Receive Path).
+*   **Objetivo**: Documentar `recv()`, o RX ring buffer, `RCV.NXT`, ACK de dados, EOF e RST.
+*   **Dependências**: Drivers e1000, IPv4, Sockets, Escalonador.
+*   **Público-Alvo**: Engenheiros de rede e desenvolvedores de kernel.
+
+### 7.5. [tcp_phase2b2_tx.md](networking/tcp_phase2b2_tx.md)
+*   **Descrição**: Especificação técnica da TCP Phase 2B.2B (Transmit Path).
+*   **Objetivo**: Documentar `send()`, TX buffer, segmentação MSS, `SND.NXT`/`SND.UNA`, ACK e retransmissão básica.
+*   **Dependências**: Drivers e1000, IPv4, Sockets, Escalonador e VMM.
+*   **Público-Alvo**: Engenheiros de rede, revisores de concorrência e desenvolvedores de kernel.

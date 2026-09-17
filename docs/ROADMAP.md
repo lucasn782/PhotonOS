@@ -76,16 +76,42 @@ Este documento descreve o estado atual do desenvolvimento do PhotonOS, dividindo
 - **Temporizadores RTO e Prevenção de Deadlocks:** Retransmissão com recuo exponencial e transmissão diferida no `tcp_timer_tick()`, desacoplada de `tcp_pcbs_lock`.
 - **Concorrência e Estresse:** Validação de 4 conexões consecutivas e 4 conexões simultâneas via `fork()` sem corrupção ou vazamento de recursos.
 
+### Trilha 17 — TCP Phase 2B.1: Passive Open, Listen, Accept & Backlog (v4.4-tcp2b1)
+- **Abertura Passiva do Servidor (`listen`/`accept`):** Transição de socket para estado `LISTEN`, validação de porta vinculada e saturação de backlog (`TCP_MAX_BACKLOG = 16`).
+- **Ciclo de Vida de Child PCBs:** Alocação de PCB filho em `SYN_RECEIVED`, Initial Sequence Number (`ISS`) próprio e monotônico, resposta com `SYN+ACK`.
+- **Fila de Backlog & Syscall `accept()` Bloqueante:** Enfileiramento ao receber o `ACK` final (`ESTABLISHED`), espera cooperativa sem busy-wait no escalonador e despertar imediato (`tcp_socket_notify`).
+- **Demultiplexação Prioritária:** Conexões ativas de 4-tuple exato têm precedência sobre listeners genéricos.
+- **Herança de Descritores pós-`fork()`:** Suporte a clonagem de descritores pós-`accept()` e encerramento limpo sem efeito colateral.
+- **Validação de Não-Regressão e PCAP:** 15/15 testes automatizados aprovados, traço de wire validado com clientes externos e 10/10 boots sem regressões.
+
+### Trilha 18 — TCP Phase 2B.2A: Receive Path & RX Buffer (v4.4-tcp2b2a)
+- **Buffer Circular de Recepção (RX Buffer):** Capacidade de 8192 bytes por PCB (`tcp_rx_buffer_t`), gerenciamento de ponteiros head/tail, cálculo de espaço livre e capacidade, com prevenção de overflow.
+- **Data Plane de Recepção em `ESTABLISHED`:** Ingestão de dados ordenados (`seq == rcv_nxt`), avanço monotônico de `rcv_nxt`, atualização dinâmica da janela anunciada (`rcv_wnd`) e emissão imediata de `ACK`.
+- **Tratamento de Segmentos Duplicados e Fora de Ordem:** Descarte seguro de dados duplicados (`seq < rcv_nxt`) e out-of-order (`seq > rcv_nxt`), com re-emissão de ACK com `rcv_nxt` atual para ressincronização.
+- **Syscall `recv()` com Bloqueio Cooperativo (SYS_RECV = 54):** Consumo de dados do buffer circular, validação de ponteiros de usuário, suporte a leituras parciais, suspensão limpa em `TASK_WAIT_SOCKET_RECV` e eliminação de lost wakeups.
+- **Tratamento de EOF e RST:** Detecção de encerramento remoto (`FIN` -> `TCP_CLOSE_WAIT` / `TCP_PCB_FLAG_EOF`) retornando 0 (EOF padrão POSIX) e abortos (`RST`) retornando erro.
+- **Concorrência e Herança (`fork()` / `dup()`):** Compartilhamento seguro de socket e descritor entre processos pai/filho e múltiplos clientes simultâneos.
+- **Validação Completa & PCAP:** 17/17 testes aprovados na suite Phase 2B.2A, sem regressões nas suites 2A, 2B.1, 10/10 boots, signals e VFS.
+
+### Trilha 19 — TCP Phase 2B.2B: Transmit Path & Data Plane (v4.4-tcp2b2b)
+- **Transmissão de Dados (`send`/TX Buffer):** `tcp_tx_buffer_t` limitado a 8192 bytes por PCB, cópia de payload Ring 3 para memória kernel-owned, segmentação MSS 1460, avanço de `SND.NXT`, rastreamento de `SND.UNA`, ACK parcial e cumulativo, e semântica de escrita parcial não bloqueante sob saturação.
+- **Retransmissão Básica (RTO):** Temporizador RTO de dados com backoff exponencial, desacoplado do timeout de handshake, limite de tentativas (`TCP_MAX_DATA_RETRIES = 5`) e encerramento limpo com reset em caso de falha persistente.
+- **Concorrência e Locks:** Operação atômica de buffer sob `pcb->lock`, ausência de locks da pilha TCP durante transmissões de rede (`net_send_ipv4()`) e proteção de descritor entre `send()` e `close()`.
+- **Validação Completa & PCAP:** 28/28 testes aprovados na suite Phase 2B.2B, validação de integridade com múltiplos clientes, `fork`, `dup`, e inspeção PCAP comprovando correspondência `ACK == SEQ + LEN`.
+
 ---
 
 ## 🟡 Em Desenvolvimento (v4.4-dev)
 
-### Trilha 17 — TCP Phase 2B: Streams & Passive Open (v4.4)
-- **Transmissão e Recepção de Dados (`send`/`recv`):** Transferência de fluxo contínuo sobre conexões `ESTABLISHED` integradas ao VFS (`read`/`write`).
-- **Abertura Passiva do Servidor (`listen`/`accept`):** Fila de conexões pendentes (*backlog*) e geração de sockets derivados.
-- **Encerramento Ordenado de Conexão:** Transições `FIN`, `FIN+ACK`, `TIME_WAIT` e `CLOSED`.
+### Trilha 20 — TCP Phase 2B.3: Janela Deslizante & Controle de Fluxo
+- **Sliding Window Dinâmica:** Uso de `snd_wnd` anunciado pelo peer remoto para limitação em tempo real da taxa de transmissão.
+- **Janela de Recepção Dinâmica:** Ajuste contínuo de `rcv_wnd` baseado na ocupação do RX buffer e sinalização de Window Updates.
 
----
+### Trilha 21 — TCP Phase 2C: Encerramento Gracioso & Full-Duplex
+- **Four-Way Handshake de Fechamento:** Máquina de estados completa para encerramento ativo e passivo (`FIN_WAIT_1`, `FIN_WAIT_2`, `CLOSING`, `TIME_WAIT`, `LAST_ACK`).
+- **Syscall `shutdown()`:** Encerramento unidirecional de canais (`SHUT_RD`, `SHUT_WR`, `SHUT_RDWR`).
+- **Validação Full-Duplex Simultâneo:** Validação de tráfego bidirecional concorrente sem interferência entre caminhos RX e TX.
+
 
 ## 🔵 Planejado
 

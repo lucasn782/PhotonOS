@@ -37,7 +37,7 @@ KERNEL_OBJS := build/boot/kernel_asm.o build/user/shell_blob.o build/user/hello_
                build/kernel/apic.o build/kernel/smp.o build/kernel/trampoline_blob.o \
                build/kernel/bcache.o build/fs/ext2.o
 
-CFLAGS := -ffreestanding -m64 -nostdlib -mno-red-zone -fno-pic -fno-pie \
+CFLAGS := -Os -ffreestanding -m64 -nostdlib -mno-red-zone -mno-sse -mno-mmx -fno-pic -fno-pie \
           -fstack-protector-strong -Wall -Wextra -Iinclude
 USER_CFLAGS := $(CFLAGS) -fno-stack-protector -fno-builtin -fno-asynchronous-unwind-tables \
                -mcmodel=large

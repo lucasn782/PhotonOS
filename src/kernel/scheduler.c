@@ -614,6 +614,7 @@ void scheduler_sleep_current(enum task_wait_reason reason, uint64_t target)
         return;
     }
 
+    uint64_t flags = spin_lock_irqsave(&task_table_lock);
     if (reason == TASK_WAIT_CHILD) {
         current_task->state = TASK_WAITING;
     } else if (reason == TASK_WAIT_SOCKET_RECV || reason == TASK_WAIT_NETWORK) {
@@ -623,10 +624,12 @@ void scheduler_sleep_current(enum task_wait_reason reason, uint64_t target)
     }
     current_task->wait_reason = reason;
     current_task->wait_target = target;
+    spin_unlock_irqrestore(&task_table_lock, flags);
 }
 
 void scheduler_wake_stdin_readers(void)
 {
+    uint64_t flags = spin_lock_irqsave(&task_table_lock);
     for (uint32_t i = 0; i < task_count; i++) {
         if (tasks[i].state == TASK_SLEEPING &&
             tasks[i].wait_reason == TASK_WAIT_STDIN) {
@@ -635,10 +638,12 @@ void scheduler_wake_stdin_readers(void)
             tasks[i].wait_target = 0;
         }
     }
+    spin_unlock_irqrestore(&task_table_lock, flags);
 }
 
 void scheduler_wake_pipe_readers(void *pipe)
 {
+    uint64_t flags = spin_lock_irqsave(&task_table_lock);
     for (uint32_t i = 0; i < task_count; i++) {
         if (tasks[i].state == TASK_SLEEPING &&
             tasks[i].wait_reason == TASK_WAIT_PIPE_READ &&
@@ -648,10 +653,12 @@ void scheduler_wake_pipe_readers(void *pipe)
             tasks[i].wait_target = 0;
         }
     }
+    spin_unlock_irqrestore(&task_table_lock, flags);
 }
 
 void scheduler_wake_pipe_writers(void *pipe)
 {
+    uint64_t flags = spin_lock_irqsave(&task_table_lock);
     for (uint32_t i = 0; i < task_count; i++) {
         if (tasks[i].state == TASK_SLEEPING &&
             tasks[i].wait_reason == TASK_WAIT_PIPE_WRITE &&
@@ -661,10 +668,12 @@ void scheduler_wake_pipe_writers(void *pipe)
             tasks[i].wait_target = 0;
         }
     }
+    spin_unlock_irqrestore(&task_table_lock, flags);
 }
 
 void scheduler_wake_socket_receivers(uint8_t protocol)
 {
+    uint64_t flags = spin_lock_irqsave(&task_table_lock);
     for (uint32_t i = 0; i < task_count; i++) {
         if (tasks[i].state == TASK_BLOCKED &&
             tasks[i].wait_reason == TASK_WAIT_SOCKET_RECV &&
@@ -674,20 +683,26 @@ void scheduler_wake_socket_receivers(uint8_t protocol)
             tasks[i].wait_target = 0;
         }
     }
+    spin_unlock_irqrestore(&task_table_lock, flags);
 }
 
-void scheduler_wake_socket(void *sock)
+int scheduler_wake_socket(void *sock)
 {
+    int matched_count = 0;
+    uint64_t flags = spin_lock_irqsave(&task_table_lock);
     for (uint32_t i = 0; i < task_count; i++) {
         if ((tasks[i].state == TASK_BLOCKED || tasks[i].state == TASK_SLEEPING) &&
             (tasks[i].wait_reason == TASK_WAIT_SOCKET_RECV ||
              tasks[i].wait_reason == TASK_WAIT_NETWORK) &&
             tasks[i].wait_target == (uint64_t)sock) {
+            matched_count++;
             tasks[i].state = TASK_READY;
             tasks[i].wait_reason = TASK_WAIT_NONE;
             tasks[i].wait_target = 0;
         }
     }
+    spin_unlock_irqrestore(&task_table_lock, flags);
+    return matched_count;
 }
 
 int scheduler_waitpid(int32_t pid, int *status, int options)

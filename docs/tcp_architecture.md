@@ -195,16 +195,47 @@ O Kernel aloca o socket e automaticamente invoca `tcp_alloc()` e `tcp_register()
 
 ---
 
-## 🚀 8. Conclusão da Fase 2A & Preparação para a Fase 2B
+## 🚀 8. Conclusão das Fases 2A, 2B (2B.1, 2B.2A, 2B.2B) & Próximos Passos
 
-A **Fase 2A** (Active Open / 3-Way Handshake) foi concluída e validada:
+### 8.1. Fase 2A (Active Open / 3-Way Handshake) — Concluída
 1. Implementação completa do Three-Way Handshake (`SYN -> SYN+ACK -> ACK`) com números de sequência monotônicos (`iss`), confirmação de `ack_num == iss + 1` e transição para `ESTABLISHED`.
 2. Syscall `connect()` funcional com bloqueio cooperativo através do escalonador (`scheduler_sleep_current(TASK_WAIT_NETWORK)` e `scheduler_yield()`).
 3. Temporizadores RTO com recuo exponencial e fila de transmissão diferida em `tcp_timer_tick()`.
 4. Validação por captura PCAP no fio (*wire*) e testes de concorrência/estresse (`scripts/test_tcp_phase2a.py`).
 Para detalhes completos, consulte [TCP Phase 2A](networking/tcp_phase2a.md).
 
-A próxima etapa (**Fase 2B**) desenvolverá:
-1. Transmissão e recepção contínua de dados (`send()`, `recv()`, `read()`, `write()`).
-2. Abertura passiva no servidor (`listen()`, `accept()`, gerenciamento de fila de `backlog`).
-3. Encerramento gracioso de quatro vias (`FIN`, `FIN+ACK`, `TIME_WAIT`).
+### 8.2. Fase 2B.1 (Passive Open, Listen, Accept & Backlog) — Concluída
+1. Implementação do lado servidor passivo: chamadas de sistema `listen()` e `accept()` com bloqueio cooperativo e despertar imediato no escalonador.
+2. Separação rigorosa de ciclo de vida entre Listener PCB (`state = TCP_LISTEN`) e Child PCBs (`state = TCP_SYN_RECEIVED -> TCP_ESTABLISHED`).
+3. Fila de backlog com enfileiramento após `ACK` final e saturação controlada por `TCP_MAX_BACKLOG` (16).
+4. Demultiplexação prioritária: conexões ativas com tupla de 4 elementos exata sobrepõem listeners genéricos.
+5. Validação de conexões simultâneas, consecutivas, isolamento de descritores pós-`fork()` e captura PCAP (`scripts/test_tcp_phase2b_passive.py`).
+Para detalhes completos, consulte [TCP Phase 2B.1](networking/tcp_phase2b_passive.md).
+
+### 8.3. Fase 2B.2A (Receive Path, RX Buffer & recv()) — Concluída
+1. Buffer circular de recepção (`tcp_rx_buffer_t`) com 8192 bytes por PCB, sem busy-wait e com cálculo de advertised window.
+2. Ingestão in-order de dados (`seq == rcv_nxt`), avanço monotônico de `rcv_nxt` e emissão de ACK.
+3. Descarte de duplicados e fora de ordem com re-emissão de ACK atualizado.
+4. Syscall `recv()` (SYS_RECV = 54) com suspensão cooperativa (`TASK_WAIT_SOCKET_RECV`), tratamento de EOF (`TCP_CLOSE_WAIT`) e RST.
+5. Validação de `blocking recv`, `multiple receive`, `fork`, `dup` e repetição contínua (5/5).
+Para detalhes completos, consulte [TCP Phase 2B.2A](networking/tcp_phase2b2_rx.md).
+
+### 8.4. Fase 2B.2B (Transmit Path, TX Buffer, send() & Data ACK) — Concluída
+1. Estrutura `tcp_tx_buffer_t` de 8192 bytes com separação entre `unsent` e `unacked` e cópia kernel-owned.
+2. Syscall `send()` (SYS_SEND = 55) com semântica de escrita parcial não-bloqueante sob saturação de buffer.
+3. Segmentação com `TCP_DEFAULT_MSS = 1460`, cálculo de checksum TCP com pseudo-header IPv4, avanço de `SND.NXT`.
+4. Processamento de ACK cumulativo/parcial avançando `SND.UNA` e liberando segmentos confirmados.
+5. Retransmissão RTO de dados com backoff exponencial e limite de tentativas (`TCP_MAX_DATA_RETRIES = 5`).
+Para detalhes completos, consulte [TCP Phase 2B.2B](networking/tcp_phase2b2_tx.md).
+
+### 8.5. Métricas de Build & Otimização do Kernel
+- **Otimização de Compilação:** Flag `-Os` ativada em CFLAGS no `Makefile`.
+- **Tamanho do Kernel Binário:** `build/photon.bin` = 137.772 bytes.
+- **Limite Máximo do Kernel (`KERNEL_MAX_BYTES`):** 245.760 bytes (480 setores LBA × 512 bytes).
+- **Margem de Segurança:** 107.988 bytes livres antes do teto de carregamento do bootloader.
+- **Gate de Build Ativo:** `test $(stat -c%s build/photon.bin) -le 245760` no Makefile.
+
+### 8.6. Próximas Etapas (Fase 2B.3 & Fase 2C):
+1. **Fase 2B.3 (Controle de Janela & Fluxo):** Janela deslizante (*sliding window*) dinâmica com controle de créditos via `snd_wnd`.
+2. **Fase 2C (Encerramento Gracioso & Full-Duplex):** Máquina de estados de fechamento ativo e passivo (`FIN_WAIT_1`, `FIN_WAIT_2`, `TIME_WAIT`, `LAST_ACK`, `shutdown()`).
+3. **Fases Posteriores:** Algoritmos de controle de congestionamento (Slow Start, AIMD, Fast Retransmit), SACK, Window Scaling e Servidor HTTP Ring 3.
