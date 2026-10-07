@@ -565,7 +565,8 @@ uint64_t *vmm_clone_address_space(uint64_t *parent_pml4)
     return child_pml4;
 }
 
-void vmm_page_fault_handler(uint64_t error_code, uintptr_t fault_addr, uintptr_t rip, uint64_t cs)
+void vmm_page_fault_handler(uint64_t error_code, uintptr_t fault_addr,
+    uintptr_t rip, uint64_t cs)
 {
     (void)rip;
 
@@ -605,7 +606,6 @@ void vmm_page_fault_handler(uint64_t error_code, uintptr_t fault_addr, uintptr_t
     if (is_cow) {
         uint64_t old_phys_frame = pte & VMM_ENTRY_ADDR_MASK;
         uint32_t refcount = pmm_ref_get((void *)old_phys_frame);
-
         if (refcount > 1) {
             void *new_frame = pmm_alloc();
             if (new_frame == NULL) {

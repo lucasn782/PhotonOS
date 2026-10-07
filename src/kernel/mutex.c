@@ -1,5 +1,7 @@
 #include "mutex.h"
 
+#include <stddef.h>
+
 #include "scheduler.h"
 
 static uint64_t read_rflags(void)
@@ -72,9 +74,8 @@ void mutex_lock(mutex_t *mutex)
         return;
     }
 
+    task_t *current = scheduler_current_task();
     while (__sync_lock_test_and_set(&mutex->locked, 1)) {
-        task_t *current = scheduler_current_task();
-
         if (current != 0 && interrupts_are_enabled()) {
             if (!queue_contains(mutex->wait_queue, current)) {
                 queue_push(&mutex->wait_queue, current);
@@ -88,8 +89,27 @@ void mutex_lock(mutex_t *mutex)
         }
     }
 
-    task_t *current = scheduler_current_task();
     mutex->pid_owner = current != 0 ? (int)current->pid : 0;
+}
+
+void mutex_lock_preemptible(mutex_t *mutex)
+{
+    if (mutex == 0) {
+        return;
+    }
+
+    uint64_t flags = read_rflags();
+    task_t *current = scheduler_current_task();
+    int schedulable = current != 0 && current->pid != 0;
+    int raised_if = (flags & (1ULL << 9)) == 0 && schedulable;
+    if (raised_if) {
+        __asm__ volatile ("sti" ::: "memory");
+    }
+
+    mutex_lock(mutex);
+    if (raised_if) {
+        __asm__ volatile ("cli" ::: "memory");
+    }
 }
 
 void mutex_unlock(mutex_t *mutex)

@@ -97,20 +97,21 @@ Este documento descreve o estado atual do desenvolvimento do PhotonOS, dividindo
 - **Transmissão de Dados (`send`/TX Buffer):** `tcp_tx_buffer_t` limitado a 8192 bytes por PCB, cópia de payload Ring 3 para memória kernel-owned, segmentação MSS 1460, avanço de `SND.NXT`, rastreamento de `SND.UNA`, ACK parcial e cumulativo, e semântica de escrita parcial não bloqueante sob saturação.
 - **Retransmissão Básica (RTO):** Temporizador RTO de dados com backoff exponencial, desacoplado do timeout de handshake, limite de tentativas (`TCP_MAX_DATA_RETRIES = 5`) e encerramento limpo com reset em caso de falha persistente.
 - **Concorrência e Locks:** Operação atômica de buffer sob `pcb->lock`, ausência de locks da pilha TCP durante transmissões de rede (`net_send_ipv4()`) e proteção de descritor entre `send()` e `close()`.
-- **Validação Completa & PCAP:** 28/28 testes aprovados na suite Phase 2B.2B, validação de integridade com múltiplos clientes, `fork`, `dup`, e inspeção PCAP comprovando correspondência `ACK == SEQ + LEN`.
+### Trilha 20 — TCP Phase 2C: Controle de Fluxo, Persist Timer & Full-Duplex (v4.4-tcp2c)
+- **Janela de Recepção Anunciada (Advertised Window):** Cálculo dinâmico `rcv_wnd = capacity - used` com base na ocupação real do buffer RX, encolhimento de janela até zero-window e emissão imediata de Window Updates na leitura em espaço de usuário.
+- **Janela de Transmissão e Imposição do Par (Peer Window):** Rastreamento de `snd_wnd`, `snd_wl1` e `snd_wl2` conforme RFC 793, imposição de limite por `bytes_in_flight` e fatiamento (*slicing*) de segmentos maiores que a janela restante ou MSS 1460.
+- **Persist Timer & Zero-Window Probes:** Armamento automático de temporizador de persistência sob janela zero com dados pendentes, sondagem periódica via probes e recuo exponencial até reabertura da janela.
+- **Comunicação Full-Duplex Simultânea:** Troca bidirecional concorrente de 16 KiB (16.384 bytes em cada sentido) entre processos bifurcados com validação de padrão byte-a-byte.
+- **Hardening de Concorrência e Preempção:** Introdução de `mutex_lock_preemptible()` para permitir preempção durante a espera de locks em syscalls, e redução do escopo de `sock->mutex` desacoplando transmissões de dados concorrentes.
+- **Validação Completa & PCAP:** 14/14 testes aprovados na suíte automatizada Phase 2C com inspeção PCAP comprovando dinâmicas de janela e ausência de estouro de MSS.
 
 ---
 
 ## 🟡 Em Desenvolvimento (v4.4-dev)
 
-### Trilha 20 — TCP Phase 2B.3: Janela Deslizante & Controle de Fluxo
-- **Sliding Window Dinâmica:** Uso de `snd_wnd` anunciado pelo peer remoto para limitação em tempo real da taxa de transmissão.
-- **Janela de Recepção Dinâmica:** Ajuste contínuo de `rcv_wnd` baseado na ocupação do RX buffer e sinalização de Window Updates.
-
-### Trilha 21 — TCP Phase 2C: Encerramento Gracioso & Full-Duplex
+### Trilha 21 — TCP Phase 2D: Encerramento Gracioso & FIN Handshake
 - **Four-Way Handshake de Fechamento:** Máquina de estados completa para encerramento ativo e passivo (`FIN_WAIT_1`, `FIN_WAIT_2`, `CLOSING`, `TIME_WAIT`, `LAST_ACK`).
-- **Syscall `shutdown()`:** Encerramento unidirecional de canais (`SHUT_RD`, `SHUT_WR`, `SHUT_RDWR`).
-- **Validação Full-Duplex Simultâneo:** Validação de tráfego bidirecional concorrente sem interferência entre caminhos RX e TX.
+- **Syscall `shutdown()`:** Encerramento unidirecional e bidirecional de canais (`SHUT_RD`, `SHUT_WR`, `SHUT_RDWR`).
 
 
 ## 🔵 Planejado

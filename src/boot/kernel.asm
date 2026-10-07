@@ -376,7 +376,6 @@ page_fault_stub:
     mov rdx, [rsp + 128]    ; arg3: faulting RIP
     mov rcx, [rsp + 136]    ; arg4: CS
 
-
     mov rbp, rsp
     sub rsp, 8
     and rsp, -16

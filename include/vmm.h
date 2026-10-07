@@ -46,7 +46,8 @@ void vmm_map_in_space(uint64_t *pml4, uintptr_t virtual_addr,
 int vmm_is_mapped(uint64_t *pml4, uintptr_t virtual_addr);
 void vmm_switch_address_space(uint64_t *pml4);
 uint64_t *vmm_clone_address_space(uint64_t *parent_pml4);
-void vmm_page_fault_handler(uint64_t error_code, uintptr_t fault_addr, uintptr_t rip, uint64_t cs);
+void vmm_page_fault_handler(uint64_t error_code, uintptr_t fault_addr,
+    uintptr_t rip, uint64_t cs);
 int vmm_validate_user_ptr(const void *ptr, size_t size, int write_intent);
 int vmm_validate_user_string(const char *str, size_t max_len);
 

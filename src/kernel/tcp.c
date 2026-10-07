@@ -35,6 +35,7 @@ static void tcp_copy(void *destination, const void *source, size_t length)
     }
 }
 
+
 static void tcp_zero(void *destination, size_t length)
 {
     uint8_t *out = destination;
@@ -85,11 +86,14 @@ static void tcp_timers_reset(struct tcp_pcb *pcb)
     pcb->timers.keepalive = 0;
     pcb->timers.delayed_ack = 0;
     pcb->timers.timeout = 0;
+    pcb->timers.persist = 0;
     pcb->timers.rto_ticks = TCP_RTO_TICKS_DEFAULT;
+    pcb->timers.persist_ticks = (uint32_t)TCP_PERSIST_TICKS_DEFAULT;
     pcb->timers.retransmit_count = 0;
+    pcb->timers.persist_count = 0;
     pcb->retransmission_timer = 0;
     pcb->flags &= ~(TCP_PCB_FLAG_TIMER_RTO | TCP_PCB_FLAG_TIMER_KEEP |
-        TCP_PCB_FLAG_TIMER_DACK);
+        TCP_PCB_FLAG_TIMER_DACK | TCP_PCB_FLAG_TIMER_PERSIST | TCP_PCB_FLAG_DRAINING);
 }
 
 static int tcp_port_in_use_locked(const struct tcp_pcb *except,
@@ -286,9 +290,18 @@ static int tcp_build_output_locked(struct tcp_pcb *pcb, uint8_t flags,
     }
 
     header->seq_num = htonl(current_seq);
-    header->ack_num = htonl(pcb->ack_number);
+    header->ack_num = htonl(pcb->rcv_nxt);
     header->data_offset_flags = htons((5U << 12) | flags);
-    header->window_size = htons((uint16_t)(pcb->window & 0xFFFFU));
+    {
+        size_t free_sp = tcp_rx_buffer_free_space_locked(pcb);
+        if (free_sp > 0xFFFFU) {
+            free_sp = 0xFFFFU;
+        }
+        pcb->window = (uint32_t)free_sp;
+        pcb->rcv_wnd = (uint16_t)free_sp;
+        pcb->rcv_ann_wnd = (uint16_t)free_sp;
+    }
+    header->window_size = htons(pcb->rcv_wnd);
     header->checksum = 0;
     header->urgent_ptr = 0;
     if (payload_len != 0U) {
@@ -336,9 +349,12 @@ tcp_pcb_t *tcp_alloc(void)
     pcb->rx_buf.used = 0;
     pcb->tx_buf.capacity = TCP_TX_BUFFER_CAPACITY;
 
-    pcb->window = TCP_DEFAULT_WINDOW;
+    pcb->window = TCP_RX_BUFFER_CAPACITY;
     pcb->snd_wnd = (uint16_t)TCP_DEFAULT_WINDOW;
-    pcb->rcv_wnd = (uint16_t)TCP_DEFAULT_WINDOW;
+    pcb->rcv_wnd = (uint16_t)TCP_RX_BUFFER_CAPACITY;
+    pcb->rcv_ann_wnd = (uint16_t)TCP_RX_BUFFER_CAPACITY;
+    pcb->snd_wl1 = 0;
+    pcb->snd_wl2 = 0;
     pcb->state = TCP_CLOSED;
     tcp_timers_reset(pcb);
     mutex_init(&pcb->lock);
@@ -625,6 +641,63 @@ void tcp_timer_tick(uint64_t now_ticks)
                     pcb->retransmission_timer = 0;
                 }
             }
+
+            /* Check persist timer for zero-window probe */
+            if ((pcb->flags & TCP_PCB_FLAG_TIMER_PERSIST) != 0 &&
+                pcb->timers.persist != 0 &&
+                now_ticks >= pcb->timers.persist) {
+                if (pcb->snd_wnd == 0 && pcb->tx_buf.unsent.head != 0) {
+                    if (pcb->timers.persist_count < TCP_MAX_PERSIST_PROBES) {
+                        pcb->timers.persist_count++;
+                        pcb->timers.persist_ticks = (uint32_t)(pcb->timers.persist_ticks * 2U);
+                        if (pcb->timers.persist_ticks > (uint32_t)TCP_MAX_PERSIST_TICKS) {
+                            pcb->timers.persist_ticks = (uint32_t)TCP_MAX_PERSIST_TICKS;
+                        }
+                        pcb->timers.persist = now_ticks + pcb->timers.persist_ticks;
+
+                        if (deferred_count < 4) {
+                            uint32_t local_ip = tcp_effective_local_ip(pcb);
+                            uint32_t remote_ip = pcb->remote_ip;
+                            uint8_t *pkt = tcp_deferred_tx[deferred_count].packet;
+                            struct tcp_header *hdr = (struct tcp_header *)pkt;
+
+                            hdr->src_port = htons(pcb->local_port);
+                            hdr->dest_port = htons(pcb->remote_port);
+                            hdr->seq_num = htonl(pcb->snd_nxt - 1U);
+                            hdr->ack_num = htonl(pcb->rcv_nxt);
+                            hdr->data_offset_flags = htons((5U << 12) | TCP_FLAG_ACK);
+                            size_t free_sp = tcp_rx_buffer_free_space_locked(pcb);
+                            if (free_sp > 0xFFFFU) {
+                                free_sp = 0xFFFFU;
+                            }
+                            hdr->window_size = htons((uint16_t)free_sp);
+                            hdr->checksum = 0;
+                            hdr->urgent_ptr = 0;
+
+                            size_t total_len = sizeof(struct tcp_header);
+                            uint16_t csum = tcp_checksum(local_ip, remote_ip, pkt, total_len);
+                            if (csum == 0U) {
+                                csum = 0xFFFFU;
+                            }
+                            hdr->checksum = htons(csum);
+
+                            tcp_deferred_tx[deferred_count].packet_len = total_len;
+                            tcp_deferred_tx[deferred_count].remote_ip = remote_ip;
+                            deferred_count++;
+                            klog("[TCP PERSIST] Zero-window probe transmitido\n");
+                        }
+                    } else {
+                        /* Persist retry limit reached */
+                        pcb->flags &= ~TCP_PCB_FLAG_TIMER_PERSIST;
+                        pcb->timers.persist = 0;
+                    }
+                } else {
+                    /* Window reopened or no unsent data */
+                    pcb->flags &= ~TCP_PCB_FLAG_TIMER_PERSIST;
+                    pcb->timers.persist = 0;
+                    pcb->timers.persist_count = 0;
+                }
+            }
         }
         mutex_unlock(&pcb->lock);
     }
@@ -676,7 +749,7 @@ void tcp_socket_destroy(struct tcp_pcb *pcb)
 
 
     /* If destroying a listener, identify half-open children */
-    mutex_lock(&tcp_pcbs_lock);
+    mutex_lock_preemptible(&tcp_pcbs_lock);
     if (pcb->state == TCP_LISTEN) {
         for (struct tcp_pcb *c = tcp_pcbs; c != 0; c = c->next) {
             if (c->parent == pcb && c->state == TCP_SYN_RECEIVED &&
@@ -689,7 +762,7 @@ void tcp_socket_destroy(struct tcp_pcb *pcb)
     mutex_unlock(&tcp_pcbs_lock);
 
     tcp_unregister(pcb);
-    mutex_lock(&pcb->lock);
+    mutex_lock_preemptible(&pcb->lock);
     if (pcb->state == TCP_LISTEN) {
         orphan_count = tcp_accept_queue_detach_locked(pcb, orphans,
             (int)TCP_MAX_BACKLOG);
@@ -727,7 +800,7 @@ int tcp_register(struct tcp_pcb *pcb)
         return -1;
     }
 
-    mutex_lock(&tcp_pcbs_lock);
+    mutex_lock_preemptible(&tcp_pcbs_lock);
     for (struct tcp_pcb *entry = tcp_pcbs; entry != 0; entry = entry->next) {
         if (entry == pcb) {
             mutex_unlock(&tcp_pcbs_lock);
@@ -748,7 +821,7 @@ void tcp_unregister(struct tcp_pcb *pcb)
         return;
     }
 
-    mutex_lock(&tcp_pcbs_lock);
+    mutex_lock_preemptible(&tcp_pcbs_lock);
     entry = &tcp_pcbs;
     while (*entry != 0) {
         if (*entry == pcb) {
@@ -1088,9 +1161,10 @@ static int tcp_handle_listen_syn(struct tcp_pcb *listener, uint32_t src_ip,
     child->snd_nxt = iss + 1U;
     child->ack_number = sequence + 1U;
     child->rcv_nxt = sequence + 1U;
-    child->window = TCP_DEFAULT_WINDOW;
+    child->window = TCP_RX_BUFFER_CAPACITY;
     child->snd_wnd = (uint16_t)TCP_DEFAULT_WINDOW;
-    child->rcv_wnd = (uint16_t)TCP_DEFAULT_WINDOW;
+    child->rcv_wnd = TCP_RX_BUFFER_CAPACITY;
+    child->rcv_ann_wnd = TCP_RX_BUFFER_CAPACITY;
     child->state = TCP_SYN_RECEIVED;
     child->parent = listener;
     child->flags = TCP_PCB_FLAG_BOUND | TCP_PCB_FLAG_PASSIVE | TCP_PCB_FLAG_TIMER_RTO;
@@ -1139,6 +1213,7 @@ int tcp_input(uint32_t src_ip, uint32_t dest_ip, const uint8_t *segment,
     size_t out_packet_len = 0;
     uint32_t out_remote_ip = 0;
     int send_out = 0;
+    int need_drain_after_ack = 0;
     void *socket = 0;
     void *listener_socket = 0;
 
@@ -1176,13 +1251,37 @@ int tcp_input(uint32_t src_ip, uint32_t dest_ip, const uint8_t *segment,
     pcb = tcp_lookup_locked(dest_ip, src_ip, local_port, remote_port);
     if (pcb == 0) {
         mutex_unlock(&tcp_pcbs_lock);
+        if ((flags & TCP_FLAG_RST) == 0U) {
+            uint8_t rst_pkt[TCP_HEADER_MIN_SIZE];
+            struct tcp_header rst_hdr;
+            rst_hdr.src_port = local_port;
+            rst_hdr.dest_port = remote_port;
+            if ((flags & TCP_FLAG_ACK) != 0U) {
+                rst_hdr.seq_num = acknowledgement;
+                rst_hdr.ack_num = 0;
+                rst_hdr.data_offset_flags = (5U << 12) | TCP_FLAG_RST;
+            } else {
+                rst_hdr.seq_num = 0;
+                rst_hdr.ack_num = sequence + (uint32_t)payload_len +
+                    (((flags & (TCP_FLAG_SYN | TCP_FLAG_FIN)) != 0U) ? 1U : 0U);
+                rst_hdr.data_offset_flags = (5U << 12) | TCP_FLAG_RST | TCP_FLAG_ACK;
+            }
+            rst_hdr.window_size = 0;
+            rst_hdr.checksum = 0;
+            rst_hdr.urgent_ptr = 0;
+            tcp_serialize_header(&rst_hdr, rst_pkt, sizeof(rst_pkt));
+            uint16_t rst_csum = tcp_checksum(dest_ip, src_ip, rst_pkt, sizeof(rst_pkt));
+            if (rst_csum == 0U) {
+                rst_csum = 0xFFFFU;
+            }
+            ((struct tcp_header *)rst_pkt)->checksum = htons(rst_csum);
+            (void)net_send_ipv4(src_ip, IP_PROTO_TCP, rst_pkt, sizeof(rst_pkt));
+        }
         return -1;
     }
 
     mutex_lock(&pcb->lock);
     mutex_unlock(&tcp_pcbs_lock);
-
-    pcb->snd_wnd = hdr.window_size;
 
     /* Passive open: demux landed on a LISTEN PCB. */
     if (pcb->state == TCP_LISTEN) {
@@ -1226,6 +1325,9 @@ int tcp_input(uint32_t src_ip, uint32_t dest_ip, const uint8_t *segment,
         pcb->snd_una = acknowledgement;
         pcb->snd_nxt = pcb->iss + 1U;
         pcb->seq_number = pcb->iss + 1U;
+        pcb->snd_wnd = hdr.window_size;
+        pcb->snd_wl1 = sequence;
+        pcb->snd_wl2 = acknowledgement;
         pcb->state = TCP_ESTABLISHED;
         tcp_timers_reset(pcb);
         pcb->timers.keepalive = kernel_ticks + TCP_KEEPALIVE_TICKS;
@@ -1245,6 +1347,9 @@ int tcp_input(uint32_t src_ip, uint32_t dest_ip, const uint8_t *segment,
         } else if ((flags & TCP_FLAG_ACK) != 0U && (flags & TCP_FLAG_SYN) == 0U &&
             (acknowledgement == pcb->iss + 1U || acknowledgement == pcb->seq_number)) {
             struct tcp_pcb *listener = pcb->parent;
+            pcb->snd_wnd = hdr.window_size;
+            pcb->snd_wl1 = sequence;
+            pcb->snd_wl2 = acknowledgement;
             pcb->state = TCP_ESTABLISHED;
 
             tcp_timers_reset(pcb);
@@ -1278,9 +1383,47 @@ int tcp_input(uint32_t src_ip, uint32_t dest_ip, const uint8_t *segment,
             }
         }
     } else if (pcb->state == TCP_ESTABLISHED) {
+        uint16_t peer_wnd_before = pcb->snd_wnd;
+
         /* If ACK flag is present, process data acknowledgements */
         if ((flags & TCP_FLAG_ACK) != 0U) {
             tcp_tx_ack_received_locked(pcb, acknowledgement);
+
+            /* A pure window update is still a valid ACK even when the byte
+             * acknowledgement does not advance snd_wl1/snd_wl2.  We must honor
+             * peer window growth because it can unlock previously blocked TX data.
+             */
+            if ((hdr.window_size != pcb->snd_wnd) ||
+                TCP_SEQ_LT(pcb->snd_wl1, sequence) ||
+                (TCP_SEQ_EQ(pcb->snd_wl1, sequence) &&
+                 TCP_SEQ_LE(pcb->snd_wl2, acknowledgement))) {
+                pcb->snd_wnd = hdr.window_size;
+                pcb->snd_wl1 = sequence;
+                pcb->snd_wl2 = acknowledgement;
+                if (pcb->snd_wnd > peer_wnd_before && pcb->tx_buf.unsent.head != 0) {
+                    need_drain_after_ack = 1;
+                }
+                /* Disarm persist timer if window opened */
+                if (pcb->snd_wnd > 0 &&
+                    (pcb->flags & TCP_PCB_FLAG_TIMER_PERSIST) != 0) {
+                    pcb->flags &= ~TCP_PCB_FLAG_TIMER_PERSIST;
+                    pcb->timers.persist = 0;
+                    pcb->timers.persist_ticks = (uint32_t)TCP_PERSIST_TICKS_DEFAULT;
+                    pcb->timers.persist_count = 0;
+                }
+            }
+
+        }
+
+        /* 0. Incoming zero-window probe handling */
+        if (payload_len == 0U && TCP_SEQ_EQ(sequence, pcb->rcv_nxt - 1U) &&
+            (flags & TCP_FLAG_ACK) != 0U &&
+            (flags & (TCP_FLAG_SYN | TCP_FLAG_FIN | TCP_FLAG_RST)) == 0U) {
+            /* Respond with current window */
+            send_out = 1;
+            (void)tcp_build_output_locked(pcb, TCP_FLAG_ACK, 0, 0, out_packet,
+                &out_packet_len, &out_remote_ip);
+            klog("[TCP RX] Zero-window probe recebido, ACK com janela atual transmitido\n");
         }
 
         /* 1. Incoming data payload processing */
@@ -1344,6 +1487,10 @@ int tcp_input(uint32_t src_ip, uint32_t dest_ip, const uint8_t *segment,
         }
     }
 
+    int has_unsent = 0;
+    if (pcb->state == TCP_ESTABLISHED && pcb->tx_buf.unsent.head != 0) {
+        has_unsent = 1;
+    }
     socket = pcb->socket;
     mutex_unlock(&pcb->lock);
 
@@ -1353,6 +1500,9 @@ int tcp_input(uint32_t src_ip, uint32_t dest_ip, const uint8_t *segment,
     if (send_out) {
         (void)net_send_ipv4(out_remote_ip, IP_PROTO_TCP, out_packet,
             out_packet_len);
+    }
+    if (has_unsent || need_drain_after_ack) {
+        tcp_drain_unsent(pcb);
     }
     return 0;
 }
@@ -1430,6 +1580,11 @@ size_t tcp_rx_buffer_read_locked(struct tcp_pcb *pcb, uint8_t *dst, size_t len)
 
 int tcp_receive_read(struct tcp_pcb *pcb, uint8_t *buffer, size_t length)
 {
+    uint8_t wnd_packet[TCP_HEADER_MIN_SIZE];
+    size_t wnd_packet_len = 0;
+    uint32_t wnd_remote_ip = 0;
+    int send_wnd_update = 0;
+
     if (pcb == 0 || buffer == 0 || length == 0U) {
         return -1;
     }
@@ -1438,7 +1593,35 @@ int tcp_receive_read(struct tcp_pcb *pcb, uint8_t *buffer, size_t length)
     size_t free_sp = tcp_rx_buffer_free_space_locked(pcb);
     pcb->window = (uint32_t)free_sp;
     pcb->rcv_wnd = (uint16_t)(free_sp & 0xFFFFU);
+    pcb->rcv_ann_wnd = pcb->rcv_wnd;
+
+    /*
+     * RFC 793 allows a window update to be advertised with an ACK after the
+     * receive buffer is drained.  The earlier gate was too conservative and
+     * could suppress a legitimate reopen while a full-duplex peer was still
+     * sending on the same connection.  Emit the update whenever application
+     * consumption makes progress, especially after a previously low or zero
+     * window.
+     */
+    if (read_bytes > 0 && pcb->state == TCP_ESTABLISHED) {
+        pcb->rcv_ann_wnd = pcb->rcv_wnd;
+        send_wnd_update = 1;
+        (void)tcp_build_output_locked(pcb, TCP_FLAG_ACK, 0, 0,
+            wnd_packet, &wnd_packet_len, &wnd_remote_ip);
+    }
+
+    /* Drain unsent data if window update triggered peer-side space */
+    int has_unsent = (pcb->state == TCP_ESTABLISHED &&
+                      pcb->tx_buf.unsent.head != 0);
     mutex_unlock(&pcb->lock);
+
+    if (send_wnd_update && wnd_packet_len > 0) {
+        (void)net_send_ipv4(wnd_remote_ip, IP_PROTO_TCP, wnd_packet,
+            wnd_packet_len);
+    }
+    if (has_unsent) {
+        tcp_drain_unsent(pcb);
+    }
     return (int)read_bytes;
 }
 
@@ -1543,6 +1726,200 @@ void tcp_tx_ack_received_locked(struct tcp_pcb *pcb, uint32_t ack)
     }
 }
 
+void tcp_drain_unsent(struct tcp_pcb *pcb)
+{
+    if (pcb == 0) {
+        return;
+    }
+
+    mutex_lock_preemptible(&pcb->lock);
+    if ((pcb->flags & TCP_PCB_FLAG_DRAINING) != 0) {
+        mutex_unlock(&pcb->lock);
+        return;
+    }
+    pcb->flags |= TCP_PCB_FLAG_DRAINING;
+
+    for (;;) {
+        if (pcb->state != TCP_ESTABLISHED ||
+            (pcb->flags & TCP_PCB_FLAG_RESET) != 0 ||
+            pcb->tx_buf.unsent.head == 0) {
+            pcb->flags &= ~TCP_PCB_FLAG_DRAINING;
+            mutex_unlock(&pcb->lock);
+            break;
+        }
+
+        /* Compute remaining peer window */
+        uint32_t bytes_in_flight = pcb->snd_nxt - pcb->snd_una;
+        uint32_t remaining_wnd = 0;
+        if (pcb->snd_wnd > bytes_in_flight) {
+            remaining_wnd = pcb->snd_wnd - bytes_in_flight;
+        }
+
+        if (remaining_wnd == 0) {
+            /* Peer window exhausted: arm persist timer if not already armed */
+            if (pcb->snd_wnd == 0 &&
+                (pcb->flags & TCP_PCB_FLAG_TIMER_PERSIST) == 0 &&
+                pcb->tx_buf.unsent.head != 0) {
+                pcb->flags |= TCP_PCB_FLAG_TIMER_PERSIST;
+                pcb->timers.persist_ticks = (uint32_t)TCP_PERSIST_TICKS_DEFAULT;
+                pcb->timers.persist = kernel_ticks + pcb->timers.persist_ticks;
+                pcb->timers.persist_count = 0;
+            }
+            pcb->flags &= ~TCP_PCB_FLAG_DRAINING;
+            mutex_unlock(&pcb->lock);
+            break;
+        }
+
+        struct tcp_segment *seg = pcb->tx_buf.unsent.head;
+        size_t seg_remaining = seg->length;
+        size_t send_len = seg_remaining;
+        if (send_len > remaining_wnd) {
+            send_len = remaining_wnd;
+        }
+        if (send_len > TCP_DEFAULT_MSS) {
+            send_len = TCP_DEFAULT_MSS;
+        }
+
+        if (send_len < seg_remaining) {
+            /*
+             * Window or MSS smaller than segment: create a slice to transmit
+             * and keep the remainder at the head of unsent.
+             */
+            struct tcp_segment *slice =
+                (struct tcp_segment *)kmalloc(sizeof(*slice));
+            if (slice == 0) {
+                pcb->flags &= ~TCP_PCB_FLAG_DRAINING;
+                mutex_unlock(&pcb->lock);
+                break;
+            }
+
+            /* The slice needs its own data copy for unacked since the
+             * original data pointer is shared with the remainder in unsent. */
+            uint8_t *slice_data = (uint8_t *)kmalloc(send_len);
+            if (slice_data == 0) {
+                kfree(slice);
+                pcb->flags &= ~TCP_PCB_FLAG_DRAINING;
+                mutex_unlock(&pcb->lock);
+                break;
+            }
+            tcp_copy(slice_data, seg->data + seg->offset, send_len);
+
+            slice->data = slice_data;
+            slice->sequence = pcb->snd_nxt;
+            slice->length = send_len;
+            slice->offset = 0;
+            slice->sent_at = kernel_ticks;
+            slice->retransmit_count = 0;
+            slice->next = 0;
+
+            /* Advance the unsent head past the slice */
+            seg->offset += send_len;
+            seg->length -= send_len;
+            seg->sequence = pcb->snd_nxt + (uint32_t)send_len;
+
+            /* Adjust unsent bytes accounting */
+            if (pcb->tx_buf.unsent.bytes >= send_len) {
+                pcb->tx_buf.unsent.bytes -= send_len;
+            } else {
+                pcb->tx_buf.unsent.bytes = 0;
+            }
+
+            int queue_was_empty = (pcb->tx_buf.unacked.head == 0);
+            tcp_queue_append_locked(&pcb->tx_buf.unacked, slice);
+            uint32_t cur_seq = slice->sequence;
+            pcb->snd_nxt += (uint32_t)send_len;
+            pcb->seq_number = pcb->snd_nxt;
+
+            if (queue_was_empty) {
+                pcb->timers.rto_ticks = (uint32_t)TCP_DATA_RTO_TICKS_DEFAULT;
+                pcb->timers.retransmission = kernel_ticks + pcb->timers.rto_ticks;
+                pcb->retransmission_timer = pcb->timers.retransmission;
+                pcb->timers.retransmit_count = 0;
+                pcb->flags |= TCP_PCB_FLAG_TIMER_RTO;
+            }
+
+            /* Build packet under lock */
+            uint8_t packet[TCP_HEADER_MIN_SIZE + TCP_DEFAULT_MSS];
+            size_t packet_len = sizeof(struct tcp_header) + send_len;
+            uint32_t local_ip = tcp_effective_local_ip(pcb);
+            uint32_t remote_ip = pcb->remote_ip;
+            struct tcp_header *hdr = (struct tcp_header *)packet;
+            hdr->src_port = htons(pcb->local_port);
+            hdr->dest_port = htons(pcb->remote_port);
+            hdr->seq_num = htonl(cur_seq);
+            hdr->ack_num = htonl(pcb->rcv_nxt);
+            hdr->data_offset_flags = htons((5U << 12) | TCP_FLAG_ACK | TCP_FLAG_PSH);
+            {
+                size_t fsp = tcp_rx_buffer_free_space_locked(pcb);
+                if (fsp > 0xFFFFU) fsp = 0xFFFFU;
+                pcb->rcv_wnd = (uint16_t)fsp;
+                pcb->rcv_ann_wnd = (uint16_t)fsp;
+                pcb->window = (uint32_t)fsp;
+            }
+            hdr->window_size = htons(pcb->rcv_wnd);
+            hdr->checksum = 0;
+            hdr->urgent_ptr = 0;
+            tcp_copy(packet + sizeof(struct tcp_header), slice_data, send_len);
+            uint16_t csum = tcp_checksum(local_ip, remote_ip, packet, packet_len);
+            if (csum == 0U) csum = 0xFFFFU;
+            hdr->checksum = htons(csum);
+
+            mutex_unlock(&pcb->lock);
+            (void)net_send_ipv4(remote_ip, IP_PROTO_TCP, packet, packet_len);
+            mutex_lock_preemptible(&pcb->lock);
+        } else {
+            /* Full segment fits within window and MSS */
+            seg = tcp_queue_take_head_locked(&pcb->tx_buf.unsent);
+            uint32_t cur_seq = pcb->snd_nxt;
+            seg->sequence = cur_seq;
+            int queue_was_empty = (pcb->tx_buf.unacked.head == 0);
+            tcp_queue_append_locked(&pcb->tx_buf.unacked, seg);
+            pcb->snd_nxt += (uint32_t)send_len;
+            pcb->seq_number = pcb->snd_nxt;
+            seg->sent_at = kernel_ticks;
+
+            if (queue_was_empty) {
+                pcb->timers.rto_ticks = (uint32_t)TCP_DATA_RTO_TICKS_DEFAULT;
+                pcb->timers.retransmission = kernel_ticks + pcb->timers.rto_ticks;
+                pcb->retransmission_timer = pcb->timers.retransmission;
+                pcb->timers.retransmit_count = 0;
+                pcb->flags |= TCP_PCB_FLAG_TIMER_RTO;
+            }
+
+            /* Build packet under lock */
+            uint8_t packet[TCP_HEADER_MIN_SIZE + TCP_DEFAULT_MSS];
+            size_t packet_len = sizeof(struct tcp_header) + send_len;
+            uint32_t local_ip = tcp_effective_local_ip(pcb);
+            uint32_t remote_ip = pcb->remote_ip;
+            struct tcp_header *hdr = (struct tcp_header *)packet;
+            hdr->src_port = htons(pcb->local_port);
+            hdr->dest_port = htons(pcb->remote_port);
+            hdr->seq_num = htonl(cur_seq);
+            hdr->ack_num = htonl(pcb->rcv_nxt);
+            hdr->data_offset_flags = htons((5U << 12) | TCP_FLAG_ACK | TCP_FLAG_PSH);
+            {
+                size_t fsp = tcp_rx_buffer_free_space_locked(pcb);
+                if (fsp > 0xFFFFU) fsp = 0xFFFFU;
+                pcb->rcv_wnd = (uint16_t)fsp;
+                pcb->rcv_ann_wnd = (uint16_t)fsp;
+                pcb->window = (uint32_t)fsp;
+            }
+            hdr->window_size = htons(pcb->rcv_wnd);
+            hdr->checksum = 0;
+            hdr->urgent_ptr = 0;
+            tcp_copy(packet + sizeof(struct tcp_header),
+                seg->data + seg->offset, send_len);
+            uint16_t csum = tcp_checksum(local_ip, remote_ip, packet, packet_len);
+            if (csum == 0U) csum = 0xFFFFU;
+            hdr->checksum = htons(csum);
+
+            mutex_unlock(&pcb->lock);
+            (void)net_send_ipv4(remote_ip, IP_PROTO_TCP, packet, packet_len);
+            mutex_lock_preemptible(&pcb->lock);
+        }
+    }
+}
+
 int tcp_send(struct tcp_pcb *pcb, const uint8_t *buffer, size_t len)
 {
     if (pcb == 0 || buffer == 0) {
@@ -1552,26 +1929,46 @@ int tcp_send(struct tcp_pcb *pcb, const uint8_t *buffer, size_t len)
         return 0;
     }
 
+    /*
+     * Phase 1: Accept data into the unsent queue, bounded by TX buffer
+     * capacity.  This does not transmit anything yet.
+     */
     size_t accepted = 0;
     while (accepted < len) {
+        mutex_lock_preemptible(&pcb->lock);
+        if (pcb->state != TCP_ESTABLISHED ||
+            (pcb->flags & TCP_PCB_FLAG_RESET) != 0) {
+            mutex_unlock(&pcb->lock);
+            return accepted != 0 ? (int)accepted : -1;
+        }
+
+        size_t space = tcp_tx_buffer_available_locked(pcb);
+        if (space == 0) {
+            mutex_unlock(&pcb->lock);
+            break;
+        }
+
         size_t requested = len - accepted;
         if (requested > TCP_DEFAULT_MSS) {
             requested = TCP_DEFAULT_MSS;
         }
+        if (requested > space) {
+            requested = space;
+        }
+        mutex_unlock(&pcb->lock);
 
-        /* Allocate the private kernel copy before taking the PCB mutex. */
         struct tcp_segment *seg = (struct tcp_segment *)kmalloc(sizeof(*seg));
         if (seg == 0) {
-            return accepted != 0 ? (int)accepted : -1;
+            break;
         }
         seg->data = (uint8_t *)kmalloc(requested);
         if (seg->data == 0) {
             kfree(seg);
-            return accepted != 0 ? (int)accepted : -1;
+            break;
         }
         tcp_copy(seg->data, buffer + accepted, requested);
 
-        mutex_lock(&pcb->lock);
+        mutex_lock_preemptible(&pcb->lock);
         if (pcb->state != TCP_ESTABLISHED ||
             (pcb->flags & TCP_PCB_FLAG_RESET) != 0) {
             mutex_unlock(&pcb->lock);
@@ -1580,76 +1977,33 @@ int tcp_send(struct tcp_pcb *pcb, const uint8_t *buffer, size_t len)
             return accepted != 0 ? (int)accepted : -1;
         }
 
-        size_t space = tcp_tx_buffer_available_locked(pcb);
-        if (space == 0) {
+        space = tcp_tx_buffer_available_locked(pcb);
+        if (space < requested) {
             mutex_unlock(&pcb->lock);
             kfree(seg->data);
             kfree(seg);
-            return accepted != 0 ? (int)accepted : -1;
+            break;
         }
-        size_t chunk_len = requested < space ? requested : space;
-        seg->sequence = pcb->snd_nxt;
-        seg->length = chunk_len;
+
+        seg->sequence = pcb->snd_nxt + (uint32_t)pcb->tx_buf.unsent.bytes;
+        seg->length = requested;
         seg->offset = 0;
         seg->sent_at = 0;
         seg->retransmit_count = 0;
         tcp_queue_append_locked(&pcb->tx_buf.unsent, seg);
-
-        /*
-         * Send immediately in this phase.  Moving the entry before dropping
-         * pcb->lock makes a synchronous peer ACK safe: tcp_input can only
-         * acknowledge data already represented in the unacked queue.
-         */
-        seg = tcp_queue_take_head_locked(&pcb->tx_buf.unsent);
-        uint32_t cur_seq = seg->sequence;
-        int queue_was_empty = pcb->tx_buf.unacked.head == 0;
-        tcp_queue_append_locked(&pcb->tx_buf.unacked, seg);
-        pcb->snd_nxt += (uint32_t)chunk_len;
-        pcb->seq_number = pcb->snd_nxt;
-        seg->sent_at = kernel_ticks;
-
-        if (queue_was_empty) {
-            pcb->timers.rto_ticks = (uint32_t)TCP_DATA_RTO_TICKS_DEFAULT;
-            pcb->timers.retransmission = kernel_ticks + pcb->timers.rto_ticks;
-            pcb->retransmission_timer = pcb->timers.retransmission;
-            pcb->timers.retransmit_count = 0;
-            pcb->flags |= TCP_PCB_FLAG_TIMER_RTO;
-        }
-
-        /* Build the wire packet under the lock, then release it before IPv4. */
-        uint8_t packet[TCP_HEADER_MIN_SIZE + TCP_DEFAULT_MSS];
-        size_t packet_len = sizeof(struct tcp_header) + chunk_len;
-        uint32_t local_ip = tcp_effective_local_ip(pcb);
-        uint32_t remote_ip = pcb->remote_ip;
-
-        struct tcp_header *hdr = (struct tcp_header *)packet;
-        hdr->src_port = htons(pcb->local_port);
-        hdr->dest_port = htons(pcb->remote_port);
-        hdr->seq_num = htonl(cur_seq);
-        hdr->ack_num = htonl(pcb->rcv_nxt);
-        hdr->data_offset_flags = htons((5U << 12) | TCP_FLAG_ACK | TCP_FLAG_PSH);
-        hdr->window_size = htons((uint16_t)(pcb->window & 0xFFFFU));
-        hdr->checksum = 0;
-        hdr->urgent_ptr = 0;
-
-        tcp_copy(packet + sizeof(struct tcp_header), seg->data, chunk_len);
-        uint16_t csum = tcp_checksum(local_ip, remote_ip, packet, packet_len);
-        if (csum == 0U) {
-            csum = 0xFFFFU;
-        }
-        hdr->checksum = htons(csum);
-
         mutex_unlock(&pcb->lock);
 
-        /* Transmit with NO locks held */
-        klog("[TCP TX] DATA transmitido\n");
-        if (net_send_ipv4(remote_ip, IP_PROTO_TCP, packet, packet_len) != 0) {
-            /* The private unacked copy remains queued for the data RTO. */
-            klog("[TCP TX] DATA enfileirado para retransmissao apos falha de IPv4\n");
-        }
-
-        accepted += chunk_len;
+        accepted += requested;
     }
+
+    if (accepted == 0) {
+        return -1;
+    }
+
+    /*
+     * Phase 2: Drain unsent queue respecting the peer advertised window.
+     */
+    tcp_drain_unsent(pcb);
 
     return (int)accepted;
 }
@@ -1661,7 +2015,7 @@ void tcp_run_tests(void)
 
     /* Test 1: Alloc */
     tcp_pcb_t *pcb = tcp_alloc();
-    if (pcb != 0 && pcb->state == TCP_CLOSED && pcb->rcv_wnd == TCP_DEFAULT_WINDOW) {
+    if (pcb != 0 && pcb->state == TCP_CLOSED && pcb->rcv_wnd == TCP_RX_BUFFER_CAPACITY) {
         klog("[TCP TEST] PASS: tcp_alloc (PCB criado com sucesso e estado CLOSED)\n");
     } else {
         klog("[TCP TEST] FAIL: tcp_alloc\n");
@@ -2140,6 +2494,162 @@ void tcp_run_tests(void)
             klog("[TCP TEST] FAIL: tcp_tx_retransmission\n");
         }
         tcp_socket_destroy(rt_pcb);
+    }
+
+    /* Test 17: Advertised window calculation (capacity - used, zero window, reopening) */
+    tcp_pcb_t *wnd_pcb = tcp_alloc();
+    if (wnd_pcb != 0) {
+        wnd_pcb->state = TCP_ESTABLISHED;
+        mutex_lock(&wnd_pcb->lock);
+        size_t init_free = tcp_rx_buffer_free_space_locked(wnd_pcb);
+        int t17_init_ok = (init_free == TCP_RX_BUFFER_CAPACITY &&
+                           wnd_pcb->rcv_wnd == TCP_RX_BUFFER_CAPACITY);
+
+        /* Write 1000 bytes into RX buffer */
+        uint8_t dummy[1000];
+        tcp_zero(dummy, sizeof(dummy));
+        (void)tcp_rx_buffer_write_locked(wnd_pcb, dummy, 1000);
+        size_t free_after_1000 = tcp_rx_buffer_free_space_locked(wnd_pcb);
+        int t17_used_ok = (free_after_1000 == TCP_RX_BUFFER_CAPACITY - 1000 &&
+                           wnd_pcb->rx_buf.used == 1000);
+
+        /* Fill entire remaining RX buffer */
+        size_t rem = TCP_RX_BUFFER_CAPACITY - 1000;
+        uint8_t *fill = (uint8_t *)kmalloc(rem);
+        if (fill != 0) {
+            tcp_zero(fill, rem);
+            (void)tcp_rx_buffer_write_locked(wnd_pcb, fill, rem);
+            kfree(fill);
+        }
+        size_t free_zero = tcp_rx_buffer_free_space_locked(wnd_pcb);
+        int t17_zero_ok = (free_zero == 0 && wnd_pcb->rx_buf.used == TCP_RX_BUFFER_CAPACITY);
+
+        /* Read 2000 bytes: window should reopen by 2000 */
+        uint8_t rdbuf[2000];
+        size_t nread = tcp_rx_buffer_read_locked(wnd_pcb, rdbuf, 2000);
+        size_t free_reopen = tcp_rx_buffer_free_space_locked(wnd_pcb);
+        int t17_reopen_ok = (nread == 2000 && free_reopen == 2000 && wnd_pcb->rx_buf.used == TCP_RX_BUFFER_CAPACITY - 2000);
+        mutex_unlock(&wnd_pcb->lock);
+
+        if (t17_init_ok && t17_used_ok && t17_zero_ok && t17_reopen_ok) {
+            klog("[TCP TEST] PASS: tcp_advertised_window (capacidade - ocupado, zero-window e reabertura)\n");
+        } else {
+            klog("[TCP TEST] FAIL: tcp_advertised_window\n");
+        }
+        tcp_socket_destroy(wnd_pcb);
+    }
+
+    /* Test 18: Peer window enforcement, sendable calculation & zero-window */
+    tcp_pcb_t *pw_pcb = tcp_alloc();
+    if (pw_pcb != 0) {
+        pw_pcb->local_ip = htonl(0x0A00020FU);
+        pw_pcb->remote_ip = htonl(0x0A000202U);
+        pw_pcb->local_port = 7777;
+        pw_pcb->remote_port = 55555;
+        pw_pcb->iss = 10000;
+        pw_pcb->snd_una = 10001;
+        pw_pcb->snd_nxt = 10001;
+        pw_pcb->seq_number = 10001;
+        pw_pcb->rcv_nxt = 20000;
+        pw_pcb->state = TCP_ESTABLISHED;
+        pw_pcb->snd_wnd = 500; /* Peer window = 500 (< MSS) */
+        pw_pcb->snd_wl1 = 20000;
+        pw_pcb->snd_wl2 = 10001;
+        tcp_register(pw_pcb);
+
+        /* Send 1000 bytes: should transmit 500 bytes (sliced) and keep 500 in unsent */
+        uint8_t payload[1000];
+        tcp_zero(payload, sizeof(payload));
+        int sent = tcp_send(pw_pcb, payload, 1000);
+
+        mutex_lock(&pw_pcb->lock);
+        int t18_slice_ok = (sent == 1000 &&
+                            pw_pcb->tx_buf.unacked.bytes == 500 &&
+                            pw_pcb->tx_buf.unsent.bytes == 500 &&
+                            pw_pcb->snd_nxt == 10501);
+
+        /* Remaining window is now 0 (500 in flight == snd_wnd 500) */
+        uint32_t in_flight = pw_pcb->snd_nxt - pw_pcb->snd_una;
+        int t18_flight_ok = (in_flight == 500);
+
+        /* Receiving ACK for 500 with window reopening to 1000 */
+        tcp_tx_ack_received_locked(pw_pcb, 10501);
+        pw_pcb->snd_wnd = 1000;
+        mutex_unlock(&pw_pcb->lock);
+
+        /* Drain unsent: remaining 500 bytes should now be transmitted */
+        tcp_drain_unsent(pw_pcb);
+
+        mutex_lock(&pw_pcb->lock);
+        int t18_drain_ok = (pw_pcb->tx_buf.unsent.bytes == 0 &&
+                            pw_pcb->tx_buf.unacked.bytes == 500 &&
+                            pw_pcb->snd_nxt == 11001);
+        mutex_unlock(&pw_pcb->lock);
+
+        if (t18_slice_ok && t18_flight_ok && t18_drain_ok) {
+            klog("[TCP TEST] PASS: tcp_peer_window (enforcement < MSS, bytes_in_flight e retomada)\n");
+        } else {
+            klog("[TCP TEST] FAIL: tcp_peer_window\n");
+        }
+        tcp_socket_destroy(pw_pcb);
+    }
+
+    /* Test 19: Persist timer arm, backoff, and disarm on window update */
+    tcp_pcb_t *pst_pcb = tcp_alloc();
+    if (pst_pcb != 0) {
+        pst_pcb->local_ip = htonl(0x0A00020FU);
+        pst_pcb->remote_ip = htonl(0x0A000202U);
+        pst_pcb->local_port = 8888;
+        pst_pcb->remote_port = 6666;
+        pst_pcb->iss = 30000;
+        pst_pcb->snd_una = 30001;
+        pst_pcb->snd_nxt = 30001;
+        pst_pcb->seq_number = 30001;
+        pst_pcb->rcv_nxt = 40000;
+        pst_pcb->state = TCP_ESTABLISHED;
+        pst_pcb->snd_wnd = 0; /* Peer advertises ZERO window */
+        pst_pcb->snd_wl1 = 40000;
+        pst_pcb->snd_wl2 = 30001;
+        tcp_register(pst_pcb);
+
+        /* Send 100 bytes: peer window is 0, so nothing can transmit, persist timer must arm */
+        uint8_t pdata[100];
+        tcp_zero(pdata, sizeof(pdata));
+        tcp_send(pst_pcb, pdata, 100);
+
+        mutex_lock(&pst_pcb->lock);
+        int t19_arm_ok = ((pst_pcb->flags & TCP_PCB_FLAG_TIMER_PERSIST) != 0 &&
+                          pst_pcb->timers.persist != 0 &&
+                          pst_pcb->timers.persist_ticks == TCP_PERSIST_TICKS_DEFAULT &&
+                          pst_pcb->tx_buf.unsent.bytes == 100 &&
+                          pst_pcb->tx_buf.unacked.bytes == 0);
+        uint64_t fire_tick = pst_pcb->timers.persist;
+        mutex_unlock(&pst_pcb->lock);
+
+        /* Tick past persist deadline: should trigger probe and backoff */
+        tcp_timer_tick(fire_tick + 1);
+
+        mutex_lock(&pst_pcb->lock);
+        int t19_backoff_ok = (pst_pcb->timers.persist_count == 1 &&
+                              pst_pcb->timers.persist_ticks == TCP_PERSIST_TICKS_DEFAULT * 2);
+
+        /* Peer opens window: update window and check persist disarms */
+        pst_pcb->snd_wnd = 4096;
+        if (pst_pcb->snd_wnd > 0 && (pst_pcb->flags & TCP_PCB_FLAG_TIMER_PERSIST) != 0) {
+            pst_pcb->flags &= ~TCP_PCB_FLAG_TIMER_PERSIST;
+            pst_pcb->timers.persist = 0;
+            pst_pcb->timers.persist_count = 0;
+        }
+        int t19_disarm_ok = ((pst_pcb->flags & TCP_PCB_FLAG_TIMER_PERSIST) == 0 &&
+                             pst_pcb->timers.persist == 0);
+        mutex_unlock(&pst_pcb->lock);
+
+        if (t19_arm_ok && t19_backoff_ok && t19_disarm_ok) {
+            klog("[TCP TEST] PASS: tcp_persist_timer (arm em zero-window, backoff de probe e desarme)\n");
+        } else {
+            klog("[TCP TEST] FAIL: tcp_persist_timer\n");
+        }
+        tcp_socket_destroy(pst_pcb);
     }
 
     klog("[TCP TEST] Finalizada Suite de Testes TCP.\n");

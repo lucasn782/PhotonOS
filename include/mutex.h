@@ -13,6 +13,7 @@ typedef struct mutex {
 
 void mutex_init(mutex_t *mutex);
 void mutex_lock(mutex_t *mutex);
+void mutex_lock_preemptible(mutex_t *mutex);
 void mutex_unlock(mutex_t *mutex);
 
 #endif

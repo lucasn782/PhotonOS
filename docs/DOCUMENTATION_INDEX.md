@@ -91,6 +91,7 @@ Este documento serve como o mapa central da documentação técnica do PhotonOS 
 *   **Público-Alvo**: Desenvolvedores e engenheiros de depuração.
 
 ### 14. Subsistema TCP v4.2 / v4.4 & Arquitetura de Rede
+*   **[networking/tcp_phase2c_flow_control.md](networking/tcp_phase2c_flow_control.md)**: Especificação da **TCP Phase 2C** (Controle de fluxo por janela deslizante RFC 793, advertised receive window, peer window enforcement, bytes in flight, fatiamento/MSS, zero-window persist timer & probes, full-duplex simultâneo de 16 KiB, blindagem de preempção com `mutex_lock_preemptible()` e validação PCAP).
 *   **[networking/tcp_phase2b2_tx.md](networking/tcp_phase2b2_tx.md)**: Especificação da **TCP Phase 2B.2B** (TX buffer por PCB de 8192 bytes, `send()`, segmentação MSS, `SND.NXT`/`SND.UNA`, ACK parcial/cumulativo, RTO básico e política de escrita parcial).
 *   **[networking/tcp_phase2b2_rx.md](networking/tcp_phase2b2_rx.md)**: Especificação completa da **TCP Phase 2B.2A** (Receive Path, Buffer Circular RX de 8192 bytes, avanço monotônico de `rcv_nxt`, emissão de ACK de payload, descarte e re-ACK de duplicados e fora de ordem, syscall `recv()` com bloqueio cooperativo, detecção de EOF e RST, e validação por captura PCAP no fio).
 *   **[networking/tcp_phase2b_passive.md](networking/tcp_phase2b_passive.md)**: Especificação completa da **TCP Phase 2B.1** (Abertura Passiva, estado `LISTEN`, child PCBs independentes, transição `SYN_RECEIVED`, fila de backlog com saturação, syscalls `listen()` e `accept()` com bloqueio cooperativo).

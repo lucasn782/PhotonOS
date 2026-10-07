@@ -228,14 +228,21 @@ Para detalhes completos, consulte [TCP Phase 2B.2A](networking/tcp_phase2b2_rx.m
 5. Retransmissão RTO de dados com backoff exponencial e limite de tentativas (`TCP_MAX_DATA_RETRIES = 5`).
 Para detalhes completos, consulte [TCP Phase 2B.2B](networking/tcp_phase2b2_tx.md).
 
-### 8.5. Métricas de Build & Otimização do Kernel
+### 8.5. Fase 2C (Flow Control, Persist Timer & Full-Duplex) — Concluída
+1. Advertised Receive Window dinâmico calculado por `rcv_wnd = capacity - used`, saturação até zero-window e emissão de Window Updates pós-`recv()`.
+2. Peer Window enforcement: rastreamento de `snd_wnd`, `snd_wl1` e `snd_wl2`, limitação por `bytes_in_flight` e fatiamento (*slicing*) de segmentos maiores que a janela restante ou MSS 1460.
+3. Persist Timer & Zero-Window Probing: armamento automático com dados represados sob janela zero, backoff exponencial e reabertura via `tcp_drain_unsent()`.
+4. Full-Duplex simultâneo de 16 KiB em canais bidirecionais concorrentes entre processos pai e filho (`fork()`).
+5. Hardening de concorrência com `mutex_lock_preemptible()`, desacoplamento de `sock->mutex` de chamadas de longa duração e garantia de ausência de locks durante transmissões de rede.
+Para detalhes completos, consulte [TCP Phase 2C](networking/tcp_phase2c_flow_control.md).
+
+### 8.6. Métricas de Build & Otimização do Kernel
 - **Otimização de Compilação:** Flag `-Os` ativada em CFLAGS no `Makefile`.
-- **Tamanho do Kernel Binário:** `build/photon.bin` = 137.772 bytes.
+- **Tamanho do Kernel Binário:** `build/photon.bin` = 141.868 bytes.
 - **Limite Máximo do Kernel (`KERNEL_MAX_BYTES`):** 245.760 bytes (480 setores LBA × 512 bytes).
-- **Margem de Segurança:** 107.988 bytes livres antes do teto de carregamento do bootloader.
+- **Margem de Segurança:** 103.892 bytes livres antes do teto de carregamento do bootloader.
 - **Gate de Build Ativo:** `test $(stat -c%s build/photon.bin) -le 245760` no Makefile.
 
-### 8.6. Próximas Etapas (Fase 2B.3 & Fase 2C):
-1. **Fase 2B.3 (Controle de Janela & Fluxo):** Janela deslizante (*sliding window*) dinâmica com controle de créditos via `snd_wnd`.
-2. **Fase 2C (Encerramento Gracioso & Full-Duplex):** Máquina de estados de fechamento ativo e passivo (`FIN_WAIT_1`, `FIN_WAIT_2`, `TIME_WAIT`, `LAST_ACK`, `shutdown()`).
-3. **Fases Posteriores:** Algoritmos de controle de congestionamento (Slow Start, AIMD, Fast Retransmit), SACK, Window Scaling e Servidor HTTP Ring 3.
+### 8.7. Próximas Etapas (Fase 2D):
+1. **Fase 2D (Encerramento Gracioso & FIN Handshake):** Máquina de estados de fechamento ativo e passivo (`FIN_WAIT_1`, `FIN_WAIT_2`, `TIME_WAIT`, `LAST_ACK`, `shutdown()`).
+2. **Fases Posteriores:** Algoritmos de controle de congestionamento (Slow Start, AIMD, Fast Retransmit), SACK, Window Scaling e Servidor HTTP Ring 3.

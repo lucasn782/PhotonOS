@@ -34,6 +34,8 @@
 #define TCP_PCB_FLAG_TIMER_DACK   (1U << 6)
 #define TCP_PCB_FLAG_RESET        (1U << 7)
 #define TCP_PCB_FLAG_EOF          (1U << 8)
+#define TCP_PCB_FLAG_TIMER_PERSIST (1U << 9)
+#define TCP_PCB_FLAG_DRAINING     (1U << 10)
 
 #define TCP_RX_BUFFER_CAPACITY    8192U
 #define TCP_TX_BUFFER_CAPACITY    8192U
@@ -54,6 +56,9 @@
 #define TCP_CONNECT_TIMEOUT_TICKS 500ULL
 #define TCP_MAX_SYN_RETRIES       3U
 #define TCP_MAX_DATA_RETRIES      5U
+#define TCP_PERSIST_TICKS_DEFAULT 100ULL
+#define TCP_MAX_PERSIST_TICKS     1000ULL
+#define TCP_MAX_PERSIST_PROBES    10U
 
 struct socket;
 
@@ -133,8 +138,11 @@ struct tcp_timers {
     uint64_t keepalive;      /* idle keep-alive probe */
     uint64_t delayed_ack;    /* delayed ACK deadline */
     uint64_t timeout;        /* generic connect / idle timeout */
+    uint64_t persist;        /* zero-window persist probe deadline */
     uint32_t rto_ticks;      /* current RTO budget */
+    uint32_t persist_ticks;  /* current persist probe interval */
     uint32_t retransmit_count;
+    uint32_t persist_count;
 };
 
 /*
@@ -160,6 +168,10 @@ typedef struct tcp_pcb {
 
     uint16_t snd_wnd;
     uint16_t rcv_wnd;
+    uint16_t rcv_ann_wnd;
+
+    uint32_t snd_wl1;
+    uint32_t snd_wl2;
 
     uint8_t state;
 
@@ -238,6 +250,7 @@ size_t tcp_rx_buffer_free_space_locked(struct tcp_pcb *pcb);
 int tcp_send(struct tcp_pcb *pcb, const uint8_t *buffer, size_t len);
 void tcp_tx_ack_received_locked(struct tcp_pcb *pcb, uint32_t ack);
 size_t tcp_tx_buffer_available_locked(struct tcp_pcb *pcb);
+void tcp_drain_unsent(struct tcp_pcb *pcb);
 
 /* Arm / clear timer slots */
 void tcp_timer_arm_rto(struct tcp_pcb *pcb, uint64_t now_ticks);

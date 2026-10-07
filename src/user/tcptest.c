@@ -999,6 +999,229 @@ static int do_send_error_test(void)
     return -1;
 }
 
+static int do_flow_server_test(uint16_t port, const char *mode)
+{
+    int listener_fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (listener_fd < 0) {
+        printf("[TCPTEST FLOW] FAIL: socket()\n");
+        return -1;
+    }
+
+    struct sockaddr_in bind_addr;
+    bind_addr.sin_family = AF_INET;
+    bind_addr.sin_port = htons(port);
+    bind_addr.sin_addr.s_addr = 0; /* INADDR_ANY */
+    for (int i = 0; i < 8; i++) bind_addr.sin_zero[i] = 0;
+
+    if (bind(listener_fd, (const struct sockaddr *)&bind_addr, sizeof(bind_addr)) != 0 ||
+        listen(listener_fd, 2) != 0) {
+        printf("[TCPTEST FLOW] FAIL: bind/listen\n");
+        close(listener_fd);
+        return -1;
+    }
+
+    printf("[TCPTEST FLOW] Ouvindo na porta %u (mode=%s)...\n", (unsigned int)port, mode);
+    int client_fd = accept(listener_fd, 0, 0);
+    if (client_fd < 0) {
+        printf("[TCPTEST FLOW] FAIL: accept()\n");
+        close(listener_fd);
+        return -1;
+    }
+    printf("[TCPTEST FLOW] Conexao aceita!\n");
+
+    int ret = 0;
+    if (strcmp(mode, "saturation") == 0) {
+        /* Deliberately pause before reading so client fills RX ring buffer and window shrinks to 0 */
+        delay_ticks(100);
+        /* Now read in 1024-byte chunks to observe window reopenings */
+        static uint8_t rx_buf[8192];
+        size_t total_read = 0;
+        int stalled = 0;
+        while (total_read < 8192 && stalled < 100) {
+            int r = recv(client_fd, rx_buf + total_read, 1024, 0);
+            if (r > 0) {
+                total_read += (size_t)r;
+                stalled = 0;
+                delay_ticks(10); /* small pause between reads */
+            } else if (r == 0) {
+                break; /* EOF */
+            } else {
+                stalled++;
+                yield();
+            }
+        }
+        printf("[TCPTEST FLOW SATURATION] Total lido: %u bytes\n", (unsigned int)total_read);
+        if (total_read != 8192) {
+            ret = -1;
+        }
+    } else if (strcmp(mode, "send_limited") == 0) {
+        /* Server sends 4000 bytes to client with limited window */
+        static uint8_t tx_buf[4000];
+        for (int i = 0; i < 4000; i++) {
+            tx_buf[i] = (uint8_t)('A' + (i % 26));
+        }
+        size_t total_sent = 0;
+        int stalled = 0;
+        while (total_sent < 4000 && stalled < 100) {
+            int s = send(client_fd, tx_buf + total_sent, 4000 - total_sent, 0);
+            if (s > 0) {
+                total_sent += (size_t)s;
+                stalled = 0;
+            } else {
+                stalled++;
+                yield();
+            }
+        }
+        printf("[TCPTEST FLOW SEND LIMITED] Total enviado: %u bytes\n", (unsigned int)total_sent);
+        if (total_sent != 4000) {
+            ret = -1;
+        }
+    } else if (strcmp(mode, "echo") == 0) {
+        /* Echo server */
+        static uint8_t buf[2048];
+        printf("[TCPTEST FLOW ECHO] Chamando recv...\n");
+        int r = recv(client_fd, buf, sizeof(buf), 0);
+        printf("[TCPTEST FLOW ECHO] recv retornou %d\n", r);
+        if (r > 0) {
+            int s = send(client_fd, buf, (size_t)r, 0);
+            printf("[TCPTEST FLOW ECHO] Echoed %d bytes (send res: %d)\n", r, s);
+            if (s != r) ret = -1;
+        } else {
+            ret = -1;
+        }
+    }
+
+    delay_ticks(20);
+    close(client_fd);
+    close(listener_fd);
+
+    if (ret == 0) {
+        printf("[TCPTEST FLOW] >>> FLUXO CONCLUIDO COM SUCESSO! <<<\n");
+    } else {
+        printf("[TCPTEST FLOW] >>> FALHA NO CONTROLE DE FLUXO! <<<\n");
+    }
+    return ret;
+}
+
+static int do_full_duplex_test(uint16_t port)
+{
+    int listener_fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (listener_fd < 0) {
+        printf("[TCPTEST FULL DUPLEX] FAIL: socket()\n");
+        return -1;
+    }
+
+    struct sockaddr_in bind_addr;
+    bind_addr.sin_family = AF_INET;
+    bind_addr.sin_port = htons(port);
+    bind_addr.sin_addr.s_addr = 0;
+    for (int i = 0; i < 8; i++) bind_addr.sin_zero[i] = 0;
+
+    if (bind(listener_fd, (const struct sockaddr *)&bind_addr, sizeof(bind_addr)) != 0 ||
+        listen(listener_fd, 2) != 0) {
+        printf("[TCPTEST FULL DUPLEX] FAIL: bind/listen\n");
+        close(listener_fd);
+        return -1;
+    }
+
+    printf("[TCPTEST FULL DUPLEX] Ouvindo na porta %u...\n", (unsigned int)port);
+    int client_fd = accept(listener_fd, 0, 0);
+    if (client_fd < 0) {
+        printf("[TCPTEST FULL DUPLEX] FAIL: accept()\n");
+        close(listener_fd);
+        return -1;
+    }
+    printf("[TCPTEST FULL DUPLEX] Conexao aceita para full duplex!\n");
+
+    /* Fork receiver child process while parent executes transmitter */
+    int pid = fork();
+    if (pid < 0) {
+        printf("[TCPTEST FULL DUPLEX] FAIL: fork() retornou %d\n", pid);
+        close(client_fd);
+        close(listener_fd);
+        return -1;
+    }
+    printf("[TCPTEST FULL DUPLEX] fork retornou %d (sou %s)\n", pid, pid == 0 ? "FILHO" : "PAI");
+
+    if (pid == 0) {
+        /* Child process: receive the client payload and then send the guest
+         * payload back on the same connection, exercising simultaneous RX/TX
+         * in the same TCP flow. */
+        static uint8_t rx_buf[16384];
+        for (int i = 0; i < 16384; i++) {
+            rx_buf[i] = 0;
+        }
+
+        size_t rx_recv = 0;
+        int stalled = 0;
+        printf("[TCPTEST FULL DUPLEX CHILD] Iniciando loop de recv...\n");
+        while (rx_recv < 16384 && stalled < 5000) {
+            int r = recv(client_fd, rx_buf + rx_recv, 16384 - rx_recv, 0);
+            if (r > 0) {
+                rx_recv += (size_t)r;
+                stalled = 0;
+            } else if (r == 0) {
+                printf("[TCPTEST FULL DUPLEX CHILD] EOF recebido\n");
+                break;
+            } else {
+                stalled++;
+                delay_ticks(1);
+            }
+        }
+        printf("[TCPTEST FULL DUPLEX] RX final: %u/16384\n", (unsigned int)rx_recv);
+        int ok = (rx_recv == 16384);
+        for (size_t i = 0; i < rx_recv; i++) {
+            uint8_t expected = (uint8_t)('C' + (i % 23));
+            if (rx_buf[i] != expected) {
+                printf("[TCPTEST FULL DUPLEX] FAIL: mismatch at byte %u: got %u expected %u\n",
+                    (unsigned int)i, rx_buf[i], expected);
+                ok = 0;
+                break;
+            }
+        }
+
+        close(client_fd);
+        close(listener_fd);
+        exit(ok ? 0 : 1);
+    }
+
+    /* Parent process: transmitter */
+    static uint8_t tx_buf[16384];
+    for (int i = 0; i < 16384; i++) {
+        tx_buf[i] = (uint8_t)('S' + (i % 23));
+    }
+    size_t tx_sent = 0;
+    int stalled = 0;
+    printf("[TCPTEST FULL DUPLEX PARENT] Iniciando loop de send...\n");
+    while (tx_sent < 16384 && stalled < 5000) {
+        int s = send(client_fd, tx_buf + tx_sent, 16384 - tx_sent, 0);
+        if (s > 0) {
+            tx_sent += (size_t)s;
+            stalled = 0;
+        } else {
+            stalled++;
+            delay_ticks(1);
+        }
+    }
+    printf("[TCPTEST FULL DUPLEX] TX final: %u/16384\n", (unsigned int)tx_sent);
+    int tx_ok = (tx_sent == 16384);
+
+    int child_status = 0;
+    waitpid(pid, &child_status, 0);
+
+    delay_ticks(20);
+    close(client_fd);
+    close(listener_fd);
+
+    if (tx_ok && child_status == 0) {
+        printf("[TCPTEST FULL DUPLEX] >>> FULL DUPLEX CONCLUIDO COM SUCESSO! <<<\n");
+        return 0;
+    } else {
+        printf("[TCPTEST FULL DUPLEX] >>> FALHA NO TESTE FULL DUPLEX! <<<\n");
+        return -1;
+    }
+}
+
 void _start(const char *arg)
 {
     if (arg == 0) {
@@ -1283,8 +1506,30 @@ void _start(const char *arg)
         int res = do_send_error_test();
         exit(res == 0 ? 0 : 1);
     }
+    else if (strcmp(cmd, "flow_server") == 0) {
+        /* uso: tcptest flow_server <porta> [mode] */
+        unsigned int lport = 8088;
+        if (ip_str[0] != '\0') {
+            parse_uint(ip_str, &lport);
+        }
+        const char *mode = "saturation";
+        if (port_str[0] != '\0') {
+            mode = port_str;
+        }
+        int res = do_flow_server_test((uint16_t)lport, mode);
+        exit(res == 0 ? 0 : 1);
+    }
+    else if (strcmp(cmd, "full_duplex") == 0) {
+        /* uso: tcptest full_duplex <porta> */
+        unsigned int lport = 8088;
+        if (ip_str[0] != '\0') {
+            parse_uint(ip_str, &lport);
+        }
+        int res = do_full_duplex_test((uint16_t)lport);
+        exit(res == 0 ? 0 : 1);
+    }
     else {
-        printf("Comando desconhecido: %s. Use connect, closed, timeout, stress, concurrent, listen, server_multi, server_fork, errors, recv_server, recv_partial, recv_block, recv_errors, recv_multi, recv_fork, recv_dup, send_server, send_multi, send_fork, send_dup, send_errors.\n", cmd);
+        printf("Comando desconhecido: %s. Use connect, closed, timeout, stress, concurrent, listen, server_multi, server_fork, errors, recv_server, recv_partial, recv_block, recv_errors, recv_multi, recv_fork, recv_dup, send_server, send_multi, send_fork, send_dup, send_errors, flow_server, full_duplex.\n", cmd);
         exit(1);
     }
 }

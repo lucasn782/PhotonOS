@@ -3,6 +3,30 @@
 Histórico completo de mudanças do sistema operacional, organizado por versão.
 Convenções: cada entrada lista data, commit (quando aplicável), resumo, arquivos alterados, bugs corrigidos, novas funcionalidades, breaking changes e impacto arquitetural.
 
+## `v4.4-tcp2c` — Milestone TCP Phase 2C: Flow Control, Persist Timer & Full-Duplex 🌐
+**Data:** 2026-10-07
+**Status:** Consolidado e validado em WSL/Ubuntu/QEMU com inspeção PCAP (14/14 testes aprovados).
+
+### Resumo do Milestone
+Implementação e consolidação completa do controle de fluxo por janela deslizante (RFC 793), advertised receive window dinâmico com suporte a zero-window e reabertura, persist timer com zero-window probing e backoff exponencial, suporte robusto a tráfego full-duplex simultâneo de 16 KiB em processos bifurcados e blindagem de concorrência com `mutex_lock_preemptible()` no kernel do PhotonOS.
+
+### Funcionalidades Consolidadas
+- **Advertised Receive Window Dinâmico:** Janela anunciada calculada com base na capacidade real do buffer RX (`rcv_wnd = capacity - used`). Saturação comprovada no fio reduzindo a janela a 0 (*zero window*) e emissão imediata de Window Updates após leituras em Ring 3 via `sys_recv()`.
+- **Peer Window Enforcement & Slicing:** Rastreamento estrito de `snd_wnd`, `snd_wl1` e `snd_wl2` conforme RFC 793. Limitação da taxa de envio por `bytes_in_flight` e fatiamento automático de segmentos (`slice`) respeitando a janela restante e MSS 1460.
+- **Persist Timer & Zero-Window Probes:** Detecção de exaustão de janela do par (`snd_wnd == 0`) com dados pendentes em `unsent`. Armamento de persist timer com intervalo inicial de 100 ticks, sondagem periódica via zero-window probes com backoff exponencial até o limite de retries e retomada automática via `tcp_drain_unsent()`.
+- **Comunicação Full-Duplex Simultânea (16 KiB):** Troca concorrente de 16.384 bytes em cada sentido entre processos bifurcados via `fork()`. Validação de integridade estrita (`host_sent=16384/16384`, `fd_received=16384/16384`) com pattern matching perfeito.
+- **Hardening de Sincronização e Preempção:**
+  - Implementação de `mutex_lock_preemptible()`: reabilita temporariamente interrupções (`sti`) durante a espera de mutexes em tarefas escalonáveis chamadas a partir de syscalls (`IF=0`), prevenindo deadlocks e starvation de CPUs por spinloop fechado sem preempção.
+  - Delimitação estrita do escopo de `sock->mutex`: liberação antecipada do lock do socket antes de chamadas de longa duração como `tcp_send()` e `tcp_socket_destroy()`, eliminando contenção entre leitura e escrita concorrentes em descritores compartilhados.
+- **Harness de Teste Determinístico:** Eliminação de detecção espúria de prompts antigos através de rastreamento monotônico por deslocamento de bytes (`min_index`, `wait_new_prompt`, `wait_for_exit`) e sincronização estrita por marcadores inequívocos de prontidão do servidor (`SERVER_READY`).
+
+### Validação de Integração e Regressões
+- **Suíte Phase 2C (14/14 PASS):** `UNIT_ADVERTISED_WINDOW`, `UNIT_PEER_WINDOW`, `UNIT_PERSIST_TIMER`, `FLOW_RX_SATURATION`, `FLOW_SEND_LIMITED`, `FLOW_ECHO_INTERACTIVE`, `FULL_DUPLEX_SIMULTANEOUS`, `FULL_DUPLEX_PATTERN_MATCH`, `PCAP_INITIAL_WINDOW`, `PCAP_WINDOW_DYNAMICS`, `FLOW_WINDOW_SHRINK`, `FLOW_WINDOW_REOPEN`, `PCAP_FLOW_CHECKSUMS` e `PCAP_MSS_COMPLIANCE`.
+- **Regressão Global:** Aprovação unânime de todas as suítes anteriores (Phase 2A, Phase 2B.1, Phase 2B.2A RX 5/5, Phase 2B.2B TX 28/28), 10/10 boots consecutivos, SMP stress com 4 CPUs, VFS, sinais POSIX, pipes, disco FAT16 e rede ICMP.
+- **Tamanho do Kernel:** `build/photon.bin` compilado em 141.868 bytes contra o limite de 245.760 bytes (margem de 103.892 bytes livres com `-Os`).
+
+---
+
 ## `v4.4-tcp2b` — Milestone TCP Phase 2B: Passive Open, RX & TX Data Plane 🌐
 **Data:** 2026-09-17
 **Status:** Consolidado e validado em WSL/Ubuntu/QEMU com inspeção PCAP.
