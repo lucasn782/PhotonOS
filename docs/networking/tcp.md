@@ -8,6 +8,7 @@ O suporte TCP do PhotonOS está dividido em fases progressivas:
 * **Fase 2B.2B (Transmit Path & `send()`):** Caminho de transmissão por PCB com `tcp_tx_buffer_t` limitado a 8192 bytes, cópia segura de payload Ring 3, segmentação em MSS 1460, `SND.NXT`/`SND.UNA`, ACK parcial/cumulativo, RTO básico com limite de tentativas e limpeza em RST/close. A API usa escrita parcial, não bloqueante, quando o TX buffer enche.
 * **Fase 2C (Controle de Fluxo, Persist Timer & Full-Duplex):** Controle de fluxo por janela deslizante RFC 793, cálculo dinâmico de advertised window (`rcv_wnd`), rastreamento de janela do par (`snd_wnd`), fatiamento e imposição de bytes em voo, proteção contra deadlock por zero-window probes com persist timer e backoff exponencial, suporte a tráfego full-duplex simultâneo de 16 KiB em processos bifurcados e blindagem de preempção com `mutex_lock_preemptible()`.
 * **Fase 2D (Encerramento Gracioso & FIN Handshake):** Implementação completa do encerramento gracioso RFC 793 (`FIN_WAIT_1`, `FIN_WAIT_2`, `TIME_WAIT`, `CLOSE_WAIT`, `LAST_ACK`), contabilidade de sequência para FIN (`SND.NXT++`, `RCV.NXT++`), retransmissão de FIN sob RTO com backoff exponencial, temporizador determinístico de TIME_WAIT (200 ticks = 2,0s), suporte a fechamento simultâneo, semântica estrita de EOF pós-drenagem de dados, desacoplamento de ciclo de vida entre Socket e PCB e isolamento de descritores pós-`fork()` e `dup()`.
+* **Fase 2E (Controle de Congestionamento RFC 5681):** Implementação de Slow Start (crescimento exponencial inicial com janela inicial $IW = 3 \times SMSS$), Congestion Avoidance (crescimento linear acumulado de 1 MSS por RTT via acumulador de bytes), reação a perdas por timeout de retransmissão RTO (reajuste de `ssthresh` e colapso de `cwnd = 1 \times SMSS` na primeira expiração sem rebaixamentos espúrios em backoff), e modulação do envio pelo menor valor entre `snd_wnd` e `cwnd`.
 
 Para as especificações técnicas detalhadas e evidências experimentais:
 * [TCP Phase 2A — Arquitetura e Validação](tcp_phase2a.md)
@@ -16,6 +17,7 @@ Para as especificações técnicas detalhadas e evidências experimentais:
 * [TCP Phase 2B.2B — TX Path, send() & Data ACK](tcp_phase2b2_tx.md)
 * [TCP Phase 2C — Flow Control, Persist Timer & Full-Duplex](tcp_phase2c_flow_control.md)
 * [TCP Phase 2D — Teardown, FIN Handshake & TIME_WAIT](tcp_phase2d_teardown.md)
+* [TCP Phase 2E — Congestion Control (RFC 5681)](tcp_phase2e_congestion_control.md)
 
 Documentação técnica de referência:
 * [Arquitetura TCP](../tcp_architecture.md)

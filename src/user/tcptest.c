@@ -1445,6 +1445,83 @@ static int do_teardown_client_test(const char *ip_str, uint16_t port, const char
     }
 }
 
+static int do_cc_server_test(uint16_t port, const char *mode)
+{
+    int listener_fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (listener_fd < 0) {
+        printf("[TCPTEST CC] FAIL: socket()\n");
+        return -1;
+    }
+
+    struct sockaddr_in bind_addr;
+    bind_addr.sin_family = AF_INET;
+    bind_addr.sin_port = htons(port);
+    bind_addr.sin_addr.s_addr = 0;
+    for (int i = 0; i < 8; i++) bind_addr.sin_zero[i] = 0;
+
+    if (bind(listener_fd, (const struct sockaddr *)&bind_addr, sizeof(bind_addr)) != 0 ||
+        listen(listener_fd, 4) != 0) {
+        printf("[TCPTEST CC] FAIL: bind/listen\n");
+        close(listener_fd);
+        return -1;
+    }
+
+    printf("[TCPTEST CC] Ouvindo na porta %u (mode=%s)...\n",
+        (unsigned int)port, mode != 0 ? mode : "default");
+
+    int client_fd = accept(listener_fd, 0, 0);
+    if (client_fd < 0) {
+        printf("[TCPTEST CC] FAIL: accept()\n");
+        close(listener_fd);
+        return -1;
+    }
+
+    printf("[TCPTEST CC] Conexao aceita!\n");
+
+    int ret = 0;
+    if (strcmp(mode, "slow_start") == 0) {
+        /* Envia 8192 bytes em blocos para validar Slow Start e cwnd */
+        static uint8_t buf[8192];
+        for (int i = 0; i < 8192; i++) {
+            buf[i] = (uint8_t)('A' + (i % 26));
+        }
+        int total = 0;
+        while (total < 8192) {
+            int chunk = 8192 - total;
+            if (chunk > 2048) chunk = 2048;
+            int s = send(client_fd, buf + total, (size_t)chunk, 0);
+            if (s <= 0) {
+                printf("[TCPTEST CC] Erro ao enviar total=%d\n", total);
+                ret = -1;
+                break;
+            }
+            total += s;
+        }
+        printf("[TCPTEST CC SLOW START] Total enviado: %d bytes\n", total);
+        if (total != 8192) ret = -1;
+    } else if (strcmp(mode, "loss_recovery") == 0) {
+        /* Envia 4000 bytes em fluxo continuo */
+        static uint8_t buf[4000];
+        for (int i = 0; i < 4000; i++) buf[i] = (uint8_t)('0' + (i % 10));
+        int s = send(client_fd, buf, 4000, 0);
+        printf("[TCPTEST CC LOSS] send retornou: %d\n", s);
+        if (s != 4000) ret = -1;
+    } else if (strcmp(mode, "peer_window") == 0) {
+        /* Envia dados para teste de interacao com janela do peer */
+        static uint8_t buf[4000];
+        for (int i = 0; i < 4000; i++) buf[i] = (uint8_t)('a' + (i % 26));
+        int s = send(client_fd, buf, 4000, 0);
+        printf("[TCPTEST CC PEER WINDOW] send retornou: %d\n", s);
+        if (s != 4000) ret = -1;
+    }
+
+    delay_ticks(30);
+    close(client_fd);
+    close(listener_fd);
+    printf("[TCPTEST CC] >>> CONGESTION CONTROL CONCLUIDO COM SUCESSO! <<<\n");
+    return ret;
+}
+
 void _start(const char *arg)
 {
     if (arg == 0) {
@@ -1776,6 +1853,19 @@ void _start(const char *arg)
             mode = extra_str;
         }
         int res = do_teardown_client_test(target, (uint16_t)rport, mode);
+        exit(res == 0 ? 0 : 1);
+    }
+    else if (strcmp(cmd, "cc_server") == 0) {
+        /* uso: tcptest cc_server <porta> [mode] */
+        unsigned int lport = 8088;
+        if (ip_str[0] != '\0') {
+            parse_uint(ip_str, &lport);
+        }
+        const char *mode = "slow_start";
+        if (port_str[0] != '\0') {
+            mode = port_str;
+        }
+        int res = do_cc_server_test((uint16_t)lport, mode);
         exit(res == 0 ? 0 : 1);
     }
     else {

@@ -61,6 +61,10 @@
 #define TCP_MAX_PERSIST_PROBES    10U
 #define TCP_TIMEWAIT_TICKS        200ULL
 
+/* RFC 5681 Congestion Control Constants (Phase 2E) */
+#define TCP_INITIAL_CWND(mss)     (3U * (mss))  /* RFC 5681: 3 * SMSS for 1095 < SMSS <= 2190 */
+#define TCP_INITIAL_SSTHRESH      65535U        /* RFC 5681: arbitrarily high (max unscaled window) */
+
 struct socket;
 
 struct __attribute__((packed)) tcp_header {
@@ -191,6 +195,11 @@ typedef struct tcp_pcb {
     tcp_tx_buffer_t tx_buf;
     uint32_t flags;
     struct tcp_timers timers;
+
+    /* RFC 5681 Congestion Control State (Phase 2E) */
+    uint32_t cwnd;              /* Congestion window in bytes */
+    uint32_t ssthresh;          /* Slow start threshold in bytes */
+    uint32_t ca_bytes_acked;    /* Congestion avoidance byte accumulator */
 
 
     /* Passive open / accept infrastructure. */

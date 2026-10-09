@@ -137,7 +137,10 @@ typedef struct tcp_pcb {
     struct tcp_pcb *parent;
     struct tcp_pcb *accept_next;
     struct tcp_pcb *accept_head;
-    struct tcp_pcb *accept_tail;
+    /* Controle de Congestionamento (RFC 5681 - TCP Phase 2E) */
+    uint32_t cwnd;           /* Janela de congestionamento */
+    uint32_t ssthresh;       /* Limiar de Slow Start / Congestion Avoidance */
+    uint32_t ca_bytes_acked; /* Acumulador de bytes em Congestion Avoidance */
 
     mutex_t lock;
 } tcp_pcb_t;
@@ -246,12 +249,21 @@ Para detalhes completos, consulte [TCP Phase 2C](networking/tcp_phase2c_flow_con
 7. Fechamento simultâneo RFC 793 (`FIN_WAIT_1 -> TIME_WAIT`) e suporte a segmentos combinados (`DATA+FIN`, `ACK+FIN`).
 Para detalhes completos, consulte [TCP Phase 2D](networking/tcp_phase2d_teardown.md).
 
-### 8.7. Métricas de Build & Otimização do Kernel
+### 8.7. Fase 2E (Congestion Control — RFC 5681) — Concluída
+1. Implementação de Slow Start com janela inicial determinística $IW = 3 \times SMSS$ (4380 bytes com MSS 1460).
+2. Crescimento linear suave em Congestion Avoidance quando `cwnd >= ssthresh` usando acumulador de bytes confirmados (`ca_bytes_acked`).
+3. Reação a perdas por RTO Timeout: reajuste de $ssthresh = \max(\lfloor FlightSize / 2 \rfloor, 2 \times SMSS)$ e colapso de $cwnd = 1 \times SMSS$ na primeira expiração sem rebaixamentos espúrios em retries.
+4. Modulação de saída pelo menor limite entre controle de fluxo e congestionamento: $min(snd\_wnd, cwnd) - bytes\_in\_flight$.
+5. Isolamento completo de estado por conexão, ACKs duplicados ignorados e persist timer preservado.
+Para detalhes completos, consulte [TCP Phase 2E](networking/tcp_phase2e_congestion_control.md).
+
+### 8.8. Métricas de Build & Otimização do Kernel
 - **Otimização de Compilação:** Flag `-Os` ativada em CFLAGS no `Makefile`.
 - **Tamanho do Kernel Binário:** `build/photon.bin` = 150.060 bytes.
 - **Limite Máximo do Kernel (`KERNEL_MAX_BYTES`):** 245.760 bytes (480 setores LBA × 512 bytes).
 - **Margem de Segurança:** 95.700 bytes livres antes do teto de carregamento do bootloader.
 - **Gate de Build Ativo:** `test $(stat -c%s build/photon.bin) -le 245760` no Makefile.
 
-### 8.8. Próximas Etapas:
-1. **Fases Posteriores:** Algoritmos de controle de congestionamento (Slow Start, AIMD, Fast Retransmit), SACK, Window Scaling e Servidor HTTP Ring 3.
+### 8.9. Próximas Etapas:
+1. **TCP Phase 2F:** Implementação da chamada de sistema `shutdown()` para encerramento unidirecional e bidirecional de canais (`SHUT_RD`, `SHUT_WR`, `SHUT_RDWR`).
+2. **Fases Posteriores:** Fast Retransmit / Fast Recovery, SACK, Window Scaling e Servidor HTTP Ring 3.

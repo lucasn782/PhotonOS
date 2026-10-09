@@ -3,6 +3,28 @@
 Histórico completo de mudanças do sistema operacional, organizado por versão.
 Convenções: cada entrada lista data, commit (quando aplicável), resumo, arquivos alterados, bugs corrigidos, novas funcionalidades, breaking changes e impacto arquitetural.
 
+## `v4.4-tcp2e` — Milestone TCP Phase 2E: Congestion Control (RFC 5681) 🌐
+**Data:** 2026-10-09
+**Status:** Consolidado e validado em WSL/Ubuntu/QEMU com inspeção PCAP (16/16 testes aprovados).
+
+### Resumo do Milestone
+Implementação e validação completa dos algoritmos fundamentais de controle de congestionamento TCP conforme a especificação RFC 5681, introduzindo Slow Start com janela inicial de 3 SMSS (4380 bytes), Congestion Avoidance com crescimento linear estável modulado por acumulador de bytes confirmados, reação a perdas por timeout de retransmissão (RTO) com recálculo de `ssthresh` e colapso de `cwnd = 1 SMSS`, e integração ao caminho de transmissão condicionando o envio ao menor valor entre `snd_wnd` e `cwnd`.
+
+### Funcionalidades Consolidadas
+- **Estado de Congestionamento por Conexão:** Campos dedicados no PCB (`cwnd`, `ssthresh`, `ca_bytes_acked`) mantidos com isolamento estrito entre conexões.
+- **Slow Start Exponencial Suave (RFC 5681):** Janela inicial $IW = 3 \times SMSS$ para $MSS = 1460$ bytes. Crescimento de `cwnd += min(bytes_acked, SMSS)` a cada ACK que confirma novos dados. ACKs duplicados e fora de ordem não afetam a janela.
+- **Congestion Avoidance Estável:** Ao atingir ou ultrapassar `ssthresh`, o acúmulo de bytes confirmados em `ca_bytes_acked` aciona incrementos de 1 SMSS a cada RTT completo quando `ca_bytes_acked >= cwnd`, eliminando problemas de divisão inteira truncada.
+- **Reação a Perda por RTO Timeout:** Na primeira expiração do temporizador de retransmissão (`retransmit_count == 0`), $ssthresh = \max(\lfloor FlightSize/2 \rfloor, 2 \times SMSS)$ e $cwnd = 1 \times SMSS$. Backoffs sucessivos não provocam reduções duplicadas espúrias.
+- **Modulação do Caminho TX:** Transmissão de segmentos controlada por $\min(snd\_wnd, cwnd) - bytes\_in\_flight$, preservando segmentação MSS, sliding window e persist timer sob `snd_wnd == 0`.
+- **Limitações Notáveis:** Fast Retransmit e Fast Recovery não integram este milestone, sendo postergados para fases posteriores. A syscall `shutdown()` permanece agendada para a Fase 2F.
+
+### Validação de Integração e Regressões
+- **Suíte Phase 2E (16/16 PASS):** `UNIT_CC_INIT`, `UNIT_SLOW_START_GROWTH`, `UNIT_CONGESTION_AVOIDANCE`, `UNIT_RTO_LOSS_RECOVERY`, `UNIT_EFFECTIVE_WINDOW`, `UNIT_DUP_ACK_NO_GROWTH`, `UNIT_RTO_NO_DOUBLE_DROP`, `WIRE_SLOW_START`, `WIRE_PEER_WINDOW_INTERACTION`, `WIRE_LOSS_RECOVERY`, `WIRE_FULL_DUPLEX_CC`, `WIRE_TEARDOWN_COMPLIANCE`, `PCAP_MSS_SEGMENTATION`, `PCAP_CWND_FLIGHT_PROGRESSION`, `PCAP_CHECKSUMS_VALID` e `PCAP_NO_DUPLICATE_DATA`.
+- **Regressão Global:** Aprovação unânime de todas as suítes anteriores (Phase 2A, Phase 2B.1, Phase 2B.2A RX, Phase 2B.2B TX, Phase 2C, Phase 2D 16/16), 10/10 boots consecutivos, SMP stress com 4 CPUs, VFS, sinais POSIX, pipes, disco FAT16 e conectividade ICMP.
+- **Tamanho do Kernel:** `build/photon.bin` compilado em 150.060 bytes contra o limite de 245.760 bytes (margem de 95.700 bytes livres com `-Os`).
+
+---
+
 ## `v4.4-tcp2d` — Milestone TCP Phase 2D: Graceful Teardown & FIN Handshake 🌐
 **Data:** 2026-10-09
 **Status:** Consolidado e validado em WSL/Ubuntu/QEMU com inspeção PCAP (16/16 testes aprovados).

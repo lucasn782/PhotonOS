@@ -378,3 +378,21 @@ Este documento serve como o mapa central da documentação técnica do PhotonOS 
 *   **Objetivo**: Documentar `send()`, TX buffer, segmentação MSS, `SND.NXT`/`SND.UNA`, ACK e retransmissão básica.
 *   **Dependências**: Drivers e1000, IPv4, Sockets, Escalonador e VMM.
 *   **Público-Alvo**: Engenheiros de rede, revisores de concorrência e desenvolvedores de kernel.
+
+### 7.6. [tcp_phase2c_flow_control.md](networking/tcp_phase2c_flow_control.md)
+*   **Descrição**: Especificação técnica da TCP Phase 2C (Flow Control, Persist Timer & Full-Duplex).
+*   **Objetivo**: Documentar controle de fluxo por janela deslizante, advertised window dinâmica, rastreamento de janela do par, persist timer sob zero-window e full-duplex simultâneo.
+*   **Dependências**: Drivers e1000, IPv4, Sockets, Escalonador e Mutex preemptível.
+*   **Público-Alvo**: Engenheiros de rede, arquitetos de kernel e desenvolvedores.
+
+### 7.7. [tcp_phase2d_teardown.md](networking/tcp_phase2d_teardown.md)
+*   **Descrição**: Especificação técnica da TCP Phase 2D (Graceful Connection Teardown & FIN Handshake).
+*   **Objetivo**: Documentar máquina de estados de fechamento RFC 793, contabilidade de sequência para FIN, temporizador e retransmissão RTO, TIME_WAIT determinístico e isolamento de descritores.
+*   **Dependências**: Drivers e1000, IPv4, Sockets, VFS e Escalonador.
+*   **Público-Alvo**: Engenheiros de rede, arquitetos de kernel e revisores de conformidade.
+
+### 7.8. [tcp_phase2e_congestion_control.md](networking/tcp_phase2e_congestion_control.md)
+*   **Descrição**: Especificação técnica da TCP Phase 2E (Congestion Control — RFC 5681).
+*   **Objetivo**: Documentar algoritmos de Slow Start, Congestion Avoidance, acumulador de bytes confirmados, reação a perdas por RTO Timeout e integração ao caminho de envio.
+*   **Dependências**: Drivers e1000, IPv4, Sockets e Escalonador.
+*   **Público-Alvo**: Engenheiros de rede e desenvolvedores de kernel.

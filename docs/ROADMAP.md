@@ -119,10 +119,18 @@ Este documento descreve o estado atual do desenvolvimento do PhotonOS, dividindo
 
 ---
 
+### Trilha 22 — TCP Phase 2E: Controle de Congestionamento (v4.4-tcp2e)
+- **Slow Start & Janela Inicial (RFC 5681):** $IW = 3 \times SMSS$ (4380 bytes com MSS 1460), crescimento exponencial suave via `min(bytes_acked, SMSS)` por ACK novo válido.
+- **Congestion Avoidance & Acumulador:** Crescimento linear aproximado de 1 MSS por RTT quando `cwnd >= ssthresh` utilizando acumulador `ca_bytes_acked` para evitar truncamento por divisão inteira.
+- **Reação a Perda por Retransmission Timeout (RTO):** Reajuste de $ssthresh = \max(\lfloor FlightSize/2 \rfloor, 2 \times SMSS)$ e colapso de $cwnd = 1 \times SMSS$ na primeira expiração sem rebaixamento duplicado em backoff.
+- **Integração com Caminho TX:** Modulação de envio pela janela efetiva $\min(snd\_wnd, cwnd) - bytes\_in\_flight$.
+- **Validação Completa & PCAP:** 16/16 testes aprovados na suíte dedicada Phase 2E e 100% de aprovação nas suítes de regressão globais.
+
+---
+
 ## 🟡 Em Desenvolvimento (v4.4-dev)
 
-### Trilha 22 — TCP Fases Avançadas & Congestion Control
-- **Controle de Congestionamento Básico:** Slow Start e Congestion Avoidance conforme RFC 5681.
+### Trilha 23 — TCP Phase 2F: Syscall `shutdown()`
 - **Syscall `shutdown()`:** Encerramento unidirecional e bidirecional de canais (`SHUT_RD`, `SHUT_WR`, `SHUT_RDWR`).
 
 

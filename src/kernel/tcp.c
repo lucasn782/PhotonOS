@@ -354,6 +354,9 @@ tcp_pcb_t *tcp_alloc(void)
     pcb->snd_wnd = (uint16_t)TCP_DEFAULT_WINDOW;
     pcb->rcv_wnd = (uint16_t)TCP_RX_BUFFER_CAPACITY;
     pcb->rcv_ann_wnd = (uint16_t)TCP_RX_BUFFER_CAPACITY;
+    pcb->cwnd = TCP_INITIAL_CWND(TCP_DEFAULT_MSS);
+    pcb->ssthresh = TCP_INITIAL_SSTHRESH;
+    pcb->ca_bytes_acked = 0;
     pcb->snd_wl1 = 0;
     pcb->snd_wl2 = 0;
     pcb->state = TCP_CLOSED;
@@ -571,7 +574,7 @@ void tcp_timer_tick(uint64_t now_ticks)
                 mutex_unlock(&pcb->lock);
                 continue;
             }
-        } else if (pcb->state == TCP_ESTABLISHED) {
+        } else if (pcb->state == TCP_ESTABLISHED || pcb->state == TCP_CLOSE_WAIT) {
             /* Check data RTO retransmission */
             if ((pcb->flags & TCP_PCB_FLAG_TIMER_RTO) != 0 &&
                 pcb->timers.retransmission != 0 &&
@@ -590,6 +593,16 @@ void tcp_timer_tick(uint64_t now_ticks)
                             tcp_socket_notify(sock);
                         }
                         continue;
+                    }
+
+                    /* RFC 5681 Section 3.1: Congestion response to RTO timeout */
+                    if (pcb->timers.retransmit_count == 0) {
+                        uint32_t flight_size = pcb->snd_nxt - pcb->snd_una;
+                        uint32_t half_flight = flight_size / 2U;
+                        uint32_t min_ssthresh = 2U * TCP_DEFAULT_MSS;
+                        pcb->ssthresh = (half_flight > min_ssthresh) ? half_flight : min_ssthresh;
+                        pcb->cwnd = 1U * TCP_DEFAULT_MSS; /* Loss Window (LW) = 1 SMSS */
+                        pcb->ca_bytes_acked = 0;
                     }
 
                     /* Increment retry count & apply exponential backoff */
@@ -1988,7 +2001,31 @@ void tcp_tx_ack_received_locked(struct tcp_pcb *pcb, uint32_t ack)
     }
 
     /* 4. Valid new ACK: SND.UNA < ACK <= SND.NXT */
+    uint32_t bytes_acked = ack - pcb->snd_una;
     pcb->snd_una = ack;
+
+    /* RFC 5681 Congestion Control: update cwnd on valid new ACK */
+    if (pcb->cwnd < pcb->ssthresh) {
+        /* Slow Start: cwnd grows by at most 1 SMSS per ACK */
+        uint32_t incr = bytes_acked;
+        if (incr > TCP_DEFAULT_MSS) {
+            incr = TCP_DEFAULT_MSS;
+        }
+        pcb->cwnd += incr;
+        if (pcb->cwnd > 0xFFFFU) {
+            pcb->cwnd = 0xFFFFU;
+        }
+    } else {
+        /* Congestion Avoidance: cwnd grows by roughly 1 SMSS per RTT */
+        pcb->ca_bytes_acked += bytes_acked;
+        if (pcb->ca_bytes_acked >= pcb->cwnd) {
+            pcb->ca_bytes_acked = 0;
+            pcb->cwnd += TCP_DEFAULT_MSS;
+            if (pcb->cwnd > 0xFFFFU) {
+                pcb->cwnd = 0xFFFFU;
+            }
+        }
+    }
 
     /* Free confirmed segments or adjust partially confirmed segment */
     while (pcb->tx_buf.unacked.head != 0) {
@@ -2065,15 +2102,23 @@ void tcp_drain_unsent(struct tcp_pcb *pcb)
             break;
         }
 
-        /* Compute remaining peer window */
+        /*
+         * Effective transmission window (RFC 5681 Section 3.1):
+         * Transmission is bounded by min(snd_wnd, cwnd) - bytes_in_flight.
+         */
         uint32_t bytes_in_flight = pcb->snd_nxt - pcb->snd_una;
+        uint32_t eff_wnd = ((uint32_t)pcb->snd_wnd < pcb->cwnd) ? (uint32_t)pcb->snd_wnd : pcb->cwnd;
         uint32_t remaining_wnd = 0;
-        if (pcb->snd_wnd > bytes_in_flight) {
-            remaining_wnd = pcb->snd_wnd - bytes_in_flight;
+        if (eff_wnd > bytes_in_flight) {
+            remaining_wnd = eff_wnd - bytes_in_flight;
         }
 
         if (remaining_wnd == 0) {
-            /* Peer window exhausted: arm persist timer if not already armed */
+            /*
+             * Peer window exhausted (flow control zero-window):
+             * arm persist timer if peer advertised 0 window.
+             * If blocked solely by cwnd, do NOT arm persist timer.
+             */
             if (pcb->snd_wnd == 0 &&
                 (pcb->flags & TCP_PCB_FLAG_TIMER_PERSIST) == 0 &&
                 pcb->tx_buf.unsent.head != 0) {
@@ -3262,6 +3307,133 @@ void tcp_run_tests(void)
             klog("[TCP TEST] FAIL: FIN Retransmission\n");
         }
         tcp_socket_destroy(fr_pcb);
+    }
+
+    /* Test 26: Congestion Control Initialization (RFC 5681) */
+    tcp_pcb_t *cc_pcb = tcp_alloc();
+    if (cc_pcb != 0) {
+        int cc_init_ok = (cc_pcb->cwnd == 3U * TCP_DEFAULT_MSS &&
+                          cc_pcb->ssthresh == TCP_INITIAL_SSTHRESH &&
+                          cc_pcb->ca_bytes_acked == 0);
+        if (cc_init_ok) {
+            klog("[TCP TEST] PASS: Congestion Control Init (IW=3*MSS, ssthresh=65535)\n");
+        } else {
+            klog("[TCP TEST] FAIL: Congestion Control Init\n");
+        }
+
+        /* Test 27: Slow Start Growth */
+        cc_pcb->local_ip = htonl(0x0A00020FU);
+        cc_pcb->remote_ip = htonl(0x0A000202U);
+        cc_pcb->local_port = 7786;
+        cc_pcb->remote_port = 55586;
+        cc_pcb->iss = 1000;
+        cc_pcb->snd_una = 1000;
+        cc_pcb->snd_nxt = 5000;
+        cc_pcb->state = TCP_ESTABLISHED;
+        mutex_lock(&cc_pcb->lock);
+
+        /* ACK 1460 bytes in Slow Start: cwnd grows from 4380 by 1460 -> 5840 */
+        tcp_tx_ack_received_locked(cc_pcb, 2460);
+        int ss_grow1 = (cc_pcb->cwnd == (3U * TCP_DEFAULT_MSS + 1460U) && cc_pcb->snd_una == 2460);
+
+        /* Duplicate ACK: must NOT grow cwnd */
+        tcp_tx_ack_received_locked(cc_pcb, 2460);
+        int dup_ack_ok = (cc_pcb->cwnd == (3U * TCP_DEFAULT_MSS + 1460U));
+
+        /* Another 1460 bytes: cwnd grows -> 7300 */
+        tcp_tx_ack_received_locked(cc_pcb, 3920);
+        int ss_grow2 = (cc_pcb->cwnd == (3U * TCP_DEFAULT_MSS + 2920U) && cc_pcb->snd_una == 3920);
+        mutex_unlock(&cc_pcb->lock);
+
+        if (ss_grow1 && dup_ack_ok && ss_grow2) {
+            klog("[TCP TEST] PASS: Slow Start Growth (crescimento por ACK valido, dup ACK ignorado)\n");
+        } else {
+            klog("[TCP TEST] FAIL: Slow Start Growth\n");
+        }
+
+        /* Test 28: Congestion Avoidance Linear Growth */
+        mutex_lock(&cc_pcb->lock);
+        cc_pcb->ssthresh = cc_pcb->cwnd; /* ssthresh = 7300, now cwnd >= ssthresh */
+        cc_pcb->ca_bytes_acked = 0;
+        cc_pcb->snd_nxt = 20000;
+
+        /* ACK 3000 bytes: ca_bytes_acked = 3000 (< 7300), cwnd unchanged */
+        tcp_tx_ack_received_locked(cc_pcb, 6920);
+        int ca_accum_ok = (cc_pcb->cwnd == 7300U && cc_pcb->ca_bytes_acked == 3000U);
+
+        /* ACK another 4300 bytes: ca_bytes_acked reaches 7300 >= 7300 -> cwnd grows by 1 MSS */
+        tcp_tx_ack_received_locked(cc_pcb, 11220);
+        int ca_grow_ok = (cc_pcb->cwnd == (7300U + TCP_DEFAULT_MSS) && cc_pcb->ca_bytes_acked == 0);
+        mutex_unlock(&cc_pcb->lock);
+
+        if (ca_accum_ok && ca_grow_ok) {
+            klog("[TCP TEST] PASS: Congestion Avoidance (crescimento linear acumulado de 1 MSS por RTT)\n");
+        } else {
+            klog("[TCP TEST] FAIL: Congestion Avoidance\n");
+        }
+
+        /* Test 29: RTO Loss Recovery (ssthresh = max(Flight/2, 2*MSS), cwnd = 1*MSS) */
+        mutex_lock(&cc_pcb->lock);
+        cc_pcb->snd_una = 11220;
+        cc_pcb->snd_nxt = 11220 + 4000; /* FlightSize = 4000 */
+        cc_pcb->timers.retransmit_count = 0;
+        cc_pcb->timers.retransmission = 100ULL;
+        cc_pcb->flags |= TCP_PCB_FLAG_TIMER_RTO;
+
+        /* Simulate dummy segment in unacked queue */
+        struct tcp_segment *sim_seg = (struct tcp_segment *)kmalloc(sizeof(*sim_seg));
+        if (sim_seg != 0) {
+            sim_seg->data = (uint8_t *)kmalloc(100);
+            sim_seg->length = 100;
+            sim_seg->offset = 0;
+            sim_seg->sequence = 11220;
+            sim_seg->next = 0;
+            tcp_queue_append_locked(&cc_pcb->tx_buf.unacked, sim_seg);
+        }
+        tcp_register(cc_pcb);
+        mutex_unlock(&cc_pcb->lock);
+
+        tcp_timer_tick(101ULL);
+
+        mutex_lock(&cc_pcb->lock);
+        /* Half flight = 2000 < 2*MSS (2920), so ssthresh = 2920, cwnd = 1460 */
+        int rto_cc_ok = (cc_pcb->ssthresh == (2U * TCP_DEFAULT_MSS) &&
+                         cc_pcb->cwnd == TCP_DEFAULT_MSS &&
+                         cc_pcb->timers.retransmit_count == 1);
+
+        /* Second timeout for same segment must NOT reduce ssthresh again */
+        mutex_unlock(&cc_pcb->lock);
+        tcp_timer_tick(cc_pcb->timers.retransmission + 1);
+        mutex_lock(&cc_pcb->lock);
+        int rto_no_double_ok = (cc_pcb->ssthresh == (2U * TCP_DEFAULT_MSS) &&
+                                cc_pcb->cwnd == TCP_DEFAULT_MSS &&
+                                cc_pcb->timers.retransmit_count == 2);
+        mutex_unlock(&cc_pcb->lock);
+
+        if (rto_cc_ok && rto_no_double_ok) {
+            klog("[TCP TEST] PASS: RTO Loss Recovery (ssthresh reduzido, cwnd reiniciado para 1 MSS)\n");
+        } else {
+            klog("[TCP TEST] FAIL: RTO Loss Recovery\n");
+        }
+
+        /* Test 30: Effective Transmission Window (min(snd_wnd, cwnd)) */
+        mutex_lock(&cc_pcb->lock);
+        cc_pcb->snd_wnd = 1000;
+        cc_pcb->cwnd = 5000;
+        uint32_t eff1 = ((uint32_t)cc_pcb->snd_wnd < cc_pcb->cwnd) ? (uint32_t)cc_pcb->snd_wnd : cc_pcb->cwnd;
+
+        cc_pcb->snd_wnd = 10000;
+        cc_pcb->cwnd = 2920;
+        uint32_t eff2 = ((uint32_t)cc_pcb->snd_wnd < cc_pcb->cwnd) ? (uint32_t)cc_pcb->snd_wnd : cc_pcb->cwnd;
+        mutex_unlock(&cc_pcb->lock);
+
+        if (eff1 == 1000 && eff2 == 2920) {
+            klog("[TCP TEST] PASS: Effective Window min(snd_wnd, cwnd)\n");
+        } else {
+            klog("[TCP TEST] FAIL: Effective Window\n");
+        }
+
+        tcp_socket_destroy(cc_pcb);
     }
 
     klog("[TCP TEST] Finalizada Suite de Testes TCP.\n");
