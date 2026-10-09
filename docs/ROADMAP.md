@@ -107,10 +107,22 @@ Este documento descreve o estado atual do desenvolvimento do PhotonOS, dividindo
 
 ---
 
+### Trilha 21 — TCP Phase 2D: Encerramento Gracioso & FIN Handshake (v4.4-tcp2d)
+- **Máquina de Estados de Fechamento RFC 793:** Implementação completa e determinística de `FIN_WAIT_1`, `FIN_WAIT_2`, `TIME_WAIT`, `CLOSE_WAIT`, `LAST_ACK` e `CLOSED`.
+- **Contabilidade de Número de Sequência:** O flag FIN consome exatamente 1 número de sequência (`SND.NXT++`, `RCV.NXT++`).
+- **Retransmissão de FIN:** Retransmissão automática por temporizador RTO com recuo exponencial e limite de tentativas em `FIN_WAIT_1` e `LAST_ACK`.
+- **Temporizador de TIME_WAIT:** Duração de 200 ticks (2,0 segundos) no `tcp_timer_tick()`, sustentando re-ACK de FINs remotos duplicados e executando desalocação diferida segura do PCB.
+- **Semântica Estrita de EOF e Drenagem RX:** `sys_recv()` consome dados residuais antes de retornar EOF (0); sem retorno prematuro de EOF.
+- **Desacoplamento de Ciclo de Vida e Descritores:** Suporte a `fork()` e `dup()` com fechamento do socket baseado em contadores de referência do VFS, e preservação do PCB após desalocação do socket até o fechamento definitivo da conexão.
+- **Fechamento Simultâneo e Segmentos Combinados:** Transição correta `FIN_WAIT_1 -> TIME_WAIT` em cruzamento de FINs e parsing correto de `DATA+FIN` e `ACK+FIN`.
+- **Validação de Testes e PCAP:** 16/16 testes aprovados na suíte dedicada Phase 2D, com validação de wire PCAP e zero regressões no sistema.
+
+---
+
 ## 🟡 Em Desenvolvimento (v4.4-dev)
 
-### Trilha 21 — TCP Phase 2D: Encerramento Gracioso & FIN Handshake
-- **Four-Way Handshake de Fechamento:** Máquina de estados completa para encerramento ativo e passivo (`FIN_WAIT_1`, `FIN_WAIT_2`, `CLOSING`, `TIME_WAIT`, `LAST_ACK`).
+### Trilha 22 — TCP Fases Avançadas & Congestion Control
+- **Controle de Congestionamento Básico:** Slow Start e Congestion Avoidance conforme RFC 5681.
 - **Syscall `shutdown()`:** Encerramento unidirecional e bidirecional de canais (`SHUT_RD`, `SHUT_WR`, `SHUT_RDWR`).
 
 

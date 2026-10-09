@@ -642,7 +642,7 @@ void socket_vfs_close(vfs_node_t *node)
         mutex_unlock(&sock->mutex);
 
         if (pcb != 0) {
-            tcp_socket_destroy(pcb);
+            tcp_close(pcb);
         }
     }
     node->data = 0;
@@ -1639,7 +1639,8 @@ int sys_recv(int fd, void *buffer, size_t len, int flags)
             return 0;
         }
 
-        if (pcb->state != TCP_ESTABLISHED && pcb->state != TCP_SYN_RECEIVED) {
+        if (pcb->state != TCP_ESTABLISHED && pcb->state != TCP_SYN_RECEIVED &&
+            pcb->state != TCP_FIN_WAIT1 && pcb->state != TCP_FIN_WAIT2) {
             mutex_unlock(&pcb->lock);
             return -1;
         }
@@ -1647,7 +1648,7 @@ int sys_recv(int fd, void *buffer, size_t len, int flags)
         uint64_t rflags = save_and_disable_interrupts();
         if (pcb->rx_buf.used == 0 &&
             (pcb->flags & (TCP_PCB_FLAG_RESET | TCP_PCB_FLAG_EOF)) == 0 &&
-            pcb->state == TCP_ESTABLISHED) {
+            (pcb->state == TCP_ESTABLISHED || pcb->state == TCP_FIN_WAIT1 || pcb->state == TCP_FIN_WAIT2)) {
             scheduler_sleep_current(TASK_WAIT_SOCKET_RECV, (uint64_t)sock);
             mutex_unlock(&pcb->lock);
             restore_interrupts(rflags);

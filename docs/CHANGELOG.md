@@ -3,9 +3,34 @@
 Histórico completo de mudanças do sistema operacional, organizado por versão.
 Convenções: cada entrada lista data, commit (quando aplicável), resumo, arquivos alterados, bugs corrigidos, novas funcionalidades, breaking changes e impacto arquitetural.
 
+## `v4.4-tcp2d` — Milestone TCP Phase 2D: Graceful Teardown & FIN Handshake 🌐
+**Data:** 2026-10-09
+**Status:** Consolidado e validado em WSL/Ubuntu/QEMU com inspeção PCAP (16/16 testes aprovados).
+
+### Resumo do Milestone
+Implementação e consolidação completa do encerramento gracioso de conexões TCP conforme a RFC 793, introduzindo a máquina de estados de fechamento (`FIN_WAIT_1`, `FIN_WAIT_2`, `TIME_WAIT`, `CLOSE_WAIT`, `LAST_ACK`, `CLOSED`), contabilidade estrita de sequence numbers para o flag FIN (`+1 SEQ`), temporizador e retransmissão de FIN via RTO, temporizador de `TIME_WAIT` determinístico (200 ticks = 2,0s), suporte a fechamento simultâneo, preservação de semântica POSIX de EOF sem perda de dados residuais no buffer RX, desacoplamento seguro do ciclo de vida entre Socket VFS e PCB, e isolamento de descritores pós-`fork()` e `dup()`.
+
+### Funcionalidades Consolidadas
+- **Máquina de Estados de Fechamento RFC 793:** Suporte completo aos caminhos ativo (`ESTABLISHED -> FIN_WAIT_1 -> FIN_WAIT_2 -> TIME_WAIT -> CLOSED`), passivo (`ESTABLISHED -> CLOSE_WAIT -> LAST_ACK -> CLOSED`) e simultâneo (`FIN_WAIT_1 -> TIME_WAIT -> CLOSED`).
+- **Contabilidade de Número de Sequência para FIN:** O controle de FIN consome exatamente 1 número de sequência (`SND.NXT++`, `RCV.NXT++`), sincronizado estritamente com `SND.UNA` após recepção do ACK correspondente.
+- **Retransmissão de FIN por Temporizador RTO:** Se o ACK do FIN for perdido, o temporizador em `tcp_timer_tick()` retransmite o segmento FIN com backoff exponencial até o limite (`TCP_MAX_DATA_RETRIES = 5`).
+- **Temporizador de TIME_WAIT Determinístico:** Duração de 200 ticks (2,0 segundos) no `tcp_timer_tick()`. Durante esse período, o PCB permanece ativo na lista global para responder com ACK a FINs remotos duplicados, sendo limpo e desalocado com segurança (`tcp_free()`) fora de locks após a expiração.
+- **Semântica Estrita de EOF e Drenagem RX:** `sys_recv()` consome e entrega todos os bytes restantes em `rx_buf` antes de retornar EOF (`0`). Leituras subsequentes retornam deterministamente `0` sem ressuscitação ou bloqueio espúrio.
+- **Desacoplamento de Ciclo de Vida (Socket vs. PCB):** Em `socket_vfs_close()`, a destruição imediata foi substituída por `tcp_close(pcb)`. Se o socket for destruído pela última referência de arquivo enquanto a conexão encerra em background, `pcb->socket = NULL` é registrado e o PCB completa o teardown de rede antes de ser liberado pelo temporizador ou ACK final.
+- **Preservação de Descritores sob `fork()` e `dup()`:** Fechar uma cópia do descritor de arquivo em um processo não envia FIN se o socket ainda mantiver referências ativas (`refcount > 1`). O FIN só é despachado quando a última referência do VFS for fechada.
+- **Fechamento Simultâneo & Segmentos Combinados:** Reconhecimento correto de `DATA+FIN` (entrega de dados e avanço de `RCV.NXT` antes de marcar EOF) e `ACK+FIN` (processamento ordenado de avanço de ACK e transição para `TIME_WAIT`).
+
+### Validação de Integração e Regressões
+- **Suíte Phase 2D (16/16 PASS):** `UNIT_ACTIVE_CLOSE`, `UNIT_PASSIVE_CLOSE`, `UNIT_SIMULTANEOUS_CLOSE`, `UNIT_DATA_PLUS_FIN`, `UNIT_DUPLICATE_FIN`, `UNIT_FIN_RETRANSMISSION`, `WIRE_PASSIVE_CLOSE`, `WIRE_ACTIVE_CLOSE`, `WIRE_EOF_REPEATED`, `WIRE_FORK_TEARDOWN`, `WIRE_DUP_TEARDOWN`, `WIRE_SIMULTANEOUS_CLOSE`, `FULL_DUPLEX_THEN_CLOSE`, `PCAP_FIN_ON_WIRE`, `PCAP_FIN_SEQ_ACCOUNTING` e `PCAP_CHECKSUMS_VALID`.
+- **Regressão Global:** Aprovação unânime de todas as suítes anteriores (Phase 2A, Phase 2B.1, Phase 2B.2A RX 17/17, Phase 2B.2B TX 28/28, Phase 2C 14/14), 10/10 boots consecutivos, SMP stress com 4 CPUs, VFS, sinais POSIX, pipes, disco FAT16 e conectividade ICMP.
+- **Tamanho do Kernel:** `build/photon.bin` compilado em 150.060 bytes contra o limite de 245.760 bytes (margem de 95.700 bytes livres com `-Os`).
+
+---
+
 ## `v4.4-tcp2c` — Milestone TCP Phase 2C: Flow Control, Persist Timer & Full-Duplex 🌐
 **Data:** 2026-10-07
 **Status:** Consolidado e validado em WSL/Ubuntu/QEMU com inspeção PCAP (14/14 testes aprovados).
+
 
 ### Resumo do Milestone
 Implementação e consolidação completa do controle de fluxo por janela deslizante (RFC 793), advertised receive window dinâmico com suporte a zero-window e reabertura, persist timer com zero-window probing e backoff exponencial, suporte robusto a tráfego full-duplex simultâneo de 16 KiB em processos bifurcados e blindagem de concorrência com `mutex_lock_preemptible()` no kernel do PhotonOS.

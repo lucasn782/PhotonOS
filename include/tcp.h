@@ -59,6 +59,7 @@
 #define TCP_PERSIST_TICKS_DEFAULT 100ULL
 #define TCP_MAX_PERSIST_TICKS     1000ULL
 #define TCP_MAX_PERSIST_PROBES    10U
+#define TCP_TIMEWAIT_TICKS        200ULL
 
 struct socket;
 
@@ -215,6 +216,7 @@ tcp_pcb_t *tcp_lookup(uint32_t local_ip, uint32_t remote_ip,
 
 struct tcp_pcb *tcp_socket_create(void *socket);
 void tcp_socket_destroy(struct tcp_pcb *pcb);
+int tcp_close(struct tcp_pcb *pcb);
 
 int tcp_bind(struct tcp_pcb *pcb, uint32_t local_ip, uint16_t local_port);
 uint16_t tcp_allocate_ephemeral_port(struct tcp_pcb *pcb, uint32_t local_ip);

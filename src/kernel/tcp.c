@@ -103,7 +103,8 @@ static int tcp_port_in_use_locked(const struct tcp_pcb *except,
         return 1;
     }
     for (struct tcp_pcb *pcb = tcp_pcbs; pcb != 0; pcb = pcb->next) {
-        if (pcb == except || pcb->local_port != local_port) {
+        if (pcb == except || pcb->local_port != local_port ||
+            pcb->state == TCP_CLOSED) {
             continue;
         }
         /* Collision if either side is wildcard or both share the address. */
@@ -470,6 +471,8 @@ void tcp_timer_tick(uint64_t now_ticks)
      * would try to re-acquire tcp_pcbs_lock → deadlock.
      * Uses static tcp_deferred_tx in .network_state to prevent kernel stack bloat. */
     int deferred_count = 0;
+    struct tcp_pcb *dead_pcbs[16];
+    int dead_count = 0;
 
     /* The packet array is static to keep 8 KiB kernel stacks shallow. */
     mutex_lock(&tcp_deferred_tx_lock);
@@ -698,10 +701,108 @@ void tcp_timer_tick(uint64_t now_ticks)
                     pcb->timers.persist_count = 0;
                 }
             }
+        } else if (pcb->state == TCP_FIN_WAIT1 || pcb->state == TCP_LAST_ACK) {
+            /* Check RTO for FIN retransmission */
+            if ((pcb->flags & TCP_PCB_FLAG_TIMER_RTO) != 0 &&
+                pcb->timers.retransmission != 0 &&
+                now_ticks >= pcb->timers.retransmission) {
+                if (pcb->timers.retransmit_count >= TCP_MAX_DATA_RETRIES) {
+                    /* Max retries reached: close PCB */
+                    pcb->state = TCP_CLOSED;
+                    tcp_timers_reset(pcb);
+                    if (pcb->socket == 0 && dead_count < 16) {
+                        dead_pcbs[dead_count++] = pcb;
+                    }
+                    mutex_unlock(&pcb->lock);
+                    continue;
+                }
+
+                pcb->timers.retransmit_count++;
+                pcb->timers.rto_ticks = (uint32_t)(pcb->timers.rto_ticks * 2U);
+                if (pcb->timers.rto_ticks > 1000U) {
+                    pcb->timers.rto_ticks = 1000U;
+                }
+                pcb->timers.retransmission = now_ticks + pcb->timers.rto_ticks;
+                pcb->retransmission_timer = pcb->timers.retransmission;
+
+                if (deferred_count < 4) {
+                    uint32_t local_ip = tcp_effective_local_ip(pcb);
+                    uint32_t remote_ip = pcb->remote_ip;
+                    uint8_t *pkt = tcp_deferred_tx[deferred_count].packet;
+                    struct tcp_header *hdr = (struct tcp_header *)pkt;
+
+                    hdr->src_port = htons(pcb->local_port);
+                    hdr->dest_port = htons(pcb->remote_port);
+
+                    if (pcb->tx_buf.unacked.head != 0) {
+                        /* Retransmit oldest unacknowledged data segment */
+                        struct tcp_segment *seg = pcb->tx_buf.unacked.head;
+                        size_t seg_len = seg->length;
+                        if (seg_len > TCP_DEFAULT_MSS) seg_len = TCP_DEFAULT_MSS;
+
+                        hdr->seq_num = htonl(seg->sequence);
+                        hdr->ack_num = htonl(pcb->rcv_nxt);
+                        hdr->data_offset_flags = htons((5U << 12) | TCP_FLAG_ACK | TCP_FLAG_PSH);
+                        size_t free_sp = tcp_rx_buffer_free_space_locked(pcb);
+                        if (free_sp > 0xFFFFU) free_sp = 0xFFFFU;
+                        hdr->window_size = htons((uint16_t)free_sp);
+                        hdr->checksum = 0;
+                        hdr->urgent_ptr = 0;
+                        if (seg_len != 0) {
+                            tcp_copy(pkt + sizeof(struct tcp_header), seg->data + seg->offset, seg_len);
+                        }
+                        size_t total_len = sizeof(struct tcp_header) + seg_len;
+                        uint16_t csum = tcp_checksum(local_ip, remote_ip, pkt, total_len);
+                        if (csum == 0U) csum = 0xFFFFU;
+                        hdr->checksum = htons(csum);
+
+                        tcp_deferred_tx[deferred_count].packet_len = total_len;
+                        tcp_deferred_tx[deferred_count].remote_ip = remote_ip;
+                        seg->sent_at = now_ticks;
+                        deferred_count++;
+                        klog("[TCP TX] segmento retransmitido em teardown\n");
+                    } else {
+                        /* Retransmit FIN segment */
+                        hdr->seq_num = htonl(pcb->snd_nxt - 1U);
+                        hdr->ack_num = htonl(pcb->rcv_nxt);
+                        hdr->data_offset_flags = htons((5U << 12) | TCP_FLAG_FIN | TCP_FLAG_ACK);
+                        size_t free_sp = tcp_rx_buffer_free_space_locked(pcb);
+                        if (free_sp > 0xFFFFU) free_sp = 0xFFFFU;
+                        hdr->window_size = htons((uint16_t)free_sp);
+                        hdr->checksum = 0;
+                        hdr->urgent_ptr = 0;
+
+                        size_t total_len = sizeof(struct tcp_header);
+                        uint16_t csum = tcp_checksum(local_ip, remote_ip, pkt, total_len);
+                        if (csum == 0U) csum = 0xFFFFU;
+                        hdr->checksum = htons(csum);
+
+                        tcp_deferred_tx[deferred_count].packet_len = total_len;
+                        tcp_deferred_tx[deferred_count].remote_ip = remote_ip;
+                        deferred_count++;
+                        klog("[TCP TX] FIN retransmitido\n");
+                    }
+                }
+            }
+        } else if (pcb->state == TCP_TIME_WAIT) {
+            /* Check TIME_WAIT expiration */
+            if (pcb->timers.timeout != 0 && now_ticks >= pcb->timers.timeout) {
+                pcb->state = TCP_CLOSED;
+                tcp_timers_reset(pcb);
+                klog("[TCP TIMER] TIME_WAIT expirou -> transicao para CLOSED\n");
+                if (pcb->socket == 0 && dead_count < 16) {
+                    dead_pcbs[dead_count++] = pcb;
+                }
+            }
         }
         mutex_unlock(&pcb->lock);
     }
     mutex_unlock(&tcp_pcbs_lock);
+
+    /* Free expired PCBs outside list lock */
+    for (int i = 0; i < dead_count; i++) {
+        tcp_free(dead_pcbs[i]);
+    }
 
     /* Transmit deferred packets with NO locks held. */
     for (int i = 0; i < deferred_count; i++) {
@@ -792,6 +893,87 @@ void tcp_socket_destroy(struct tcp_pcb *pcb)
         tcp_socket_destroy(syn_orphans[i]);
     }
     kfree(pcb);
+}
+
+int tcp_close(struct tcp_pcb *pcb)
+{
+    if (pcb == 0) {
+        return -1;
+    }
+
+    uint8_t packet[TCP_HEADER_MIN_SIZE];
+    size_t packet_len = 0;
+    uint32_t remote_ip = 0;
+    int send_fin = 0;
+
+    mutex_lock_preemptible(&pcb->lock);
+    pcb->socket = 0;
+
+    if (pcb->state == TCP_LISTEN || pcb->state == TCP_SYN_SENT ||
+        pcb->state == TCP_SYN_RECEIVED || pcb->state == TCP_CLOSED) {
+        mutex_unlock(&pcb->lock);
+        tcp_socket_destroy(pcb);
+        return 0;
+    }
+
+    if (pcb->state == TCP_ESTABLISHED) {
+        if (pcb->tx_buf.unsent.head != 0) {
+            mutex_unlock(&pcb->lock);
+            tcp_drain_unsent(pcb);
+            mutex_lock_preemptible(&pcb->lock);
+        }
+
+        int res = tcp_build_output_locked(pcb,
+            (uint8_t)(TCP_FLAG_FIN | TCP_FLAG_ACK), 0, 0,
+            packet, &packet_len, &remote_ip);
+        if (res == 0) {
+            pcb->state = TCP_FIN_WAIT1;
+            pcb->timers.rto_ticks = (uint32_t)TCP_DATA_RTO_TICKS_DEFAULT;
+            pcb->timers.retransmission = kernel_ticks + pcb->timers.rto_ticks;
+            pcb->retransmission_timer = pcb->timers.retransmission;
+            pcb->timers.retransmit_count = 0;
+            pcb->flags |= TCP_PCB_FLAG_TIMER_RTO;
+            send_fin = 1;
+            klog("[TCP TX] FIN transmitido em active close -> FIN_WAIT1\n");
+        }
+        mutex_unlock(&pcb->lock);
+
+        if (send_fin) {
+            (void)net_send_ipv4(remote_ip, IP_PROTO_TCP, packet, packet_len);
+        }
+        return 0;
+    }
+
+    if (pcb->state == TCP_CLOSE_WAIT) {
+        if (pcb->tx_buf.unsent.head != 0) {
+            mutex_unlock(&pcb->lock);
+            tcp_drain_unsent(pcb);
+            mutex_lock_preemptible(&pcb->lock);
+        }
+
+        int res = tcp_build_output_locked(pcb,
+            (uint8_t)(TCP_FLAG_FIN | TCP_FLAG_ACK), 0, 0,
+            packet, &packet_len, &remote_ip);
+        if (res == 0) {
+            pcb->state = TCP_LAST_ACK;
+            pcb->timers.rto_ticks = (uint32_t)TCP_DATA_RTO_TICKS_DEFAULT;
+            pcb->timers.retransmission = kernel_ticks + pcb->timers.rto_ticks;
+            pcb->retransmission_timer = pcb->timers.retransmission;
+            pcb->timers.retransmit_count = 0;
+            pcb->flags |= TCP_PCB_FLAG_TIMER_RTO;
+            send_fin = 1;
+            klog("[TCP TX] FIN transmitido em passive close -> LAST_ACK\n");
+        }
+        mutex_unlock(&pcb->lock);
+
+        if (send_fin) {
+            (void)net_send_ipv4(remote_ip, IP_PROTO_TCP, packet, packet_len);
+        }
+        return 0;
+    }
+
+    mutex_unlock(&pcb->lock);
+    return 0;
 }
 
 int tcp_register(struct tcp_pcb *pcb)
@@ -1283,6 +1465,11 @@ int tcp_input(uint32_t src_ip, uint32_t dest_ip, const uint8_t *segment,
     mutex_lock(&pcb->lock);
     mutex_unlock(&tcp_pcbs_lock);
 
+    if (pcb->state == TCP_CLOSED) {
+        mutex_unlock(&pcb->lock);
+        return -1;
+    }
+
     /* Passive open: demux landed on a LISTEN PCB. */
     if (pcb->state == TCP_LISTEN) {
         int listen_ok = 0;
@@ -1485,10 +1672,140 @@ int tcp_input(uint32_t src_ip, uint32_t dest_ip, const uint8_t *segment,
                 klog("[TCP RX] FIN recebido -> CLOSE_WAIT, ACK transmitido\n");
             }
         }
+    } else if (pcb->state == TCP_FIN_WAIT1) {
+        int fin_acked = 0;
+        if ((flags & TCP_FLAG_ACK) != 0U) {
+            tcp_tx_ack_received_locked(pcb, acknowledgement);
+            if (TCP_SEQ_GE(acknowledgement, pcb->snd_nxt)) {
+                fin_acked = 1;
+                pcb->flags &= ~TCP_PCB_FLAG_TIMER_RTO;
+                pcb->timers.retransmission = 0;
+                pcb->retransmission_timer = 0;
+                pcb->timers.retransmit_count = 0;
+            }
+        }
+
+        if (payload_len != 0U && TCP_SEQ_EQ(sequence, pcb->rcv_nxt)) {
+            size_t space = tcp_rx_buffer_free_space_locked(pcb);
+            size_t to_write = (payload_len < space) ? payload_len : space;
+            if (to_write > 0) {
+                size_t written = tcp_rx_buffer_write_locked(pcb, payload, to_write);
+                pcb->rcv_nxt += (uint32_t)written;
+                pcb->ack_number = pcb->rcv_nxt;
+            }
+        }
+
+        if ((flags & TCP_FLAG_FIN) != 0U) {
+            if ((pcb->flags & TCP_PCB_FLAG_EOF) != 0 &&
+                TCP_SEQ_EQ(sequence + (uint32_t)payload_len + 1U, pcb->rcv_nxt)) {
+                send_out = 1;
+                (void)tcp_build_output_locked(pcb, TCP_FLAG_ACK, 0, 0, out_packet,
+                    &out_packet_len, &out_remote_ip);
+                klog("[TCP RX] FIN duplicado em FIN_WAIT1, ACK retransmitido\n");
+            } else if (TCP_SEQ_EQ(sequence + (uint32_t)payload_len, pcb->rcv_nxt)) {
+                pcb->rcv_nxt += 1U;
+                pcb->ack_number = pcb->rcv_nxt;
+                pcb->flags |= TCP_PCB_FLAG_EOF;
+
+                send_out = 1;
+                (void)tcp_build_output_locked(pcb, TCP_FLAG_ACK, 0, 0, out_packet,
+                    &out_packet_len, &out_remote_ip);
+                if (fin_acked) {
+                    klog("[TCP RX] FIN+ACK em FIN_WAIT1 -> transicao para TIME_WAIT, ACK transmitido\n");
+                } else {
+                    klog("[TCP RX] Simultaneous close: peer FIN recebido em FIN_WAIT1, ACK transmitido\n");
+                }
+            }
+        }
+
+        if (fin_acked) {
+            if ((pcb->flags & TCP_PCB_FLAG_EOF) != 0) {
+                pcb->state = TCP_TIME_WAIT;
+                pcb->timers.timeout = kernel_ticks + TCP_TIMEWAIT_TICKS;
+                klog("[TCP RX] ACK do nosso FIN recebido apos peer FIN -> TIME_WAIT\n");
+            } else {
+                pcb->state = TCP_FIN_WAIT2;
+                klog("[TCP RX] ACK do FIN recebido em FIN_WAIT1 -> transicao para FIN_WAIT2\n");
+            }
+        }
+    } else if (pcb->state == TCP_FIN_WAIT2) {
+        if (payload_len != 0U && TCP_SEQ_EQ(sequence, pcb->rcv_nxt)) {
+            size_t space = tcp_rx_buffer_free_space_locked(pcb);
+            size_t to_write = (payload_len < space) ? payload_len : space;
+            if (to_write > 0) {
+                size_t written = tcp_rx_buffer_write_locked(pcb, payload, to_write);
+                pcb->rcv_nxt += (uint32_t)written;
+                pcb->ack_number = pcb->rcv_nxt;
+            }
+            send_out = 1;
+            (void)tcp_build_output_locked(pcb, TCP_FLAG_ACK, 0, 0, out_packet,
+                &out_packet_len, &out_remote_ip);
+        }
+
+        if ((flags & TCP_FLAG_FIN) != 0U &&
+            TCP_SEQ_EQ(sequence + (uint32_t)payload_len, pcb->rcv_nxt)) {
+            pcb->rcv_nxt += 1U;
+            pcb->ack_number = pcb->rcv_nxt;
+            pcb->flags |= TCP_PCB_FLAG_EOF;
+            pcb->state = TCP_TIME_WAIT;
+            pcb->timers.timeout = kernel_ticks + TCP_TIMEWAIT_TICKS;
+
+            send_out = 1;
+            (void)tcp_build_output_locked(pcb, TCP_FLAG_ACK, 0, 0, out_packet,
+                &out_packet_len, &out_remote_ip);
+            klog("[TCP RX] FIN recebido em FIN_WAIT2 -> transicao para TIME_WAIT, ACK transmitido\n");
+        }
+    } else if (pcb->state == TCP_CLOSE_WAIT) {
+        if ((flags & TCP_FLAG_FIN) != 0U &&
+            TCP_SEQ_EQ(sequence + (uint32_t)payload_len + 1U, pcb->rcv_nxt)) {
+            send_out = 1;
+            (void)tcp_build_output_locked(pcb, TCP_FLAG_ACK, 0, 0, out_packet,
+                &out_packet_len, &out_remote_ip);
+            klog("[TCP RX] FIN duplicado em CLOSE_WAIT, ACK retransmitido\n");
+        }
+    } else if (pcb->state == TCP_LAST_ACK) {
+        if ((flags & TCP_FLAG_FIN) != 0U &&
+            TCP_SEQ_EQ(sequence + (uint32_t)payload_len + 1U, pcb->rcv_nxt)) {
+            send_out = 1;
+            (void)tcp_build_output_locked(pcb, TCP_FLAG_ACK, 0, 0, out_packet,
+                &out_packet_len, &out_remote_ip);
+            klog("[TCP RX] FIN duplicado em LAST_ACK, ACK retransmitido\n");
+        }
+
+        if ((flags & TCP_FLAG_ACK) != 0U &&
+            TCP_SEQ_GE(acknowledgement, pcb->snd_nxt)) {
+            pcb->state = TCP_CLOSED;
+            tcp_timers_reset(pcb);
+            klog("[TCP RX] ACK do FIN em LAST_ACK -> transicao para CLOSED\n");
+            int should_free = (pcb->socket == 0);
+            socket = pcb->socket;
+            mutex_unlock(&pcb->lock);
+
+            if (socket != 0) {
+                tcp_socket_notify(socket);
+            }
+            if (send_out) {
+                (void)net_send_ipv4(out_remote_ip, IP_PROTO_TCP, out_packet,
+                    out_packet_len);
+            }
+            if (should_free) {
+                tcp_free(pcb);
+            }
+            return 0;
+        }
+    } else if (pcb->state == TCP_TIME_WAIT) {
+        if ((flags & TCP_FLAG_FIN) != 0U) {
+            send_out = 1;
+            (void)tcp_build_output_locked(pcb, TCP_FLAG_ACK, 0, 0, out_packet,
+                &out_packet_len, &out_remote_ip);
+            pcb->timers.timeout = kernel_ticks + TCP_TIMEWAIT_TICKS;
+            klog("[TCP RX] FIN retransmitido em TIME_WAIT, ACK reenviado e timer reiniciado\n");
+        }
     }
 
     int has_unsent = 0;
-    if (pcb->state == TCP_ESTABLISHED && pcb->tx_buf.unsent.head != 0) {
+    if ((pcb->state == TCP_ESTABLISHED || pcb->state == TCP_CLOSE_WAIT) &&
+        pcb->tx_buf.unsent.head != 0) {
         has_unsent = 1;
     }
     socket = pcb->socket;
@@ -1740,7 +2057,7 @@ void tcp_drain_unsent(struct tcp_pcb *pcb)
     pcb->flags |= TCP_PCB_FLAG_DRAINING;
 
     for (;;) {
-        if (pcb->state != TCP_ESTABLISHED ||
+        if ((pcb->state != TCP_ESTABLISHED && pcb->state != TCP_CLOSE_WAIT) ||
             (pcb->flags & TCP_PCB_FLAG_RESET) != 0 ||
             pcb->tx_buf.unsent.head == 0) {
             pcb->flags &= ~TCP_PCB_FLAG_DRAINING;
@@ -2650,6 +2967,301 @@ void tcp_run_tests(void)
             klog("[TCP TEST] FAIL: tcp_persist_timer\n");
         }
         tcp_socket_destroy(pst_pcb);
+    }
+
+    /* Test 20: Active Close state machine (ESTABLISHED -> FIN_WAIT1 -> FIN_WAIT2 -> TIME_WAIT -> CLOSED) */
+    tcp_pcb_t *ac_pcb = tcp_alloc();
+    if (ac_pcb != 0) {
+        ac_pcb->local_ip = htonl(0x0A00020FU);
+        ac_pcb->remote_ip = htonl(0x0A000202U);
+        ac_pcb->local_port = 7780;
+        ac_pcb->remote_port = 55580;
+        ac_pcb->iss = 1000;
+        ac_pcb->snd_una = 1001;
+        ac_pcb->snd_nxt = 1001;
+        ac_pcb->seq_number = 1001;
+        ac_pcb->rcv_nxt = 2000;
+        ac_pcb->ack_number = 2000;
+        ac_pcb->state = TCP_ESTABLISHED;
+        tcp_register(ac_pcb);
+
+        /* 1. Local close: sends FIN, enters FIN_WAIT1 */
+        tcp_close(ac_pcb);
+        int fw1_ok = (ac_pcb->state == TCP_FIN_WAIT1 &&
+                      ac_pcb->snd_nxt == 1002 &&
+                      (ac_pcb->flags & TCP_PCB_FLAG_TIMER_RTO) != 0);
+
+        /* 2. Peer ACKs our FIN (ack=1002): enters FIN_WAIT2 */
+        struct tcp_header ack_h;
+        uint8_t pkt_buf[TCP_HEADER_MIN_SIZE];
+        ack_h.src_port = 55580;
+        ack_h.dest_port = 7780;
+        ack_h.seq_num = 2000;
+        ack_h.ack_num = 1002;
+        ack_h.data_offset_flags = (5U << 12) | TCP_FLAG_ACK;
+        ack_h.window_size = 65535;
+        ack_h.checksum = 0;
+        ack_h.urgent_ptr = 0;
+        tcp_serialize_header(&ack_h, pkt_buf, sizeof(pkt_buf));
+        uint16_t c1 = tcp_checksum(htonl(0x0A000202U), htonl(0x0A00020FU), pkt_buf, sizeof(pkt_buf));
+        ((struct tcp_header *)pkt_buf)->checksum = htons(c1);
+        tcp_input(htonl(0x0A000202U), htonl(0x0A00020FU), pkt_buf, sizeof(pkt_buf));
+        int fw2_ok = (ac_pcb->state == TCP_FIN_WAIT2 &&
+                      (ac_pcb->flags & TCP_PCB_FLAG_TIMER_RTO) == 0);
+
+        /* 3. Peer sends FIN (seq=2000): enters TIME_WAIT */
+        ack_h.data_offset_flags = (5U << 12) | TCP_FLAG_FIN | TCP_FLAG_ACK;
+        tcp_serialize_header(&ack_h, pkt_buf, sizeof(pkt_buf));
+        c1 = tcp_checksum(htonl(0x0A000202U), htonl(0x0A00020FU), pkt_buf, sizeof(pkt_buf));
+        ((struct tcp_header *)pkt_buf)->checksum = htons(c1);
+        tcp_input(htonl(0x0A000202U), htonl(0x0A00020FU), pkt_buf, sizeof(pkt_buf));
+        int tw_ok = (ac_pcb->state == TCP_TIME_WAIT &&
+                     ac_pcb->rcv_nxt == 2001 &&
+                     ac_pcb->timers.timeout != 0);
+
+        /* 4. TIME_WAIT expiration in timer tick -> CLOSED and freed */
+        uint64_t exp_tick = ac_pcb->timers.timeout;
+        tcp_timer_tick(exp_tick + 1);
+        tcp_pcb_t *lookup_res = tcp_lookup(htonl(0x0A00020FU), htonl(0x0A000202U), 7780, 55580);
+        int closed_ok = (lookup_res == 0);
+
+        if (fw1_ok && fw2_ok && tw_ok && closed_ok) {
+            klog("[TCP TEST] PASS: Active Close (ESTABLISHED -> FIN_WAIT1 -> FIN_WAIT2 -> TIME_WAIT -> CLOSED)\n");
+        } else {
+            klog("[TCP TEST] FAIL: Active Close state machine\n");
+            if (lookup_res != 0) tcp_socket_destroy(ac_pcb);
+        }
+    }
+
+    /* Test 21: Passive Close state machine (ESTABLISHED -> CLOSE_WAIT -> LAST_ACK -> CLOSED) */
+    tcp_pcb_t *pc_pcb = tcp_alloc();
+    if (pc_pcb != 0) {
+        pc_pcb->local_ip = htonl(0x0A00020FU);
+        pc_pcb->remote_ip = htonl(0x0A000202U);
+        pc_pcb->local_port = 7781;
+        pc_pcb->remote_port = 55581;
+        pc_pcb->iss = 3000;
+        pc_pcb->snd_una = 3001;
+        pc_pcb->snd_nxt = 3001;
+        pc_pcb->seq_number = 3001;
+        pc_pcb->rcv_nxt = 4000;
+        pc_pcb->ack_number = 4000;
+        pc_pcb->state = TCP_ESTABLISHED;
+        tcp_register(pc_pcb);
+
+        /* 1. Peer sends FIN (seq=4000): enters CLOSE_WAIT */
+        struct tcp_header fin_h;
+        uint8_t pbuf[TCP_HEADER_MIN_SIZE];
+        fin_h.src_port = 55581;
+        fin_h.dest_port = 7781;
+        fin_h.seq_num = 4000;
+        fin_h.ack_num = 3001;
+        fin_h.data_offset_flags = (5U << 12) | TCP_FLAG_FIN | TCP_FLAG_ACK;
+        fin_h.window_size = 65535;
+        fin_h.checksum = 0;
+        fin_h.urgent_ptr = 0;
+        tcp_serialize_header(&fin_h, pbuf, sizeof(pbuf));
+        uint16_t c2 = tcp_checksum(htonl(0x0A000202U), htonl(0x0A00020FU), pbuf, sizeof(pbuf));
+        ((struct tcp_header *)pbuf)->checksum = htons(c2);
+        tcp_input(htonl(0x0A000202U), htonl(0x0A00020FU), pbuf, sizeof(pbuf));
+        int cw_ok = (pc_pcb->state == TCP_CLOSE_WAIT &&
+                     pc_pcb->rcv_nxt == 4001 &&
+                     (pc_pcb->flags & TCP_PCB_FLAG_EOF) != 0);
+
+        /* 2. Application close: sends FIN, enters LAST_ACK */
+        tcp_close(pc_pcb);
+        int la_ok = (pc_pcb->state == TCP_LAST_ACK &&
+                     pc_pcb->snd_nxt == 3002 &&
+                     (pc_pcb->flags & TCP_PCB_FLAG_TIMER_RTO) != 0);
+
+        /* 3. Peer ACKs our FIN (ack=3002): enters CLOSED and freed */
+        fin_h.seq_num = 4001;
+        fin_h.ack_num = 3002;
+        fin_h.data_offset_flags = (5U << 12) | TCP_FLAG_ACK;
+        tcp_serialize_header(&fin_h, pbuf, sizeof(pbuf));
+        c2 = tcp_checksum(htonl(0x0A000202U), htonl(0x0A00020FU), pbuf, sizeof(pbuf));
+        ((struct tcp_header *)pbuf)->checksum = htons(c2);
+        tcp_input(htonl(0x0A000202U), htonl(0x0A00020FU), pbuf, sizeof(pbuf));
+
+        tcp_pcb_t *l2 = tcp_lookup(htonl(0x0A00020FU), htonl(0x0A000202U), 7781, 55581);
+        int closed2_ok = (l2 == 0);
+
+        if (cw_ok && la_ok && closed2_ok) {
+            klog("[TCP TEST] PASS: Passive Close (ESTABLISHED -> CLOSE_WAIT -> LAST_ACK -> CLOSED)\n");
+        } else {
+            klog("[TCP TEST] FAIL: Passive Close state machine\n");
+            if (l2 != 0) tcp_socket_destroy(pc_pcb);
+        }
+    }
+
+    /* Test 22: Simultaneous Close (FIN_WAIT1 -> peer FIN+ACK -> TIME_WAIT) */
+    tcp_pcb_t *sc_pcb = tcp_alloc();
+    if (sc_pcb != 0) {
+        sc_pcb->local_ip = htonl(0x0A00020FU);
+        sc_pcb->remote_ip = htonl(0x0A000202U);
+        sc_pcb->local_port = 7782;
+        sc_pcb->remote_port = 55582;
+        sc_pcb->iss = 5000;
+        sc_pcb->snd_una = 5001;
+        sc_pcb->snd_nxt = 5002; /* Our FIN was seq 5001 */
+        sc_pcb->seq_number = 5002;
+        sc_pcb->rcv_nxt = 6000;
+        sc_pcb->ack_number = 6000;
+        sc_pcb->state = TCP_FIN_WAIT1;
+        tcp_register(sc_pcb);
+
+        /* Peer sends combined FIN+ACK (ack=5002, seq=6000): should move to TIME_WAIT */
+        struct tcp_header sh;
+        uint8_t sbuf[TCP_HEADER_MIN_SIZE];
+        sh.src_port = 55582;
+        sh.dest_port = 7782;
+        sh.seq_num = 6000;
+        sh.ack_num = 5002;
+        sh.data_offset_flags = (5U << 12) | TCP_FLAG_FIN | TCP_FLAG_ACK;
+        sh.window_size = 65535;
+        sh.checksum = 0;
+        sh.urgent_ptr = 0;
+        tcp_serialize_header(&sh, sbuf, sizeof(sbuf));
+        uint16_t cs = tcp_checksum(htonl(0x0A000202U), htonl(0x0A00020FU), sbuf, sizeof(sbuf));
+        ((struct tcp_header *)sbuf)->checksum = htons(cs);
+        tcp_input(htonl(0x0A000202U), htonl(0x0A00020FU), sbuf, sizeof(sbuf));
+
+        int sim_ok = (sc_pcb->state == TCP_TIME_WAIT &&
+                      sc_pcb->rcv_nxt == 6001 &&
+                      (sc_pcb->flags & TCP_PCB_FLAG_TIMER_RTO) == 0 &&
+                      sc_pcb->timers.timeout != 0);
+
+        if (sim_ok) {
+            klog("[TCP TEST] PASS: Simultaneous Close (FIN_WAIT1 -> peer FIN+ACK -> TIME_WAIT)\n");
+        } else {
+            klog("[TCP TEST] FAIL: Simultaneous Close\n");
+        }
+        tcp_socket_destroy(sc_pcb);
+    }
+
+    /* Test 23: DATA + FIN in single segment */
+    tcp_pcb_t *df_pcb = tcp_alloc();
+    if (df_pcb != 0) {
+        df_pcb->local_ip = htonl(0x0A00020FU);
+        df_pcb->remote_ip = htonl(0x0A000202U);
+        df_pcb->local_port = 7783;
+        df_pcb->remote_port = 55583;
+        df_pcb->iss = 7000;
+        df_pcb->snd_una = 7001;
+        df_pcb->snd_nxt = 7001;
+        df_pcb->seq_number = 7001;
+        df_pcb->rcv_nxt = 8000;
+        df_pcb->ack_number = 8000;
+        df_pcb->state = TCP_ESTABLISHED;
+        tcp_register(df_pcb);
+
+        /* Segment: seq=8000, 5 bytes payload ("HELLO"), FIN+ACK */
+        uint8_t df_pkt[TCP_HEADER_MIN_SIZE + 5];
+        struct tcp_header df_h;
+        df_h.src_port = 55583;
+        df_h.dest_port = 7783;
+        df_h.seq_num = 8000;
+        df_h.ack_num = 7001;
+        df_h.data_offset_flags = (5U << 12) | TCP_FLAG_FIN | TCP_FLAG_ACK;
+        df_h.window_size = 65535;
+        df_h.checksum = 0;
+        df_h.urgent_ptr = 0;
+        tcp_serialize_header(&df_h, df_pkt, sizeof(df_pkt));
+        tcp_copy(df_pkt + TCP_HEADER_MIN_SIZE, "HELLO", 5);
+        uint16_t cdf = tcp_checksum(htonl(0x0A000202U), htonl(0x0A00020FU), df_pkt, sizeof(df_pkt));
+        ((struct tcp_header *)df_pkt)->checksum = htons(cdf);
+        tcp_input(htonl(0x0A000202U), htonl(0x0A00020FU), df_pkt, sizeof(df_pkt));
+
+        uint8_t read_buf[10];
+        int nread = tcp_receive_read(df_pcb, read_buf, sizeof(read_buf));
+        int data_ok = (nread == 5 && read_buf[0] == 'H' && read_buf[4] == 'O');
+        int seq_ok = (df_pcb->rcv_nxt == 8006); /* 8000 + 5 data + 1 FIN */
+        int state_ok = (df_pcb->state == TCP_CLOSE_WAIT && (df_pcb->flags & TCP_PCB_FLAG_EOF) != 0);
+
+        if (data_ok && seq_ok && state_ok) {
+            klog("[TCP TEST] PASS: DATA+FIN (payload entregue primeiro, rcv_nxt avancado por data+1, EOF)\n");
+        } else {
+            klog("[TCP TEST] FAIL: DATA+FIN\n");
+        }
+        tcp_socket_destroy(df_pcb);
+    }
+
+    /* Test 24: Duplicate FIN handling (no duplicate sequence increment) */
+    tcp_pcb_t *dup_pcb = tcp_alloc();
+    if (dup_pcb != 0) {
+        dup_pcb->local_ip = htonl(0x0A00020FU);
+        dup_pcb->remote_ip = htonl(0x0A000202U);
+        dup_pcb->local_port = 7784;
+        dup_pcb->remote_port = 55584;
+        dup_pcb->iss = 9000;
+        dup_pcb->snd_una = 9001;
+        dup_pcb->snd_nxt = 9001;
+        dup_pcb->seq_number = 9001;
+        dup_pcb->rcv_nxt = 10001; /* Already processed FIN at 10000 */
+        dup_pcb->ack_number = 10001;
+        dup_pcb->state = TCP_CLOSE_WAIT;
+        tcp_register(dup_pcb);
+
+        /* Duplicate FIN with original seq=10000 */
+        struct tcp_header dup_h;
+        uint8_t dup_buf[TCP_HEADER_MIN_SIZE];
+        dup_h.src_port = 55584;
+        dup_h.dest_port = 7784;
+        dup_h.seq_num = 10000;
+        dup_h.ack_num = 9001;
+        dup_h.data_offset_flags = (5U << 12) | TCP_FLAG_FIN | TCP_FLAG_ACK;
+        dup_h.window_size = 65535;
+        dup_h.checksum = 0;
+        dup_h.urgent_ptr = 0;
+        tcp_serialize_header(&dup_h, dup_buf, sizeof(dup_buf));
+        uint16_t cdup = tcp_checksum(htonl(0x0A000202U), htonl(0x0A00020FU), dup_buf, sizeof(dup_buf));
+        ((struct tcp_header *)dup_buf)->checksum = htons(cdup);
+        tcp_input(htonl(0x0A000202U), htonl(0x0A00020FU), dup_buf, sizeof(dup_buf));
+
+        int dup_ok = (dup_pcb->rcv_nxt == 10001 && dup_pcb->state == TCP_CLOSE_WAIT);
+        if (dup_ok) {
+            klog("[TCP TEST] PASS: Duplicate FIN (sem consumo duplo de sequence, estado preservado)\n");
+        } else {
+            klog("[TCP TEST] FAIL: Duplicate FIN\n");
+        }
+        tcp_socket_destroy(dup_pcb);
+    }
+
+    /* Test 25: FIN Retransmission on RTO with exponential backoff */
+    tcp_pcb_t *fr_pcb = tcp_alloc();
+    if (fr_pcb != 0) {
+        fr_pcb->local_ip = htonl(0x0A00020FU);
+        fr_pcb->remote_ip = htonl(0x0A000202U);
+        fr_pcb->local_port = 7785;
+        fr_pcb->remote_port = 55585;
+        fr_pcb->iss = 11000;
+        fr_pcb->snd_una = 11001;
+        fr_pcb->snd_nxt = 11002; /* Sent FIN seq=11001 */
+        fr_pcb->seq_number = 11002;
+        fr_pcb->rcv_nxt = 12000;
+        fr_pcb->ack_number = 12000;
+        fr_pcb->state = TCP_FIN_WAIT1;
+        fr_pcb->timers.rto_ticks = (uint32_t)TCP_DATA_RTO_TICKS_DEFAULT;
+        fr_pcb->timers.retransmission = 500ULL;
+        fr_pcb->retransmission_timer = 500ULL;
+        fr_pcb->timers.retransmit_count = 0;
+        fr_pcb->flags |= TCP_PCB_FLAG_TIMER_RTO;
+        tcp_register(fr_pcb);
+
+        /* Tick past retransmission deadline */
+        tcp_timer_tick(501ULL);
+
+        int rto_fin_ok = (fr_pcb->timers.retransmit_count == 1 &&
+                          fr_pcb->timers.rto_ticks == TCP_DATA_RTO_TICKS_DEFAULT * 2 &&
+                          fr_pcb->state == TCP_FIN_WAIT1 &&
+                          fr_pcb->snd_nxt == 11002);
+
+        if (rto_fin_ok) {
+            klog("[TCP TEST] PASS: FIN Retransmission (RTO aciona retransmissao com backoff exponencial)\n");
+        } else {
+            klog("[TCP TEST] FAIL: FIN Retransmission\n");
+        }
+        tcp_socket_destroy(fr_pcb);
     }
 
     klog("[TCP TEST] Finalizada Suite de Testes TCP.\n");

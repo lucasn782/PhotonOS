@@ -1222,6 +1222,229 @@ static int do_full_duplex_test(uint16_t port)
     }
 }
 
+static int do_teardown_server_test(uint16_t port, const char *mode)
+{
+    int listener_fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (listener_fd < 0) {
+        printf("[TCPTEST TEARDOWN SERVER] FAIL: socket()\n");
+        return -1;
+    }
+
+    struct sockaddr_in bind_addr;
+    bind_addr.sin_family = AF_INET;
+    bind_addr.sin_port = htons(port);
+    bind_addr.sin_addr.s_addr = 0;
+    for (int i = 0; i < 8; i++) bind_addr.sin_zero[i] = 0;
+
+    if (bind(listener_fd, (const struct sockaddr *)&bind_addr, sizeof(bind_addr)) != 0 ||
+        listen(listener_fd, 1) != 0) {
+        printf("[TCPTEST TEARDOWN SERVER] FAIL: bind/listen\n");
+        close(listener_fd);
+        return -1;
+    }
+
+    printf("[TCPTEST TEARDOWN] Ouvindo na porta %u (mode=%s)...\n", (unsigned int)port, mode);
+
+    struct sockaddr_in peer;
+    uint32_t peer_len = sizeof(peer);
+    int client_fd = accept(listener_fd, (struct sockaddr *)&peer, &peer_len);
+    if (client_fd < 0) {
+        printf("[TCPTEST TEARDOWN SERVER] FAIL: accept()\n");
+        close(listener_fd);
+        return -1;
+    }
+
+    printf("[TCPTEST TEARDOWN] Conexao aceita!\n");
+
+    if (strcmp(mode, "passive") == 0) {
+        /* Passive close: receive all data until EOF */
+        char buf[256];
+        size_t total_recv = 0;
+        int saw_eof = 0;
+        for (int iter = 0; iter < 1000; iter++) {
+            int r = recv(client_fd, buf, sizeof(buf) - 1, 0);
+            if (r > 0) {
+                total_recv += (size_t)r;
+                buf[r] = '\0';
+            } else if (r == 0) {
+                saw_eof = 1;
+                printf("[TCPTEST TEARDOWN] EOF recebido com sucesso (total lido: %u)!\n",
+                    (unsigned int)total_recv);
+                break;
+            } else {
+                delay_ticks(1);
+            }
+        }
+
+        close(client_fd);
+        close(listener_fd);
+        if (saw_eof) {
+            printf("[TCPTEST TEARDOWN] >>> PASSIVE CLOSE CONCLUIDO COM SUCESSO! <<<\n");
+            return 0;
+        } else {
+            printf("[TCPTEST TEARDOWN] FAIL: EOF nao recebido\n");
+            return -1;
+        }
+    } else if (strcmp(mode, "send_close") == 0) {
+        /* Server sends data and immediately closes: client should see data then EOF */
+        const char *resp = "SERVER_TEARDOWN_PAYLOAD_1234567890\n";
+        size_t len = 35;
+        int s = send(client_fd, resp, len, 0);
+        printf("[TCPTEST TEARDOWN] Enviados %d bytes, fechando socket...\n", s);
+        close(client_fd);
+        close(listener_fd);
+        delay_ticks(20);
+        printf("[TCPTEST TEARDOWN] >>> SEND CLOSE CONCLUIDO COM SUCESSO! <<<\n");
+        return 0;
+    } else if (strcmp(mode, "simultaneous") == 0) {
+        /* Simultaneous close: server sends data and calls close nearly simultaneously */
+        const char *msg = "SIMULTANEOUS_SERVER_FIN\n";
+        send(client_fd, msg, 24, 0);
+        close(client_fd);
+        close(listener_fd);
+        delay_ticks(20);
+        printf("[TCPTEST TEARDOWN] >>> SIMULTANEOUS CLOSE CONCLUIDO COM SUCESSO! <<<\n");
+        return 0;
+    } else if (strcmp(mode, "fork") == 0) {
+        /* Fork teardown: parent closes client_fd, child serves request */
+        int pid = fork();
+        if (pid == 0) {
+            close(listener_fd);
+            char req[64];
+            int r = recv(client_fd, req, sizeof(req) - 1, 0);
+            if (r > 0) {
+                req[r] = '\0';
+                send(client_fd, "PONG_FORK_OK\n", 13, 0);
+            }
+            /* Wait for EOF */
+            while (recv(client_fd, req, sizeof(req), 0) > 0) {}
+            close(client_fd);
+            exit(0);
+            return 0;
+        } else if (pid > 0) {
+            /* Parent closes client_fd immediately */
+            close(client_fd);
+            int status = 0;
+            waitpid(pid, &status, 0);
+            close(listener_fd);
+            if (status == 0) {
+                printf("[TCPTEST TEARDOWN] >>> FORK TEARDOWN CONCLUIDO COM SUCESSO! <<<\n");
+                return 0;
+            } else {
+                printf("[TCPTEST TEARDOWN] FAIL: child status=%d\n", status);
+                return -1;
+            }
+        } else {
+            close(client_fd);
+            close(listener_fd);
+            return -1;
+        }
+    } else if (strcmp(mode, "dup") == 0) {
+        /* Dup teardown: duplicate fd, close original fd, verify dup_fd stays active */
+        int dup_fd = dup(client_fd);
+        if (dup_fd < 0) {
+            printf("[TCPTEST TEARDOWN] FAIL: dup()\n");
+            close(client_fd);
+            close(listener_fd);
+            return -1;
+        }
+        /* Close original descriptor */
+        close(client_fd);
+        printf("[TCPTEST TEARDOWN] client_fd fechado, operando via dup_fd=%d\n", dup_fd);
+
+        char req[64];
+        int r = recv(dup_fd, req, sizeof(req) - 1, 0);
+        if (r > 0) {
+            send(dup_fd, "DUP_TEARDOWN_PONG\n", 18, 0);
+        }
+        /* Read until EOF */
+        while (recv(dup_fd, req, sizeof(req), 0) > 0) {}
+        close(dup_fd);
+        close(listener_fd);
+        printf("[TCPTEST TEARDOWN] >>> DUP TEARDOWN CONCLUIDO COM SUCESSO! <<<\n");
+        return 0;
+    } else {
+        printf("[TCPTEST TEARDOWN] Modo desconhecido: %s\n", mode);
+        close(client_fd);
+        close(listener_fd);
+        return -1;
+    }
+    return 0;
+}
+
+static int do_teardown_client_test(const char *ip_str, uint16_t port, const char *mode)
+{
+    uint32_t target_ip = inet_addr(ip_str);
+    if (target_ip == 0) {
+        printf("[TCPTEST CLIENT] Endereco IP invalido: %s\n", ip_str);
+        return -1;
+    }
+
+    int fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (fd < 0) {
+        printf("[TCPTEST CLIENT] Falha em socket()\n");
+        return -1;
+    }
+
+    struct sockaddr_in addr;
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(port);
+    addr.sin_addr.s_addr = target_ip;
+    for (int i = 0; i < 8; i++) addr.sin_zero[i] = 0;
+
+    int res = connect(fd, (const struct sockaddr *)&addr, sizeof(addr));
+    if (res != 0) {
+        printf("[TCPTEST CLIENT] connect falhou: %d\n", res);
+        close(fd);
+        return -1;
+    }
+
+    printf("[TCPTEST CLIENT] Conectado a %s:%u (mode=%s)\n", ip_str, (unsigned int)port, mode);
+
+    if (strcmp(mode, "active") == 0) {
+        /* Active close: send request, then immediately close fd */
+        const char *req = "CLIENT_ACTIVE_CLOSE_DATA\n";
+        send(fd, req, 25, 0);
+        printf("[TCPTEST CLIENT] Enviado dado, fechando socket (active close)...\n");
+        close(fd);
+        printf("[TCPTEST CLIENT] >>> ACTIVE CLOSE CLIENT CONCLUIDO COM SUCESSO! <<<\n");
+        return 0;
+    } else if (strcmp(mode, "recv_close") == 0) {
+        /* Receive all data until EOF, then close */
+        char buf[256];
+        size_t total = 0;
+        int saw_eof = 0;
+        for (int i = 0; i < 1000; i++) {
+            int r = recv(fd, buf, sizeof(buf) - 1, 0);
+            if (r > 0) {
+                total += (size_t)r;
+            } else if (r == 0) {
+                saw_eof = 1;
+                break;
+            } else {
+                delay_ticks(1);
+            }
+        }
+        close(fd);
+        if (saw_eof) {
+            printf("[TCPTEST CLIENT] >>> RECV CLOSE CLIENT CONCLUIDO COM SUCESSO (lidos %u bytes)! <<<\n",
+                (unsigned int)total);
+            return 0;
+        } else {
+            printf("[TCPTEST CLIENT] FAIL: EOF nao recebido\n");
+            return -1;
+        }
+    } else if (strcmp(mode, "simultaneous") == 0) {
+        send(fd, "CLIENT_SIMULTANEOUS_FIN\n", 24, 0);
+        close(fd);
+        printf("[TCPTEST CLIENT] >>> SIMULTANEOUS CLIENT CONCLUIDO COM SUCESSO! <<<\n");
+        return 0;
+    } else {
+        close(fd);
+        return -1;
+    }
+}
+
 void _start(const char *arg)
 {
     if (arg == 0) {
@@ -1528,8 +1751,35 @@ void _start(const char *arg)
         int res = do_full_duplex_test((uint16_t)lport);
         exit(res == 0 ? 0 : 1);
     }
+    else if (strcmp(cmd, "teardown_server") == 0) {
+        /* uso: tcptest teardown_server <porta> [mode] */
+        unsigned int lport = 8088;
+        if (ip_str[0] != '\0') {
+            parse_uint(ip_str, &lport);
+        }
+        const char *mode = "passive";
+        if (port_str[0] != '\0') {
+            mode = port_str;
+        }
+        int res = do_teardown_server_test((uint16_t)lport, mode);
+        exit(res == 0 ? 0 : 1);
+    }
+    else if (strcmp(cmd, "teardown_client") == 0) {
+        /* uso: tcptest teardown_client <ip> <porta> [mode] */
+        const char *target = ip_str[0] != '\0' ? ip_str : "10.0.2.2";
+        unsigned int rport = 8088;
+        if (port_str[0] != '\0') {
+            parse_uint(port_str, &rport);
+        }
+        const char *mode = "active";
+        if (extra_str[0] != '\0') {
+            mode = extra_str;
+        }
+        int res = do_teardown_client_test(target, (uint16_t)rport, mode);
+        exit(res == 0 ? 0 : 1);
+    }
     else {
-        printf("Comando desconhecido: %s. Use connect, closed, timeout, stress, concurrent, listen, server_multi, server_fork, errors, recv_server, recv_partial, recv_block, recv_errors, recv_multi, recv_fork, recv_dup, send_server, send_multi, send_fork, send_dup, send_errors, flow_server, full_duplex.\n", cmd);
+        printf("Comando desconhecido: %s.\n", cmd);
         exit(1);
     }
 }

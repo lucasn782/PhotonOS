@@ -236,13 +236,22 @@ Para detalhes completos, consulte [TCP Phase 2B.2B](networking/tcp_phase2b2_tx.m
 5. Hardening de concorrência com `mutex_lock_preemptible()`, desacoplamento de `sock->mutex` de chamadas de longa duração e garantia de ausência de locks durante transmissões de rede.
 Para detalhes completos, consulte [TCP Phase 2C](networking/tcp_phase2c_flow_control.md).
 
-### 8.6. Métricas de Build & Otimização do Kernel
+### 8.6. Fase 2D (Graceful Teardown & FIN Handshake) — Concluída
+1. Máquina de estados de encerramento completa conforme RFC 793 (`FIN_WAIT_1`, `FIN_WAIT_2`, `TIME_WAIT`, `CLOSE_WAIT`, `LAST_ACK`, `CLOSED`).
+2. Contabilidade estrita de sequence number para controle de FIN (`SND.NXT++`, `RCV.NXT++`), com avanço de `SND.UNA` ao confirmar FIN do hospedeiro.
+3. Retransmissão de FIN por temporizador RTO (`tcp_timer_tick()`) com recuo exponencial e limite de tentativas (`TCP_MAX_DATA_RETRIES = 5`).
+4. Temporizador de `TIME_WAIT` determinístico (`TCP_TIMEWAIT_TICKS = 200ULL`, 2,0s), mantendo o PCB ativo para re-ACK de FINs duplicados e desalocação diferida segura fora de locks.
+5. Semântica estrita de EOF em `sys_recv()`: entrega de dados residuais do buffer RX e retorno de `0` somente após esvaziamento do buffer com flag EOF ativa.
+6. Desacoplamento entre ciclo de vida do Socket VFS e do PCB, respeitando contadores de referência em descritores duplicados (`fork()`, `dup()`).
+7. Fechamento simultâneo RFC 793 (`FIN_WAIT_1 -> TIME_WAIT`) e suporte a segmentos combinados (`DATA+FIN`, `ACK+FIN`).
+Para detalhes completos, consulte [TCP Phase 2D](networking/tcp_phase2d_teardown.md).
+
+### 8.7. Métricas de Build & Otimização do Kernel
 - **Otimização de Compilação:** Flag `-Os` ativada em CFLAGS no `Makefile`.
-- **Tamanho do Kernel Binário:** `build/photon.bin` = 141.868 bytes.
+- **Tamanho do Kernel Binário:** `build/photon.bin` = 150.060 bytes.
 - **Limite Máximo do Kernel (`KERNEL_MAX_BYTES`):** 245.760 bytes (480 setores LBA × 512 bytes).
-- **Margem de Segurança:** 103.892 bytes livres antes do teto de carregamento do bootloader.
+- **Margem de Segurança:** 95.700 bytes livres antes do teto de carregamento do bootloader.
 - **Gate de Build Ativo:** `test $(stat -c%s build/photon.bin) -le 245760` no Makefile.
 
-### 8.7. Próximas Etapas (Fase 2D):
-1. **Fase 2D (Encerramento Gracioso & FIN Handshake):** Máquina de estados de fechamento ativo e passivo (`FIN_WAIT_1`, `FIN_WAIT_2`, `TIME_WAIT`, `LAST_ACK`, `shutdown()`).
-2. **Fases Posteriores:** Algoritmos de controle de congestionamento (Slow Start, AIMD, Fast Retransmit), SACK, Window Scaling e Servidor HTTP Ring 3.
+### 8.8. Próximas Etapas:
+1. **Fases Posteriores:** Algoritmos de controle de congestionamento (Slow Start, AIMD, Fast Retransmit), SACK, Window Scaling e Servidor HTTP Ring 3.
