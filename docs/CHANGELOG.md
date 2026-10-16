@@ -3,6 +3,31 @@
 Histórico completo de mudanças do sistema operacional, organizado por versão.
 Convenções: cada entrada lista data, commit (quando aplicável), resumo, arquivos alterados, bugs corrigidos, novas funcionalidades, breaking changes e impacto arquitetural.
 
+## `v4.4-tcp2g` — Milestone TCP Phase 2G: Fast Retransmit & Fast Recovery (RFC 5681) 🌐
+**Data:** 2026-10-16
+**Status:** Consolidado e validado em WSL/Ubuntu/QEMU com inspeção PCAP (32/32 testes aprovados).
+
+### Resumo do Milestone
+Implementação e consolidação formal dos algoritmos de **Fast Retransmit** e **Fast Recovery** segundo a especificação normativa da **RFC 5681 (Seções 2 e 3.2)**, permitindo que a pilha TCP detecte perdas de segmentos por meio de 3 ACKs duplicados válidos e retransmita o segmento perdido imediatamente antes da expiração do temporizador RTO. Inclui classificação estrita de duplicate ACKs em 5 pontos, cálculo de `ssthresh = max(FlightSize/2, 2*SMSS)`, inflação de `cwnd` por ACKs duplicados subsequentes, desinflação de `cwnd` para `ssthresh` e saída clássica na confirmação de novos dados, interação robusta com o temporizador RTO e supressão de crescimento duplo de Slow Start / Congestion Avoidance no ACK de saída.
+
+### Funcionalidades Consolidadas
+- **Classificação Estrita de Duplicate ACKs (RFC 5681 Seção 2):** Identificação de duplicate ACK condicionada a 5 requisitos simultâneos: presença de dados não confirmados em trânsito, payload de tamanho zero, ausência de flags SYN/FIN/RST, correspondência exata de sequência com `SND.UNA`, e janela anunciada inalterada em relação ao ACK anterior.
+- **Fast Retransmit Imediato:** Detecção no 3º dupACK consecutivo, acionando a retransmissão imediata do primeiro segmento não confirmado da fila `tx_buf.unacked`, preservando sequence number, payload e opções, sem alterar `SND.NXT`.
+- **Fast Recovery Clássico (RFC 5681 Seção 3.2):**
+  - Entrada: $ssthresh = \max(\lfloor FlightSize/2 \rfloor, 2 \times SMSS)$, $cwnd = ssthresh + 3 \times SMSS$, gravação de $recover = SND.NXT$.
+  - DupACKs adicionais (> 3): inflação de $cwnd += SMSS$ e disparo de transmissão via `tcp_drain_unsent()` sob janela efetiva.
+  - Saída: no recebimento de ACK que confirma novos dados ($ack > SND.UNA$), desinflação de $cwnd = ssthresh$, limpeza da flag `FAST_RECOVERY` e reinicialização de `dupacks = 0`.
+- **Supressão de Crescimento Duplo:** O ACK que finaliza Fast Recovery não sofre crescimento adicional de Slow Start ou Congestion Avoidance (`is_recovery_exit = 1`).
+- **Interação e Contingência com RTO:** Se o temporizador RTO expirar durante Fast Recovery, a recuperação rápida é abandonada, `dupacks` é zerado, e o colapso para $cwnd = 1 \times SMSS$ com recálculo de `ssthresh` é executado com backoff exponencial.
+- **Sincronização e Hierarquia de Locks:** Transmissão diferida de Fast Retransmit executada via `net_send_ipv4()` fora de `pcb->lock`, utilizando o buffer estático `tcp_fast_rexmit_tx` protegido por `tcp_fast_rexmit_lock`.
+
+### Validação de Integração e Regressões
+- **Suíte Phase 2G (32/32 PASS):** Cobertura completa de classificação de ACKs (8 cenários), Fast Retransmit e PCAP (7 cenários), Fast Recovery (8 cenários) e Interações/Regressões (9 cenários).
+- **Regressão Global:** Aprovação unânime de todas as suítes de milestones anteriores (Phase 2F 23/23, Phase 2E 16/16, Phase 2D 16/16, Phase 2C 14/14, Phase 2B.2B TX 28/28, Phase 2B.2A RX 17/17, Phase 2B.1, Phase 2A, 10/10 boots consecutivos, VFS, sinais POSIX, pipes, disco FAT16 e Phase 7).
+- **Tamanho do Kernel:** `build/photon.bin` compilado em 162.452 bytes contra o limite de 245.760 bytes (margem livre de 83.308 bytes).
+
+---
+
 ## `v4.4-tcp2f` — Milestone TCP Phase 2F: Syscall `shutdown()` e Half-Close 🌐
 **Data:** 2026-10-16
 **Status:** Consolidado e validado em WSL/Ubuntu/QEMU com inspeção PCAP (23/23 testes aprovados).

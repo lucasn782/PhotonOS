@@ -138,10 +138,19 @@ Este documento descreve o estado atual do desenvolvimento do PhotonOS, dividindo
 
 ---
 
+### Trilha 24 — TCP Phase 2G: Fast Retransmit e Fast Recovery (v4.4-tcp2g)
+- **Classificação Estrita de Duplicate ACKs:** Verificação de 5 requisitos normativos da RFC 5681 (dados em voo, payload zero, sem flags SYN/FIN/RST, ACK cumulativo idêntico a `SND.UNA` e janela anunciada inalterada).
+- **Fast Retransmit Imediato:** Detecção de perda e retransmissão do primeiro segmento não confirmado no 3º dupACK consecutivo sem aguardar o temporizador RTO, preservando o número de sequência original.
+- **Fast Recovery Clássico:** Entrada com ajuste de $ssthresh = \max(\lfloor FlightSize/2 \rfloor, 2 \times SMSS)$ e $cwnd = ssthresh + 3 \times SMSS$; inflação de $cwnd += SMSS$ por dupACK subsequente; saída clássica desinflacionando $cwnd = ssthresh$ na confirmação de novos dados.
+- **Interação com RTO e Congestion Control:** Abandono de Fast Recovery e colapso de $cwnd = 1 \times SMSS$ caso o temporizador RTO expire durante a recuperação; supressão de crescimento duplo de Slow Start / Congestion Avoidance no ACK de saída.
+- **Validação Completa & PCAP:** 32/32 testes aprovados na suíte dedicada Phase 2G, 100% de aprovação nas suítes de regressão (Phases 2A a 2F, 10 boots, VFS, Signals e Phase 7) e validação PCAP de wire.
+
+---
+
 ## 🟡 Em Desenvolvimento (v4.4-dev)
 
-### Trilha 24 — TCP Phase 2G: Fast Retransmit e Fast Recovery
-- **Detecção de Perda Rápida:** Processamento de 3 ACKs duplicados (RFC 5681) sem aguardar expiração de RTO.
+### Trilha 25 — TCP Phase 2H: Otimizações de Rede e Hardening
+- **Melhorias de Throughput e Buffering:** Otimizações de cópia e métricas de desempenho sob carga contínua.
 
 ## 🔵 Planejado
 

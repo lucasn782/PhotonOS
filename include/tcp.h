@@ -39,6 +39,7 @@
 #define TCP_PCB_FLAG_SHUT_RD      (1U << 11)
 #define TCP_PCB_FLAG_SHUT_WR      (1U << 12)
 #define TCP_PCB_FLAG_FIN_PENDING  (1U << 13)
+#define TCP_PCB_FLAG_FAST_RECOVERY (1U << 14)
 
 #define TCP_RX_BUFFER_CAPACITY    8192U
 #define TCP_TX_BUFFER_CAPACITY    8192U
@@ -199,10 +200,12 @@ typedef struct tcp_pcb {
     uint32_t flags;
     struct tcp_timers timers;
 
-    /* RFC 5681 Congestion Control State (Phase 2E) */
+    /* RFC 5681 Congestion Control State (Phase 2E / 2G) */
     uint32_t cwnd;              /* Congestion window in bytes */
     uint32_t ssthresh;          /* Slow start threshold in bytes */
     uint32_t ca_bytes_acked;    /* Congestion avoidance byte accumulator */
+    uint32_t dupacks;           /* Consecutive duplicate ACK counter */
+    uint32_t recover;           /* Fast recovery point sequence number */
 
 
     /* Passive open / accept infrastructure. */

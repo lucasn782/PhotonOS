@@ -137,10 +137,12 @@ typedef struct tcp_pcb {
     struct tcp_pcb *parent;
     struct tcp_pcb *accept_next;
     struct tcp_pcb *accept_head;
-    /* Controle de Congestionamento (RFC 5681 - TCP Phase 2E) */
+    /* Controle de Congestionamento (RFC 5681 - TCP Phase 2E / 2G) */
     uint32_t cwnd;           /* Janela de congestionamento */
     uint32_t ssthresh;       /* Limiar de Slow Start / Congestion Avoidance */
     uint32_t ca_bytes_acked; /* Acumulador de bytes em Congestion Avoidance */
+    uint32_t dupacks;        /* Contador de duplicate ACKs (RFC 5681 Phase 2G) */
+    uint32_t recover;        /* Ponto de recuperacao de sequencia em Fast Recovery */
 
     mutex_t lock;
 } tcp_pcb_t;

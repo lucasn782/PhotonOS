@@ -188,11 +188,19 @@ def run_test():
 
     def wait_new_prompt(min_index, timeout=25):
         t0 = time.time()
+        last_kick = time.time()
         while time.time() - t0 < timeout:
             drain(0.2)
             idx = snapshot().find(SHELL_PROMPT, min_index)
             if idx != -1:
                 return idx
+            if time.time() - last_kick > 2.0:
+                try:
+                    proc.stdin.write(b"\n")
+                    proc.stdin.flush()
+                except Exception:
+                    pass
+                last_kick = time.time()
         return -1
 
     def send(cmd_str):

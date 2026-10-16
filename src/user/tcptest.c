@@ -1513,6 +1513,20 @@ static int do_cc_server_test(uint16_t port, const char *mode)
         int s = send(client_fd, buf, 4000, 0);
         printf("[TCPTEST CC PEER WINDOW] send retornou: %d\n", s);
         if (s != 4000) ret = -1;
+    } else if (strcmp(mode, "fast_retransmit") == 0) {
+        /* Envia 6000 bytes em fluxo para disparar dupACKs pelo peer */
+        static uint8_t buf[6000];
+        for (int i = 0; i < 6000; i++) buf[i] = (uint8_t)('A' + (i % 26));
+        int s = send(client_fd, buf, 6000, 0);
+        printf("[TCPTEST CC FAST REXMIT] send retornou: %d\n", s);
+        if (s != 6000) ret = -1;
+    } else if (strcmp(mode, "fast_recovery") == 0) {
+        /* Envia 12000 bytes em blocos para inflacao e recuperacao */
+        static uint8_t buf[12000];
+        for (int i = 0; i < 12000; i++) buf[i] = (uint8_t)('B' + (i % 26));
+        int s = send(client_fd, buf, 12000, 0);
+        printf("[TCPTEST CC FAST RECOVERY] send retornou: %d\n", s);
+        if (s != 12000) ret = -1;
     }
 
     delay_ticks(30);
@@ -2169,6 +2183,19 @@ void _start(const char *arg)
             mode = port_str;
         }
         int res = do_shutdown_server_test((uint16_t)lport, mode);
+        exit(res == 0 ? 0 : 1);
+    }
+    else if (strcmp(cmd, "fast_rexmit_server") == 0) {
+        /* uso: tcptest fast_rexmit_server <porta> [mode] */
+        unsigned int lport = 8088;
+        if (ip_str[0] != '\0') {
+            parse_uint(ip_str, &lport);
+        }
+        const char *mode = "fast_retransmit";
+        if (port_str[0] != '\0') {
+            mode = port_str;
+        }
+        int res = do_cc_server_test((uint16_t)lport, mode);
         exit(res == 0 ? 0 : 1);
     }
     else {

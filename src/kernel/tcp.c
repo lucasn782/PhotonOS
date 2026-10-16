@@ -21,10 +21,15 @@ struct deferred_tx_pkt {
 static struct deferred_tx_pkt tcp_deferred_tx[4] __attribute__((section(".network_state")));
 /* Serializes use of the fixed deferred packet storage after list locks drop. */
 static mutex_t tcp_deferred_tx_lock __attribute__((section(".network_state")));
+static struct deferred_tx_pkt tcp_fast_rexmit_tx __attribute__((section(".network_state")));
+static mutex_t tcp_fast_rexmit_lock __attribute__((section(".network_state")));
 
 /* Socket layer wakes sleepers only after TCP unlocks. */
 extern void tcp_socket_notify(void *socket);
 extern volatile uint64_t kernel_ticks;
+
+/* Forward declarations for functions used before definition */
+static void tcp_tx_ack_received_locked_ext(struct tcp_pcb *pcb, uint32_t ack, int is_recovery_exit);
 
 static void tcp_copy(void *destination, const void *source, size_t length)
 {
@@ -331,6 +336,55 @@ static int tcp_build_output_locked(struct tcp_pcb *pcb, uint8_t flags,
     return 0;
 }
 
+static int tcp_retransmit_segment_locked(struct tcp_pcb *pcb,
+    struct tcp_segment *seg, uint8_t *packet, size_t *packet_len,
+    uint32_t *remote_ip)
+{
+    if (pcb == 0 || seg == 0 || seg->data == 0 || packet == 0 ||
+        packet_len == 0 || remote_ip == 0) {
+        return -1;
+    }
+
+    size_t seg_len = seg->length;
+    if (seg_len > TCP_DEFAULT_MSS) {
+        seg_len = TCP_DEFAULT_MSS;
+    }
+
+    uint32_t local_ip = tcp_effective_local_ip(pcb);
+    struct tcp_header *hdr = (struct tcp_header *)packet;
+
+    hdr->src_port = htons(pcb->local_port);
+    hdr->dest_port = htons(pcb->remote_port);
+    hdr->seq_num = htonl(seg->sequence);
+    hdr->ack_num = htonl(pcb->rcv_nxt);
+    hdr->data_offset_flags = htons((5U << 12) | TCP_FLAG_ACK | TCP_FLAG_PSH);
+    size_t free_sp = tcp_rx_buffer_free_space_locked(pcb);
+    if (free_sp > 0xFFFFU) {
+        free_sp = 0xFFFFU;
+    }
+    hdr->window_size = htons((uint16_t)free_sp);
+    hdr->checksum = 0;
+    hdr->urgent_ptr = 0;
+
+    if (seg_len != 0) {
+        tcp_copy(packet + sizeof(struct tcp_header), seg->data + seg->offset, seg_len);
+    }
+    size_t total_len = sizeof(struct tcp_header) + seg_len;
+    uint16_t csum = tcp_checksum(local_ip, pcb->remote_ip, packet, total_len);
+    if (csum == 0U) {
+        csum = 0xFFFFU;
+    }
+    hdr->checksum = htons(csum);
+
+    *packet_len = total_len;
+    *remote_ip = pcb->remote_ip;
+    seg->sent_at = kernel_ticks;
+    seg->retransmit_count++;
+
+    klog("[TCP TX] Fast Retransmit: segmento retransmitido\n");
+    return 0;
+}
+
 tcp_pcb_t *tcp_alloc(void)
 {
     tcp_pcb_t *pcb = kmalloc(sizeof(*pcb));
@@ -358,6 +412,8 @@ tcp_pcb_t *tcp_alloc(void)
     pcb->cwnd = TCP_INITIAL_CWND(TCP_DEFAULT_MSS);
     pcb->ssthresh = TCP_INITIAL_SSTHRESH;
     pcb->ca_bytes_acked = 0;
+    pcb->dupacks = 0;
+    pcb->recover = 0;
     pcb->snd_wl1 = 0;
     pcb->snd_wl2 = 0;
     pcb->state = TCP_CLOSED;
@@ -596,6 +652,13 @@ void tcp_timer_tick(uint64_t now_ticks)
                         continue;
                     }
 
+                    /* If connection was in Fast Recovery, exit it immediately on RTO timeout */
+                    if ((pcb->flags & TCP_PCB_FLAG_FAST_RECOVERY) != 0) {
+                        pcb->flags &= ~TCP_PCB_FLAG_FAST_RECOVERY;
+                        pcb->dupacks = 0;
+                        klog("[TCP CC] Fast Recovery abortada por RTO timeout\n");
+                    }
+
                     /* RFC 5681 Section 3.1: Congestion response to RTO timeout */
                     if (pcb->timers.retransmit_count == 0) {
                         uint32_t flight_size = pcb->snd_nxt - pcb->snd_una;
@@ -618,38 +681,14 @@ void tcp_timer_tick(uint64_t now_ticks)
                     /* Retransmit oldest unacknowledged segment with original SEQ */
                     struct tcp_segment *seg = pcb->tx_buf.unacked.head;
                     if (seg != 0 && seg->data != 0 && deferred_count < 4) {
-                        size_t seg_len = seg->length;
-                        if (seg_len > TCP_DEFAULT_MSS) {
-                            seg_len = TCP_DEFAULT_MSS;
+                        tcp_deferred_tx[deferred_count].packet_len = 0;
+                        tcp_deferred_tx[deferred_count].remote_ip = 0;
+                        if (tcp_retransmit_segment_locked(pcb, seg,
+                                tcp_deferred_tx[deferred_count].packet,
+                                &tcp_deferred_tx[deferred_count].packet_len,
+                                &tcp_deferred_tx[deferred_count].remote_ip) == 0) {
+                            deferred_count++;
                         }
-                        uint32_t local_ip = tcp_effective_local_ip(pcb);
-                        uint32_t remote_ip = pcb->remote_ip;
-                        uint8_t *pkt = tcp_deferred_tx[deferred_count].packet;
-                        struct tcp_header *hdr = (struct tcp_header *)pkt;
-
-                        hdr->src_port = htons(pcb->local_port);
-                        hdr->dest_port = htons(pcb->remote_port);
-                        hdr->seq_num = htonl(seg->sequence);
-                        hdr->ack_num = htonl(pcb->rcv_nxt);
-                        hdr->data_offset_flags = htons((5U << 12) | TCP_FLAG_ACK | TCP_FLAG_PSH);
-                        hdr->window_size = htons((uint16_t)(pcb->window & 0xFFFFU));
-                        hdr->checksum = 0;
-                        hdr->urgent_ptr = 0;
-                        if (seg_len != 0) {
-                            tcp_copy(pkt + sizeof(struct tcp_header), seg->data + seg->offset, seg_len);
-                        }
-                        size_t total_len = sizeof(struct tcp_header) + seg_len;
-                        uint16_t csum = tcp_checksum(local_ip, remote_ip, pkt, total_len);
-                        if (csum == 0U) {
-                            csum = 0xFFFFU;
-                        }
-                        hdr->checksum = htons(csum);
-
-                        tcp_deferred_tx[deferred_count].packet_len = total_len;
-                        tcp_deferred_tx[deferred_count].remote_ip = remote_ip;
-                        seg->sent_at = now_ticks;
-                        seg->retransmit_count++;
-                        deferred_count++;
                     }
                 } else {
                     /* No unacknowledged data in queue, disarm RTO timer */
@@ -833,6 +872,7 @@ void tcp_init(void)
     tcp_next_ephemeral = TCP_EPHEMERAL_PORT_FIRST;
     mutex_init(&tcp_pcbs_lock);
     mutex_init(&tcp_deferred_tx_lock);
+    mutex_init(&tcp_fast_rexmit_lock);
     klog("TCP: Subsistema PCB inicializado (fase 1).\n");
 }
 
@@ -1551,6 +1591,7 @@ int tcp_input(uint32_t src_ip, uint32_t dest_ip, const uint8_t *segment,
     uint32_t out_remote_ip = 0;
     int send_out = 0;
     int need_drain_after_ack = 0;
+    int fast_rexmit_send = 0;
     void *socket = 0;
     void *listener_socket = 0;
 
@@ -1729,7 +1770,100 @@ int tcp_input(uint32_t src_ip, uint32_t dest_ip, const uint8_t *segment,
 
         /* If ACK flag is present, process data acknowledgements */
         if ((flags & TCP_FLAG_ACK) != 0U) {
-            tcp_tx_ack_received_locked(pcb, acknowledgement);
+            /* Check if this is a valid duplicate ACK per RFC 5681 Section 2:
+             * (a) Connection has outstanding data in flight;
+             * (b) Incoming acknowledgment carries no data (payload_len == 0);
+             * (c) SYN, FIN, and RST are not set;
+             * (d) Acknowledgment number matches largest sequence previously acknowledged (SND.UNA);
+             * (e) Advertised window matches previously observed advertised window.
+             */
+            int is_dup_ack = 0;
+            if (pcb->tx_buf.unacked.head != 0 &&
+                TCP_SEQ_LT(pcb->snd_una, pcb->snd_nxt) &&
+                payload_len == 0U &&
+                (flags & (TCP_FLAG_SYN | TCP_FLAG_FIN | TCP_FLAG_RST)) == 0U &&
+                TCP_SEQ_EQ(acknowledgement, pcb->snd_una) &&
+                hdr.window_size == peer_wnd_before) {
+                is_dup_ack = 1;
+            }
+
+            if (TCP_SEQ_GT(acknowledgement, pcb->snd_una)) {
+                /* Valid ACK acknowledging new data */
+                if ((pcb->flags & TCP_PCB_FLAG_FAST_RECOVERY) != 0) {
+                    /* RFC 5681 Section 3.2 step 5: Deflate cwnd to ssthresh and exit Fast Recovery */
+                    pcb->cwnd = pcb->ssthresh;
+                    pcb->flags &= ~TCP_PCB_FLAG_FAST_RECOVERY;
+                    pcb->dupacks = 0;
+                    pcb->ca_bytes_acked = 0;
+                    klog("[TCP CC] Fast Recovery finalizada com ACK cumulativo, cwnd deflacionada para ssthresh\n");
+                    tcp_tx_ack_received_locked_ext(pcb, acknowledgement, 1);
+                } else {
+                    pcb->dupacks = 0;
+                    tcp_tx_ack_received_locked_ext(pcb, acknowledgement, 0);
+                }
+                need_drain_after_ack = 1;
+            } else if (is_dup_ack) {
+                /* Valid duplicate ACK */
+                if ((pcb->flags & TCP_PCB_FLAG_FAST_RECOVERY) == 0) {
+                    pcb->dupacks++;
+                    klog("[TCP CC] Duplicate ACK recebido\n");
+                    if (pcb->dupacks == 3U) {
+                        /* RFC 5681 Section 3.2 step 1: 3rd dupACK -> Enter Fast Recovery */
+                        uint32_t flight_size = pcb->snd_nxt - pcb->snd_una;
+                        uint32_t smss = TCP_DEFAULT_MSS;
+                        uint32_t new_ssthresh = flight_size / 2U;
+                        if (new_ssthresh < 2U * smss) {
+                            new_ssthresh = 2U * smss;
+                        }
+                        pcb->ssthresh = new_ssthresh;
+                        pcb->cwnd = pcb->ssthresh + 3U * smss;
+                        if (pcb->cwnd > 0xFFFFU) {
+                            pcb->cwnd = 0xFFFFU;
+                        }
+                        pcb->flags |= TCP_PCB_FLAG_FAST_RECOVERY;
+                        pcb->recover = pcb->snd_nxt;
+                        pcb->ca_bytes_acked = 0;
+
+                        klog("[TCP CC] 3 dupACKs! Fast Retransmit ativado\n");
+
+                        /* RFC 5681 Section 3.2 step 2: Retransmit first unacknowledged segment */
+                        struct tcp_segment *seg = pcb->tx_buf.unacked.head;
+                        if (seg != 0 && seg->data != 0) {
+                            mutex_lock(&tcp_fast_rexmit_lock);
+                            tcp_fast_rexmit_tx.packet_len = 0;
+                            tcp_fast_rexmit_tx.remote_ip = 0;
+                            if (tcp_retransmit_segment_locked(pcb, seg,
+                                    tcp_fast_rexmit_tx.packet,
+                                    &tcp_fast_rexmit_tx.packet_len,
+                                    &tcp_fast_rexmit_tx.remote_ip) == 0) {
+                                fast_rexmit_send = 1;
+                            } else {
+                                mutex_unlock(&tcp_fast_rexmit_lock);
+                            }
+                        }
+
+                        /* Restart RTO timer for the retransmitted segment */
+                        pcb->timers.rto_ticks = (uint32_t)TCP_DATA_RTO_TICKS_DEFAULT;
+                        pcb->timers.retransmission = kernel_ticks + pcb->timers.rto_ticks;
+                        pcb->retransmission_timer = pcb->timers.retransmission;
+                        pcb->timers.retransmit_count = 0;
+                        pcb->flags |= TCP_PCB_FLAG_TIMER_RTO;
+
+                        need_drain_after_ack = 1;
+                    }
+                } else {
+                    /* RFC 5681 Section 3.2 step 4: Additional dupACK in Fast Recovery -> inflate cwnd */
+                    pcb->dupacks++;
+                    pcb->cwnd += TCP_DEFAULT_MSS;
+                    if (pcb->cwnd > 0xFFFFU) {
+                        pcb->cwnd = 0xFFFFU;
+                    }
+                    klog("[TCP CC] DupACK adicional em Fast Recovery: cwnd inflacionada\n");
+                    need_drain_after_ack = 1;
+                }
+            } else {
+                /* Non-duplicate, old, or invalid ACK: do not modify cwnd or dupacks */
+            }
 
             /* A pure window update is still a valid ACK even when the byte
              * acknowledgement does not advance snd_wl1/snd_wl2.  We must honor
@@ -2001,6 +2135,11 @@ int tcp_input(uint32_t src_ip, uint32_t dest_ip, const uint8_t *segment,
         (void)net_send_ipv4(out_remote_ip, IP_PROTO_TCP, out_packet,
             out_packet_len);
     }
+    if (fast_rexmit_send) {
+        (void)net_send_ipv4(tcp_fast_rexmit_tx.remote_ip, IP_PROTO_TCP,
+            tcp_fast_rexmit_tx.packet, tcp_fast_rexmit_tx.packet_len);
+        mutex_unlock(&tcp_fast_rexmit_lock);
+    }
     if (has_unsent || need_drain_after_ack) {
         tcp_drain_unsent(pcb);
     }
@@ -2152,7 +2291,7 @@ size_t tcp_tx_buffer_available_locked(struct tcp_pcb *pcb)
     return pcb->tx_buf.capacity - used;
 }
 
-void tcp_tx_ack_received_locked(struct tcp_pcb *pcb, uint32_t ack)
+static void tcp_tx_ack_received_locked_ext(struct tcp_pcb *pcb, uint32_t ack, int is_recovery_exit)
 {
     if (pcb == 0) {
         return;
@@ -2178,25 +2317,27 @@ void tcp_tx_ack_received_locked(struct tcp_pcb *pcb, uint32_t ack)
     uint32_t bytes_acked = ack - pcb->snd_una;
     pcb->snd_una = ack;
 
-    /* RFC 5681 Congestion Control: update cwnd on valid new ACK */
-    if (pcb->cwnd < pcb->ssthresh) {
-        /* Slow Start: cwnd grows by at most 1 SMSS per ACK */
-        uint32_t incr = bytes_acked;
-        if (incr > TCP_DEFAULT_MSS) {
-            incr = TCP_DEFAULT_MSS;
-        }
-        pcb->cwnd += incr;
-        if (pcb->cwnd > 0xFFFFU) {
-            pcb->cwnd = 0xFFFFU;
-        }
-    } else {
-        /* Congestion Avoidance: cwnd grows by roughly 1 SMSS per RTT */
-        pcb->ca_bytes_acked += bytes_acked;
-        if (pcb->ca_bytes_acked >= pcb->cwnd) {
-            pcb->ca_bytes_acked = 0;
-            pcb->cwnd += TCP_DEFAULT_MSS;
+    /* RFC 5681 Congestion Control: update cwnd on valid new ACK unless exiting Fast Recovery */
+    if (!is_recovery_exit) {
+        if (pcb->cwnd < pcb->ssthresh) {
+            /* Slow Start: cwnd grows by at most 1 SMSS per ACK */
+            uint32_t incr = bytes_acked;
+            if (incr > TCP_DEFAULT_MSS) {
+                incr = TCP_DEFAULT_MSS;
+            }
+            pcb->cwnd += incr;
             if (pcb->cwnd > 0xFFFFU) {
                 pcb->cwnd = 0xFFFFU;
+            }
+        } else {
+            /* Congestion Avoidance: cwnd grows by roughly 1 SMSS per RTT */
+            pcb->ca_bytes_acked += bytes_acked;
+            if (pcb->ca_bytes_acked >= pcb->cwnd) {
+                pcb->ca_bytes_acked = 0;
+                pcb->cwnd += TCP_DEFAULT_MSS;
+                if (pcb->cwnd > 0xFFFFU) {
+                    pcb->cwnd = 0xFFFFU;
+                }
             }
         }
     }
@@ -2252,6 +2393,11 @@ void tcp_tx_ack_received_locked(struct tcp_pcb *pcb, uint32_t ack)
         pcb->retransmission_timer = pcb->timers.retransmission;
         pcb->flags |= TCP_PCB_FLAG_TIMER_RTO;
     }
+}
+
+void tcp_tx_ack_received_locked(struct tcp_pcb *pcb, uint32_t ack)
+{
+    tcp_tx_ack_received_locked_ext(pcb, ack, 0);
 }
 
 void tcp_drain_unsent(struct tcp_pcb *pcb)
@@ -3993,6 +4139,321 @@ void tcp_run_tests(void)
             }
         }
         tcp_socket_destroy(shared_pcb);
+    }
+
+    /* Phase 2G Unit Tests: Fast Retransmit and Fast Recovery (RFC 5681) */
+    {
+        /* Test 43: Fast Retransmit / Fast Recovery Init */
+        tcp_pcb_t *fr_init_pcb = tcp_alloc();
+        if (fr_init_pcb != 0) {
+            int fr_init_ok = (fr_init_pcb->dupacks == 0 &&
+                              fr_init_pcb->recover == 0 &&
+                              (fr_init_pcb->flags & TCP_PCB_FLAG_FAST_RECOVERY) == 0);
+            if (fr_init_ok) {
+                klog("[TCP TEST] PASS: Fast Retransmit Init (dupacks=0, recover=0, flag limpa)\n");
+            } else {
+                klog("[TCP TEST] FAIL: Fast Retransmit Init\n");
+            }
+            tcp_socket_destroy(fr_init_pcb);
+        }
+
+        /* Test 44: Duplicate ACK 5-point Classification (RFC 5681 Section 2) */
+        tcp_pcb_t *fr_pcb = tcp_alloc();
+        if (fr_pcb != 0) {
+            fr_pcb->local_ip = htonl(0x0A00020FU);
+            fr_pcb->remote_ip = htonl(0x0A000202U);
+            fr_pcb->local_port = 7790;
+            fr_pcb->remote_port = 55590;
+            fr_pcb->iss = 1000;
+            fr_pcb->snd_una = 1000;
+            fr_pcb->snd_nxt = 5000;
+            fr_pcb->rcv_nxt = 8000;
+            fr_pcb->snd_wnd = 16384;
+            fr_pcb->snd_wl1 = 8000;
+            fr_pcb->snd_wl2 = 1000;
+            fr_pcb->state = TCP_ESTABLISHED;
+            fr_pcb->dupacks = 0;
+
+            /* Add unacked segment */
+            struct tcp_segment *u_seg = (struct tcp_segment *)kmalloc(sizeof(*u_seg));
+            if (u_seg != 0) {
+                u_seg->data = (uint8_t *)kmalloc(100);
+                u_seg->length = 100;
+                u_seg->offset = 0;
+                u_seg->sequence = 1000;
+                u_seg->next = 0;
+                tcp_queue_append_locked(&fr_pcb->tx_buf.unacked, u_seg);
+            }
+            tcp_register(fr_pcb);
+
+            /* Helper to inject ACK packet */
+            uint8_t ack_pkt[TCP_HEADER_MIN_SIZE + 10];
+            struct tcp_header ack_h;
+
+            /* 1) Valid duplicate ACK: ack=1000, wnd=16384, len=0, ACK only */
+            ack_h.src_port = 55590;
+            ack_h.dest_port = 7790;
+            ack_h.seq_num = 8000;
+            ack_h.ack_num = 1000;
+            ack_h.data_offset_flags = (5U << 12) | TCP_FLAG_ACK;
+            ack_h.window_size = 16384;
+            ack_h.checksum = 0;
+            ack_h.urgent_ptr = 0;
+            tcp_serialize_header(&ack_h, ack_pkt, TCP_HEADER_MIN_SIZE);
+            uint16_t c1 = tcp_checksum(htonl(0x0A000202U), htonl(0x0A00020FU), ack_pkt, TCP_HEADER_MIN_SIZE);
+            ((struct tcp_header *)ack_pkt)->checksum = htons(c1);
+            tcp_input(htonl(0x0A000202U), htonl(0x0A00020FU), ack_pkt, TCP_HEADER_MIN_SIZE);
+            int dup1_ok = (fr_pcb->dupacks == 1);
+
+            /* 2) ACK with payload (len=5) -> not duplicate ACK per RFC 5681 */
+            ack_h.data_offset_flags = (5U << 12) | TCP_FLAG_ACK;
+            tcp_serialize_header(&ack_h, ack_pkt, TCP_HEADER_MIN_SIZE + 5);
+            tcp_copy(ack_pkt + TCP_HEADER_MIN_SIZE, "12345", 5);
+            uint16_t c2 = tcp_checksum(htonl(0x0A000202U), htonl(0x0A00020FU), ack_pkt, TCP_HEADER_MIN_SIZE + 5);
+            ((struct tcp_header *)ack_pkt)->checksum = htons(c2);
+            tcp_input(htonl(0x0A000202U), htonl(0x0A00020FU), ack_pkt, TCP_HEADER_MIN_SIZE + 5);
+            int payload_reject_ok = (fr_pcb->dupacks == 1);
+
+            /* 3) ACK with changed window (wnd=8192) -> window update, not duplicate ACK */
+            ack_h.window_size = 8192;
+            tcp_serialize_header(&ack_h, ack_pkt, TCP_HEADER_MIN_SIZE);
+            uint16_t c3 = tcp_checksum(htonl(0x0A000202U), htonl(0x0A00020FU), ack_pkt, TCP_HEADER_MIN_SIZE);
+            ((struct tcp_header *)ack_pkt)->checksum = htons(c3);
+            tcp_input(htonl(0x0A000202U), htonl(0x0A00020FU), ack_pkt, TCP_HEADER_MIN_SIZE);
+            int wnd_reject_ok = (fr_pcb->dupacks == 1 && fr_pcb->snd_wnd == 8192);
+
+            /* 4) ACK with SYN flag -> not duplicate ACK */
+            ack_h.window_size = 8192;
+            ack_h.data_offset_flags = (5U << 12) | TCP_FLAG_ACK | TCP_FLAG_SYN;
+            tcp_serialize_header(&ack_h, ack_pkt, TCP_HEADER_MIN_SIZE);
+            uint16_t c4 = tcp_checksum(htonl(0x0A000202U), htonl(0x0A00020FU), ack_pkt, TCP_HEADER_MIN_SIZE);
+            ((struct tcp_header *)ack_pkt)->checksum = htons(c4);
+            tcp_input(htonl(0x0A000202U), htonl(0x0A00020FU), ack_pkt, TCP_HEADER_MIN_SIZE);
+            int syn_reject_ok = (fr_pcb->dupacks == 1);
+
+            /* 5) Dup ACK with no data in flight -> not dup ACK */
+            fr_pcb->snd_nxt = 1000; /* snd_una == snd_nxt */
+            ack_h.data_offset_flags = (5U << 12) | TCP_FLAG_ACK;
+            tcp_serialize_header(&ack_h, ack_pkt, TCP_HEADER_MIN_SIZE);
+            uint16_t c5 = tcp_checksum(htonl(0x0A000202U), htonl(0x0A00020FU), ack_pkt, TCP_HEADER_MIN_SIZE);
+            ((struct tcp_header *)ack_pkt)->checksum = htons(c5);
+            tcp_input(htonl(0x0A000202U), htonl(0x0A00020FU), ack_pkt, TCP_HEADER_MIN_SIZE);
+            int no_flight_reject_ok = (fr_pcb->dupacks == 1);
+
+            if (dup1_ok && payload_reject_ok && wnd_reject_ok && syn_reject_ok && no_flight_reject_ok) {
+                klog("[TCP TEST] PASS: Duplicate ACK Classification (5 condicoes RFC 5681 validadas rigorosamente)\n");
+            } else {
+                klog("[TCP TEST] FAIL: Duplicate ACK Classification\n");
+            }
+
+            /* Test 45: Fast Retransmit Trigger on 3rd Duplicate ACK */
+            fr_pcb->snd_nxt = 5000; /* FlightSize = 4000 */
+            fr_pcb->dupacks = 1;    /* Reset dupacks to 1 */
+
+            /* Send 2nd dupACK (wnd=8192 to match current snd_wnd) */
+            ack_h.data_offset_flags = (5U << 12) | TCP_FLAG_ACK;
+            ack_h.window_size = 8192;
+            tcp_serialize_header(&ack_h, ack_pkt, TCP_HEADER_MIN_SIZE);
+            uint16_t c6 = tcp_checksum(htonl(0x0A000202U), htonl(0x0A00020FU), ack_pkt, TCP_HEADER_MIN_SIZE);
+            ((struct tcp_header *)ack_pkt)->checksum = htons(c6);
+            tcp_input(htonl(0x0A000202U), htonl(0x0A00020FU), ack_pkt, TCP_HEADER_MIN_SIZE);
+            int dup2_ok = (fr_pcb->dupacks == 2 && (fr_pcb->flags & TCP_PCB_FLAG_FAST_RECOVERY) == 0);
+
+            /* Send 3rd dupACK -> Triggers Fast Retransmit & enters Fast Recovery */
+            tcp_input(htonl(0x0A000202U), htonl(0x0A00020FU), ack_pkt, TCP_HEADER_MIN_SIZE);
+            int fr_trigger_ok = (fr_pcb->dupacks == 3 &&
+                                 (fr_pcb->flags & TCP_PCB_FLAG_FAST_RECOVERY) != 0 &&
+                                 fr_pcb->ssthresh == (2U * TCP_DEFAULT_MSS) &&
+                                 fr_pcb->cwnd == (2U * TCP_DEFAULT_MSS + 3U * TCP_DEFAULT_MSS) &&
+                                 fr_pcb->recover == 5000);
+
+            if (dup2_ok && fr_trigger_ok) {
+                klog("[TCP TEST] PASS: Fast Retransmit 3 DupACKs (ssthresh=max(flight/2,2*MSS), cwnd=ssthresh+3*MSS, recover=snd_nxt)\n");
+            } else {
+                klog("[TCP TEST] FAIL: Fast Retransmit 3 DupACKs\n");
+            }
+
+            /* Test 46: Fast Recovery cwnd Inflation (>3 dupACKs) */
+            /* Send 4th dupACK */
+            tcp_input(htonl(0x0A000202U), htonl(0x0A00020FU), ack_pkt, TCP_HEADER_MIN_SIZE);
+            int dup4_ok = (fr_pcb->dupacks == 4 && fr_pcb->cwnd == (fr_pcb->ssthresh + 4U * TCP_DEFAULT_MSS));
+
+            /* Send 5th dupACK */
+            tcp_input(htonl(0x0A000202U), htonl(0x0A00020FU), ack_pkt, TCP_HEADER_MIN_SIZE);
+            int dup5_ok = (fr_pcb->dupacks == 5 && fr_pcb->cwnd == (fr_pcb->ssthresh + 5U * TCP_DEFAULT_MSS));
+
+            if (dup4_ok && dup5_ok) {
+                klog("[TCP TEST] PASS: Fast Recovery cwnd Inflation (cwnd inflada em 1 MSS por dupACK adicional)\n");
+            } else {
+                klog("[TCP TEST] FAIL: Fast Recovery cwnd Inflation\n");
+            }
+
+            /* Test 47: Fast Recovery Exit on New Data ACK (RFC 5681 Classic) */
+            /* Send ACK for sequence 2000 > snd_una 1000 */
+            ack_h.ack_num = 2000;
+            tcp_serialize_header(&ack_h, ack_pkt, TCP_HEADER_MIN_SIZE);
+            uint16_t c7 = tcp_checksum(htonl(0x0A000202U), htonl(0x0A00020FU), ack_pkt, TCP_HEADER_MIN_SIZE);
+            ((struct tcp_header *)ack_pkt)->checksum = htons(c7);
+            tcp_input(htonl(0x0A000202U), htonl(0x0A00020FU), ack_pkt, TCP_HEADER_MIN_SIZE);
+
+            int exit_ok = ((fr_pcb->flags & TCP_PCB_FLAG_FAST_RECOVERY) == 0 &&
+                           fr_pcb->cwnd == fr_pcb->ssthresh &&
+                           fr_pcb->dupacks == 0 &&
+                           fr_pcb->snd_una == 2000);
+
+            if (exit_ok) {
+                klog("[TCP TEST] PASS: Fast Recovery Exit on New ACK (cwnd deflacionada para ssthresh, dupacks=0, flag limpa)\n");
+            } else {
+                klog("[TCP TEST] FAIL: Fast Recovery Exit on New ACK\n");
+            }
+
+            /* Test 48: RTO during Fast Recovery */
+            /* Re-enter Fast Recovery */
+            fr_pcb->snd_una = 2000;
+            fr_pcb->snd_nxt = 6000;
+            fr_pcb->flags |= TCP_PCB_FLAG_FAST_RECOVERY;
+            fr_pcb->dupacks = 3;
+            fr_pcb->timers.retransmit_count = 0;
+            fr_pcb->timers.retransmission = 200ULL;
+            fr_pcb->flags |= TCP_PCB_FLAG_TIMER_RTO;
+
+            struct tcp_segment *rto_seg = (struct tcp_segment *)kmalloc(sizeof(*rto_seg));
+            if (rto_seg != 0) {
+                rto_seg->data = (uint8_t *)kmalloc(100);
+                rto_seg->length = 100;
+                rto_seg->offset = 0;
+                rto_seg->sequence = 2000;
+                rto_seg->next = 0;
+                tcp_queue_append_locked(&fr_pcb->tx_buf.unacked, rto_seg);
+            }
+
+            tcp_timer_tick(201ULL);
+
+            int rto_rec_ok = ((fr_pcb->flags & TCP_PCB_FLAG_FAST_RECOVERY) == 0 &&
+                              fr_pcb->dupacks == 0 &&
+                              fr_pcb->cwnd == TCP_DEFAULT_MSS &&
+                              fr_pcb->ssthresh == (2U * TCP_DEFAULT_MSS));
+
+            if (rto_rec_ok) {
+                klog("[TCP TEST] PASS: RTO during Fast Recovery (abandona Fast Recovery, cwnd=1*MSS, dupacks=0)\n");
+            } else {
+                klog("[TCP TEST] FAIL: RTO during Fast Recovery\n");
+            }
+
+            /* Test 49: Classic Fast Recovery Partial ACK Behavior */
+            /* RFC 5681 Classic exits recovery on ANY new ACK (even if ack < recover) */
+            fr_pcb->snd_una = 2000;
+            fr_pcb->snd_nxt = 8000;
+            fr_pcb->recover = 8000;
+            fr_pcb->ssthresh = 3000;
+            fr_pcb->cwnd = 3000 + 3 * TCP_DEFAULT_MSS;
+            fr_pcb->flags |= TCP_PCB_FLAG_FAST_RECOVERY;
+            fr_pcb->dupacks = 3;
+
+            /* Partial ACK acknowledging seq 4000 (< recover 8000) */
+            ack_h.ack_num = 4000;
+            tcp_serialize_header(&ack_h, ack_pkt, TCP_HEADER_MIN_SIZE);
+            uint16_t c8 = tcp_checksum(htonl(0x0A000202U), htonl(0x0A00020FU), ack_pkt, TCP_HEADER_MIN_SIZE);
+            ((struct tcp_header *)ack_pkt)->checksum = htons(c8);
+            tcp_input(htonl(0x0A000202U), htonl(0x0A00020FU), ack_pkt, TCP_HEADER_MIN_SIZE);
+
+            int partial_ok = ((fr_pcb->flags & TCP_PCB_FLAG_FAST_RECOVERY) == 0 &&
+                              fr_pcb->cwnd == 3000 &&
+                              fr_pcb->dupacks == 0 &&
+                              fr_pcb->snd_una == 4000);
+
+            if (partial_ok) {
+                klog("[TCP TEST] PASS: Classic Fast Recovery Partial ACK (deflaciona cwnd para ssthresh e sai de recovery conforme RFC 5681 classico)\n");
+            } else {
+                klog("[TCP TEST] FAIL: Classic Fast Recovery Partial ACK\n");
+            }
+
+            /* Test 50: No Double cwnd Growth on Recovery Exit */
+            /* When exiting recovery, cwnd must equal ssthresh without SS/CA increase */
+            fr_pcb->snd_una = 4000;
+            fr_pcb->snd_nxt = 9000;
+            fr_pcb->ssthresh = 4000;
+            fr_pcb->cwnd = 4000 + 3 * TCP_DEFAULT_MSS;
+            fr_pcb->flags |= TCP_PCB_FLAG_FAST_RECOVERY;
+            fr_pcb->dupacks = 3;
+
+            ack_h.ack_num = 6000;
+            tcp_serialize_header(&ack_h, ack_pkt, TCP_HEADER_MIN_SIZE);
+            uint16_t c9 = tcp_checksum(htonl(0x0A000202U), htonl(0x0A00020FU), ack_pkt, TCP_HEADER_MIN_SIZE);
+            ((struct tcp_header *)ack_pkt)->checksum = htons(c9);
+            tcp_input(htonl(0x0A000202U), htonl(0x0A00020FU), ack_pkt, TCP_HEADER_MIN_SIZE);
+
+            int no_double_ok = (fr_pcb->cwnd == 4000U);
+
+            if (no_double_ok) {
+                klog("[TCP TEST] PASS: No Double cwnd Growth on Recovery Exit (sem crescimento de Slow Start ou Congestion Avoidance no ACK de saida)\n");
+            } else {
+                klog("[TCP TEST] FAIL: No Double cwnd Growth on Recovery Exit\n");
+            }
+
+            /* Test 51: Sequence Wraparound Handling */
+            fr_pcb->snd_una = 0xFFFFFF00U;
+            fr_pcb->snd_nxt = 0x00000100U; /* FlightSize = 512 across wraparound */
+            fr_pcb->dupacks = 0;
+            fr_pcb->flags &= ~TCP_PCB_FLAG_FAST_RECOVERY;
+
+            struct tcp_segment *wrap_seg = (struct tcp_segment *)kmalloc(sizeof(*wrap_seg));
+            if (wrap_seg != 0) {
+                wrap_seg->data = (uint8_t *)kmalloc(100);
+                wrap_seg->length = 100;
+                wrap_seg->offset = 0;
+                wrap_seg->sequence = 0xFFFFFF00U;
+                wrap_seg->next = 0;
+                tcp_queue_append_locked(&fr_pcb->tx_buf.unacked, wrap_seg);
+            }
+
+            ack_h.ack_num = 0xFFFFFF00U;
+            tcp_serialize_header(&ack_h, ack_pkt, TCP_HEADER_MIN_SIZE);
+            uint16_t cw1 = tcp_checksum(htonl(0x0A000202U), htonl(0x0A00020FU), ack_pkt, TCP_HEADER_MIN_SIZE);
+            ((struct tcp_header *)ack_pkt)->checksum = htons(cw1);
+
+            /* Send 3 dupACKs across boundary */
+            tcp_input(htonl(0x0A000202U), htonl(0x0A00020FU), ack_pkt, TCP_HEADER_MIN_SIZE);
+            tcp_input(htonl(0x0A000202U), htonl(0x0A00020FU), ack_pkt, TCP_HEADER_MIN_SIZE);
+            tcp_input(htonl(0x0A000202U), htonl(0x0A00020FU), ack_pkt, TCP_HEADER_MIN_SIZE);
+
+            int wrap_ok = (fr_pcb->dupacks == 3 &&
+                           (fr_pcb->flags & TCP_PCB_FLAG_FAST_RECOVERY) != 0 &&
+                           fr_pcb->recover == 0x00000100U);
+
+            if (wrap_ok) {
+                klog("[TCP TEST] PASS: Sequence Wraparound Fast Retransmit (aritmetica modular correta em limite de 32 bits)\n");
+            } else {
+                klog("[TCP TEST] FAIL: Sequence Wraparound Fast Retransmit\n");
+            }
+
+            tcp_socket_destroy(fr_pcb);
+        }
+
+        /* Test 52: Independent Congestion State Across Connections */
+        tcp_pcb_t *p1 = tcp_alloc();
+        tcp_pcb_t *p2 = tcp_alloc();
+        if (p1 != 0 && p2 != 0) {
+            p1->state = TCP_ESTABLISHED;
+            p2->state = TCP_ESTABLISHED;
+            p1->cwnd = 3 * TCP_DEFAULT_MSS;
+            p2->cwnd = 3 * TCP_DEFAULT_MSS;
+            p1->dupacks = 3;
+            p1->flags |= TCP_PCB_FLAG_FAST_RECOVERY;
+            p1->cwnd = 7300;
+
+            int indep_ok = (p2->dupacks == 0 &&
+                            (p2->flags & TCP_PCB_FLAG_FAST_RECOVERY) == 0 &&
+                            p2->cwnd == 3 * TCP_DEFAULT_MSS);
+
+            if (indep_ok) {
+                klog("[TCP TEST] PASS: Independent Congestion State (isolamento estrito entre conexoes simultaneas)\n");
+            } else {
+                klog("[TCP TEST] FAIL: Independent Congestion State\n");
+            }
+            tcp_socket_destroy(p1);
+            tcp_socket_destroy(p2);
+        }
     }
 
     klog("[TCP TEST] Finalizada Suite de Testes TCP.\n");
