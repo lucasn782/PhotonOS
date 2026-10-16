@@ -169,6 +169,10 @@ struct acpi_rsdp {
     char oem_id[6];
     uint8_t revision;
     uint32_t rsdt_addr;
+    uint32_t length;
+    uint64_t xsdt_addr;
+    uint8_t extended_checksum;
+    uint8_t reserved[3];
 } __attribute__((packed));
 
 struct acpi_sdt_header {
@@ -272,31 +276,87 @@ static int mem_compare(const void *s1, const void *s2, uint64_t n)
     return 0;
 }
 
+static int acpi_checksum_valid(const void *data, uint32_t length)
+{
+    const uint8_t *bytes = (const uint8_t *)data;
+    uint8_t sum = 0;
+
+    for (uint32_t i = 0; i < length; i++) {
+        sum = (uint8_t)(sum + bytes[i]);
+    }
+    return sum == 0;
+}
+
+/* Read an architecture-defined physical address without forming a C object
+ * pointer from a low integer constant (which GCC diagnoses as a null-based
+ * out-of-bounds access). The mapped address is still read as volatile memory.
+ */
+static uint16_t smp_read_physical_u16(uintptr_t physical)
+{
+    uint16_t value;
+    __asm__ volatile ("movw (%1), %0"
+        : "=r"(value)
+        : "r"(physical)
+        : "memory");
+    return value;
+}
+
+static struct acpi_rsdp *find_rsdp_in_range(uintptr_t start, uintptr_t end)
+{
+    if (start >= end || end - start < sizeof(struct acpi_rsdp) ||
+        !smp_map_acpi_identity_range(start, end - start)) {
+        return (struct acpi_rsdp *)0;
+    }
+
+    for (uintptr_t addr = start; addr <= end - sizeof(struct acpi_rsdp);
+        addr += 16U) {
+        struct acpi_rsdp *rsdp = (struct acpi_rsdp *)addr;
+
+        if (mem_compare(rsdp->signature, "RSD PTR ", sizeof(rsdp->signature)) != 0 ||
+            !acpi_checksum_valid(rsdp, 20U)) {
+            continue;
+        }
+
+        if (rsdp->revision >= 2U) {
+            if (rsdp->length < sizeof(struct acpi_rsdp) ||
+                rsdp->length > end - addr ||
+                !acpi_checksum_valid(rsdp, rsdp->length)) {
+                continue;
+            }
+        }
+        return rsdp;
+    }
+
+    return (struct acpi_rsdp *)0;
+}
+
 static struct acpi_rsdp *find_rsdp(void)
 {
     /* 1. Look in EBDA (first 1 KiB) */
-    uint16_t ebda_seg = *(volatile uint16_t *)0x40E;
+    uintptr_t bda_ebda_addr = 0x40EU;
+    uint16_t ebda_seg = 0;
+    if (smp_map_acpi_identity_range(bda_ebda_addr, sizeof(uint16_t))) {
+        ebda_seg = smp_read_physical_u16(bda_ebda_addr);
+    }
     uintptr_t ebda_phys = (uintptr_t)ebda_seg << 4;
     if (ebda_phys >= 0x80000ULL && ebda_phys < 0xA0000ULL) {
-        for (uintptr_t addr = ebda_phys; addr < ebda_phys + 1024ULL; addr += 16ULL) {
-            if (mem_compare((const void *)addr, "RSD PTR ", 8) == 0) {
-                return (struct acpi_rsdp *)addr;
-            }
+        struct acpi_rsdp *rsdp = find_rsdp_in_range(ebda_phys,
+            ebda_phys + 1024ULL);
+        if (rsdp != (void *)0) {
+            return rsdp;
         }
     }
 
     /* 2. Look in BIOS read-only space 0xE0000 - 0xFFFFF */
-    for (uintptr_t addr = 0xE0000ULL; addr < 0x100000ULL; addr += 16ULL) {
-        if (mem_compare((const void *)addr, "RSD PTR ", 8) == 0) {
-            return (struct acpi_rsdp *)addr;
-        }
-    }
-
-    return (void *)0;
+    return find_rsdp_in_range(0xE0000ULL, 0x100000ULL);
 }
 
 int smp_discover_cpus(uint8_t *apic_ids, int max_cpus)
 {
+    if (apic_ids == (void *)0 || max_cpus <= 0) {
+        return 0;
+    }
+
     struct acpi_rsdp *rsdp = find_rsdp();
     if (rsdp == (void *)0) {
         return 0;
@@ -306,7 +366,8 @@ int smp_discover_cpus(uint8_t *apic_ids, int max_cpus)
     struct acpi_sdt_header *rsdt_header = smp_map_acpi_header(rsdt_phys);
     if (rsdt_header == (void *)0 ||
         mem_compare(rsdt_header->signature, "RSDT", 4) != 0 ||
-        !smp_map_acpi_table(rsdt_phys, rsdt_header)) {
+        !smp_map_acpi_table(rsdt_phys, rsdt_header) ||
+        !acpi_checksum_valid(rsdt_header, rsdt_header->length)) {
         return 0;
     }
     struct acpi_rsdt *rsdt = (struct acpi_rsdt *)rsdt_header;
@@ -324,7 +385,8 @@ int smp_discover_cpus(uint8_t *apic_ids, int max_cpus)
         struct acpi_sdt_header *header = smp_map_acpi_header(table_phys);
         if (header != (void *)0 && mem_compare(header->signature, "APIC", 4) == 0) {
             if (header->length < sizeof(struct acpi_sdt_header) + 8U ||
-                !smp_map_acpi_table(table_phys, header)) {
+                !smp_map_acpi_table(table_phys, header) ||
+                !acpi_checksum_valid(header, header->length)) {
                 return 0;
             }
             madt = (struct acpi_madt *)header;
@@ -342,11 +404,16 @@ int smp_discover_cpus(uint8_t *apic_ids, int max_cpus)
 
     while (offset < madt_limit) {
         struct acpi_madt_entry *entry = (struct acpi_madt_entry *)&madt->entries[offset];
-        if (entry->length == 0) {
-            break; /* Avoid infinite loop on malformed entries */
+        uintptr_t remaining = madt_limit - offset;
+        if (entry->length < sizeof(struct acpi_madt_entry) ||
+            entry->length > remaining) {
+            return 0;
         }
 
         if (entry->type == 0) { /* Processor Local APIC */
+            if (entry->length < sizeof(struct acpi_madt_lapic)) {
+                return 0;
+            }
             struct acpi_madt_lapic *lapic = (struct acpi_madt_lapic *)entry;
             if (lapic->flags & 1) { /* Enabled */
                 if (cpus_found < max_cpus) {
