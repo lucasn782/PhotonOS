@@ -396,3 +396,9 @@ Este documento serve como o mapa central da documentação técnica do PhotonOS 
 *   **Objetivo**: Documentar algoritmos de Slow Start, Congestion Avoidance, acumulador de bytes confirmados, reação a perdas por RTO Timeout e integração ao caminho de envio.
 *   **Dependências**: Drivers e1000, IPv4, Sockets e Escalonador.
 *   **Público-Alvo**: Engenheiros de rede e desenvolvedores de kernel.
+
+### 7.9. [tcp_phase2f_shutdown.md](networking/tcp_phase2f_shutdown.md)
+*   **Descrição**: Especificação técnica da TCP Phase 2F (Syscall `shutdown()` e Half-Close POSIX/RFC 793).
+*   **Objetivo**: Documentar a chamada de sistema `shutdown(fd, how)`, semântica dos modos `SHUT_RD`, `SHUT_WR` e `SHUT_RDWR`, ordenação atômica e linearização de dados pendentes antes do FIN (`FIN_PENDING`), separação estrita de EOF remoto e leitura local, salvaguardas de lifetime do Socket e PCB com `task_get_file_description()` e validação por wire/PCAP.
+*   **Dependências**: Drivers e1000, IPv4, Sockets, VFS, Escalonador e Mutex preemptível.
+*   **Público-Alvo**: Engenheiros de rede, arquitetos de kernel e revisores de concorrência.

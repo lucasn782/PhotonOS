@@ -72,6 +72,7 @@ int sys_listen(int fd, int backlog);
 int sys_accept(int fd, struct sockaddr *addr, uint32_t *addrlen);
 int sys_recv(int fd, void *buffer, size_t len, int flags);
 int sys_send(int fd, const void *buffer, size_t len, int flags);
+int sys_shutdown(int fd, int how);
 int sys_close(int fd);
 
 

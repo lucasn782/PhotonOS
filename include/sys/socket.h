@@ -76,6 +76,13 @@ int accept(int fd, struct sockaddr *addr, uint32_t *addrlen);
 int recv(int fd, void *buf, size_t len, int flags);
 int send(int fd, const void *buf, size_t len, int flags);
 
+/* shutdown() modes (POSIX) */
+#define SHUT_RD   0
+#define SHUT_WR   1
+#define SHUT_RDWR 2
+
+int shutdown(int fd, int how);
+
 
 int socket_send(uint32_t dest_ip, uint8_t protocol, const void *payload,
     size_t len);

@@ -100,6 +100,7 @@
 #define SYS_WAITPID 53ULL
 #define SYS_RECV 54ULL
 #define SYS_SEND 55ULL
+#define SYS_SHUTDOWN 56ULL
 
 #define F_DUPFD 0
 
@@ -576,13 +577,26 @@ file_description_t *file_description_alloc(vfs_node_t *node, uint32_t flags)
     return fdesc;
 }
 
+void file_description_ref(file_description_t *fdesc)
+{
+    if (fdesc == 0) return;
+    uint64_t rflags;
+    __asm__ volatile ("pushfq; popq %0; cli" : "=r"(rflags));
+    fdesc->ref_count++;
+    __asm__ volatile ("pushq %0; popfq" : : "r"(rflags));
+}
+
 void file_description_unref(file_description_t *fdesc)
 {
     if (fdesc == 0) return;
+    uint64_t rflags;
+    __asm__ volatile ("pushfq; popq %0; cli" : "=r"(rflags));
     if (fdesc->ref_count > 0) {
         fdesc->ref_count--;
     }
-    if (fdesc->ref_count == 0) {
+    uint32_t count = fdesc->ref_count;
+    __asm__ volatile ("pushq %0; popfq" : : "r"(rflags));
+    if (count == 0) {
         vfs_node_t *node = fdesc->node;
         if (node != 0) {
             if (node->close != 0) {
@@ -592,6 +606,21 @@ void file_description_unref(file_description_t *fdesc)
         }
         kfree(fdesc);
     }
+}
+
+file_description_t *task_get_file_description(task_t *task, int fd)
+{
+    if (task == 0 || fd < 0 || fd >= TASK_MAX_FDS) {
+        return 0;
+    }
+    uint64_t rflags;
+    __asm__ volatile ("pushfq; popq %0; cli" : "=r"(rflags));
+    file_description_t *fdesc = task->file_descriptors[fd];
+    if (fdesc != 0) {
+        fdesc->ref_count++;
+    }
+    __asm__ volatile ("pushq %0; popfq" : : "r"(rflags));
+    return fdesc;
 }
 
 void task_close_all_fds(task_t *task)
@@ -2018,6 +2047,9 @@ uint64_t syscall_handler(uint64_t number, uint64_t arg1, uint64_t arg2,
     }
     else if (number == SYS_SEND) {
         ret = (uint64_t)sys_send((int)arg1, (const void *)arg2, (size_t)arg3, (int)arg4);
+    }
+    else if (number == SYS_SHUTDOWN) {
+        ret = (uint64_t)sys_shutdown((int)arg1, (int)arg2);
     }
     else if (number == SYS_CHMOD) {
         if (!vmm_validate_user_string((const char *)arg1, 256)) return (uint64_t)-1;

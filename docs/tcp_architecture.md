@@ -257,13 +257,20 @@ Para detalhes completos, consulte [TCP Phase 2D](networking/tcp_phase2d_teardown
 5. Isolamento completo de estado por conexão, ACKs duplicados ignorados e persist timer preservado.
 Para detalhes completos, consulte [TCP Phase 2E](networking/tcp_phase2e_congestion_control.md).
 
-### 8.8. Métricas de Build & Otimização do Kernel
+### 8.8. Fase 2F (Syscall shutdown() & Half-Close) — Concluída
+1. Implementação da chamada de sistema `shutdown(fd, how)` suportando `SHUT_RD`, `SHUT_WR` e `SHUT_RDWR`.
+2. Semântica formal de half-close: `SHUT_WR` transmite FIN após esgotamento de dados no buffer TX e encerra envios, enquanto o canal de recepção e confirmação de ACKs permanece ativo.
+3. Tratamento de janela esgotada com flag `TCP_PCB_FLAG_FIN_PENDING`: garante que todo o payload pendente seja transmitido antes do envio de FIN quando o peer reabrir a janela.
+4. Flag dedicada `TCP_PCB_FLAG_SHUT_RD` separada de `TCP_PCB_FLAG_EOF`: purga o buffer RX local e faz `sys_recv()` retornar imediatamente 0 (EOF) sem quebrar o processamento TCP de pacotes subsequentes ou acordar com lost wakeup.
+5. Proteção de ciclo de vida do Socket e PCB com `task_get_file_description()` e `file_description_ref()` prevenindo Use-After-Free em corridas com `close()`.
+6. Idempotência garantida para chamadas repetidas ou concorrentes, sem emissão de FINs duplicados ou desalocações prematuras.
+Para detalhes completos, consulte [TCP Phase 2F](networking/tcp_phase2f_shutdown.md).
+
+### 8.9. Métricas de Build & Otimização do Kernel
 - **Otimização de Compilação:** Flag `-Os` ativada em CFLAGS no `Makefile`.
-- **Tamanho do Kernel Binário:** `build/photon.bin` = 150.060 bytes.
 - **Limite Máximo do Kernel (`KERNEL_MAX_BYTES`):** 245.760 bytes (480 setores LBA × 512 bytes).
-- **Margem de Segurança:** 95.700 bytes livres antes do teto de carregamento do bootloader.
 - **Gate de Build Ativo:** `test $(stat -c%s build/photon.bin) -le 245760` no Makefile.
 
-### 8.9. Próximas Etapas:
-1. **TCP Phase 2F:** Implementação da chamada de sistema `shutdown()` para encerramento unidirecional e bidirecional de canais (`SHUT_RD`, `SHUT_WR`, `SHUT_RDWR`).
-2. **Fases Posteriores:** Fast Retransmit / Fast Recovery, SACK, Window Scaling e Servidor HTTP Ring 3.
+### 8.10. Próximas Etapas:
+1. **TCP Phase 2G:** Fast Retransmit e Fast Recovery (RFC 5681) com reação a 3 ACKs duplicados.
+2. **Fases Posteriores:** SACK (RFC 2018), Window Scaling (RFC 7323) e Servidor HTTP Ring 3.

@@ -165,7 +165,9 @@ struct task_control_block {
 typedef struct task_control_block task_t;
 
 file_description_t *file_description_alloc(vfs_node_t *node, uint32_t flags);
+void file_description_ref(file_description_t *fdesc);
 void file_description_unref(file_description_t *fdesc);
+file_description_t *task_get_file_description(task_t *task, int fd);
 void task_close_all_fds(task_t *task);
 void switch_to(uint64_t *current_rsp, uint64_t next_rsp);
 

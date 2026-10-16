@@ -31,7 +31,7 @@ Durante a alocação e inicialização do PCB (`tcp_alloc()`):
 * **SMSS efetivo:** Definido em `TCP_DEFAULT_MSS = 1460` bytes.
 * **Janela Inicial (`IW`):**
   $$\text{IW} = 3 \times \text{SMSS} = 4380 \text{ bytes}$$
-  De acordo com a RFC 5681 Seção 3.1 (onde $2190 < \text{SMSS} \le 1095$ permite $3 \times \text{SMSS}$).
+  De acordo com a RFC 5681 Seção 3.1 (onde $1095 < \text{SMSS} \le 2190$ permite $3 \times \text{SMSS}$, de forma que para $\text{SMSS} = 1460$ temos $\text{IW} = 3 \times \text{SMSS} = 4380$ bytes).
 * **`ssthresh` Inicial:** Arbitrariamente alto, definido como $65535$ bytes (`TCP_INITIAL_SSTHRESH`).
 * **`ca_bytes_acked`:** Inicializado em $0$.
 

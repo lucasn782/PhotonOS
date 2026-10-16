@@ -62,6 +62,7 @@
 #define SYS_WAITPID 53
 #define SYS_RECV 54
 #define SYS_SEND 55
+#define SYS_SHUTDOWN 56
 
 #define PAGE_SIZE 4096UL
 
@@ -554,6 +555,11 @@ int recv(int fd, void *buf, size_t len, int flags)
 int send(int fd, const void *buf, size_t len, int flags)
 {
     return (int)syscall4(SYS_SEND, fd, (long)buf, len, flags);
+}
+
+int shutdown(int fd, int how)
+{
+    return (int)syscall2(SYS_SHUTDOWN, fd, how);
 }
 
 

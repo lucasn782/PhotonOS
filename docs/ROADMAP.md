@@ -128,11 +128,20 @@ Este documento descreve o estado atual do desenvolvimento do PhotonOS, dividindo
 
 ---
 
+### Trilha 23 — TCP Phase 2F: Syscall `shutdown()` e Half-Close (v4.4-tcp2f)
+- **Syscall `shutdown()`:** Encerramento unidirecional e bidirecional de canais (`SHUT_RD`, `SHUT_WR`, `SHUT_RDWR`) conforme POSIX.1-2017 e RFC 793 / RFC 1122.
+- **Ordenação Atômica e Linearização:** `SHUT_WR` garante que dados aceitos antes do shutdown sejam transmitidos na ordem original antes do FIN; rejeita imediatamente escritas subsequentes.
+- **Resolução de Janela Esgotada (`FIN_PENDING`):** Retenção controlada do FIN se a janela do peer estiver zerada/saturada, drenando o payload antes do FIN após a reabertura da janela.
+- **Separação de Estados:** Flag dedicada `TCP_PCB_FLAG_SHUT_RD` separada de `TCP_PCB_FLAG_EOF`; descarte seguro de payload em ordem com avanço de `RCV.NXT` e envio de ACK; retorno imediato de 0 (EOF) em leituras locais.
+- **Proteção de Lifetime de Descritor VFS:** Prevenção de Use-After-Free entre `shutdown()` e `close()` concorrentes via `task_get_file_description()` e `file_description_ref()`.
+- **Validação Completa & PCAP:** 23/23 testes aprovados na suíte dedicada Phase 2F, 100% de aprovação nas suítes de regressão e inspeção estrita de tráfego PCAP.
+
+---
+
 ## 🟡 Em Desenvolvimento (v4.4-dev)
 
-### Trilha 23 — TCP Phase 2F: Syscall `shutdown()`
-- **Syscall `shutdown()`:** Encerramento unidirecional e bidirecional de canais (`SHUT_RD`, `SHUT_WR`, `SHUT_RDWR`).
-
+### Trilha 24 — TCP Phase 2G: Fast Retransmit e Fast Recovery
+- **Detecção de Perda Rápida:** Processamento de 3 ACKs duplicados (RFC 5681) sem aguardar expiração de RTO.
 
 ## 🔵 Planejado
 

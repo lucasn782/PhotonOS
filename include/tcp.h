@@ -36,6 +36,9 @@
 #define TCP_PCB_FLAG_EOF          (1U << 8)
 #define TCP_PCB_FLAG_TIMER_PERSIST (1U << 9)
 #define TCP_PCB_FLAG_DRAINING     (1U << 10)
+#define TCP_PCB_FLAG_SHUT_RD      (1U << 11)
+#define TCP_PCB_FLAG_SHUT_WR      (1U << 12)
+#define TCP_PCB_FLAG_FIN_PENDING  (1U << 13)
 
 #define TCP_RX_BUFFER_CAPACITY    8192U
 #define TCP_TX_BUFFER_CAPACITY    8192U
@@ -226,6 +229,8 @@ tcp_pcb_t *tcp_lookup(uint32_t local_ip, uint32_t remote_ip,
 struct tcp_pcb *tcp_socket_create(void *socket);
 void tcp_socket_destroy(struct tcp_pcb *pcb);
 int tcp_close(struct tcp_pcb *pcb);
+int tcp_shutdown(struct tcp_pcb *pcb, int how);
+int tcp_shutdown_locked(struct tcp_pcb *pcb, int how);
 
 int tcp_bind(struct tcp_pcb *pcb, uint32_t local_ip, uint16_t local_port);
 uint16_t tcp_allocate_ephemeral_port(struct tcp_pcb *pcb, uint32_t local_ip);

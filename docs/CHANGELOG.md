@@ -3,6 +3,27 @@
 Histórico completo de mudanças do sistema operacional, organizado por versão.
 Convenções: cada entrada lista data, commit (quando aplicável), resumo, arquivos alterados, bugs corrigidos, novas funcionalidades, breaking changes e impacto arquitetural.
 
+## `v4.4-tcp2f` — Milestone TCP Phase 2F: Syscall `shutdown()` e Half-Close 🌐
+**Data:** 2026-10-16
+**Status:** Consolidado e validado em WSL/Ubuntu/QEMU com inspeção PCAP (23/23 testes aprovados).
+
+### Resumo do Milestone
+Implementação e consolidação formal da chamada de sistema `shutdown(int fd, int how)` e semântica de half-close em conformidade com POSIX.1-2017 e RFC 793 / RFC 1122. Introduz suporte aos modos `SHUT_RD`, `SHUT_WR` e `SHUT_RDWR`, sincronização linear estrita entre `send()` e encerramento de escrita, emissão diferida de FIN sob janela exaurida via `TCP_PCB_FLAG_FIN_PENDING`, separação entre EOF remoto e shutdown local de leitura (`TCP_PCB_FLAG_SHUT_RD`), proteção de concorrência e Use-After-Free de descritores VFS via contagem atômica de referências (`task_get_file_description()` / `file_description_ref()`), e idempotência completa de chamadas.
+
+### Funcionalidades Consolidadas
+- **Syscall `shutdown()` e Modos POSIX:** `SHUT_RD (0)` (desabilita leitura, purga RX buffer, leituras retornam EOF imediato 0), `SHUT_WR (1)` (drena dados TX, emite FIN e encerra escritas), e `SHUT_RDWR (2)` (combinação atômica de ambos).
+- **Linearização Estrita entre `send()` e `SHUT_WR`:** Escritas concorrentes após o início de shutdown são rejeitadas imediatamente sob lock; dados aceitos previamente são garantidos no fio antes do segmento FIN.
+- **Tratamento de Janela Esgotada (`FIN_PENDING`):** Quando a janela do par impede a transmissão imediata de todo o payload antes do FIN, o FIN é mantido pendente e despachado automaticamente assim que a janela for reaberta e o payload esgotado.
+- **Isolamento de Flag de Leitura Local (`TCP_PCB_FLAG_SHUT_RD`):** Desvinculada de `TCP_PCB_FLAG_EOF`. Segmentos válidos subsequentes continuam sendo processados pelo protocolo para avanço de `RCV.NXT` e emissão de ACKs, mas seu payload é descartado sem consumo de memória. Leituras pelo usuário retornam 0 sem acordar com lost wakeup.
+- **Lifetime de Sockets e Descritores VFS:** Acesso seguro a `fdesc` e `pcb` sob concorrência com `close()`, garantindo que descritores compartilhados por `fork()` e `dup()` não sofram fechamento prematuro ou UAF.
+- **Idempotência de Encerramento:** Chamadas repetidas a `shutdown()` não duplicam FINs no fio nem corrompem buffers ou estados TCP.
+
+### Validação de Integração e Regressões
+- **Suíte Phase 2F (23/23 PASS):** 12 testes unitários no boot do kernel, 1 teste de validação de API em userspace, 6 testes de integração wire de rede, e 4 verificações de integridade de tráfego PCAP.
+- **Regressão Global:** Aprovação de 100% nas suítes anteriores Phase 2E (16/16), Phase 2D (16/16) e Phase 2C (14/14).
+
+---
+
 ## `v4.4-tcp2e` — Milestone TCP Phase 2E: Congestion Control (RFC 5681) 🌐
 **Data:** 2026-10-09
 **Status:** Consolidado e validado em WSL/Ubuntu/QEMU com inspeção PCAP (16/16 testes aprovados).

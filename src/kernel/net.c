@@ -489,7 +489,8 @@ int socket_vfs_read(vfs_node_t *node, uint64_t offset, uint32_t size, uint8_t *b
             }
 
             mutex_lock(&pcb->lock);
-            if (pcb->state == TCP_CLOSED || (pcb->flags & TCP_PCB_FLAG_EOF) != 0 ||
+            if (pcb->state == TCP_CLOSED ||
+                (pcb->flags & (TCP_PCB_FLAG_EOF | TCP_PCB_FLAG_SHUT_RD)) != 0 ||
                 pcb->state == TCP_CLOSE_WAIT) {
                 mutex_unlock(&pcb->lock);
                 return 0;
@@ -1546,6 +1547,58 @@ int sys_accept(int fd, struct sockaddr *addr, uint32_t *addrlen)
     return new_fd;
 }
 
+int sys_shutdown(int fd, int how)
+{
+    if (how < 0 || how > 2) {
+        return -1;
+    }
+    task_t *task = scheduler_current_task();
+    if (task == 0 || fd < 0 || fd >= TASK_MAX_FDS) {
+        return -1;
+    }
+    file_description_t *fdesc = task_get_file_description(task, fd);
+    if (fdesc == 0) {
+        return -1;
+    }
+    vfs_node_t *node = fdesc->node;
+    if (node == 0 || node->read != socket_vfs_read) {
+        file_description_unref(fdesc);
+        return -1;
+    }
+    struct socket *sock = (struct socket *)node->data;
+    if (sock == 0) {
+        file_description_unref(fdesc);
+        return -1;
+    }
+    mutex_lock_preemptible(&sock->mutex);
+    if (!sock->active || sock->type != SOCK_STREAM ||
+        sock->protocol != IP_PROTO_TCP) {
+        mutex_unlock(&sock->mutex);
+        file_description_unref(fdesc);
+        return -1;
+    }
+    struct tcp_pcb *pcb = sock->tcp;
+    if (pcb == 0) {
+        mutex_unlock(&sock->mutex);
+        file_description_unref(fdesc);
+        return -1;
+    }
+
+    /*
+     * Lifetime protection:
+     * 1. fdesc->ref_count is incremented via task_get_file_description(), ensuring
+     *    concurrent sys_close() cannot release the file_description, vfs_node, or socket.
+     * 2. pcb->lock is acquired WHILE holding sock->mutex, guaranteeing that a concurrent
+     *    socket_vfs_close() cannot de-link or free the PCB during this call.
+     */
+    mutex_lock_preemptible(&pcb->lock);
+    mutex_unlock(&sock->mutex);
+
+    int res = tcp_shutdown_locked(pcb, how);
+    file_description_unref(fdesc);
+    return res;
+}
+
 int sys_recv(int fd, void *buffer, size_t len, int flags)
 {
     task_t *task = scheduler_current_task();
@@ -1565,32 +1618,49 @@ int sys_recv(int fd, void *buffer, size_t len, int flags)
         return -1;
     }
 
-    file_description_t *fdesc = task->file_descriptors[fd];
-    vfs_node_t *node = (fdesc != 0) ? fdesc->node : 0;
+    file_description_t *fdesc = task_get_file_description(task, fd);
+    if (fdesc == 0) {
+        return -1;
+    }
+    vfs_node_t *node = fdesc->node;
     if (node == 0 || node->read != socket_vfs_read) {
+        file_description_unref(fdesc);
         return -1;
     }
 
     struct socket *sock = (struct socket *)node->data;
     if (sock == 0) {
+        file_description_unref(fdesc);
         return -1;
     }
     mutex_lock(&sock->mutex);
     if (!sock->active || sock->type != SOCK_STREAM || sock->protocol != IP_PROTO_TCP) {
         mutex_unlock(&sock->mutex);
+        file_description_unref(fdesc);
         return -1;
     }
     struct tcp_pcb *pcb = sock->tcp;
     if (pcb == 0) {
         mutex_unlock(&sock->mutex);
+        file_description_unref(fdesc);
         return -1;
     }
     mutex_unlock(&sock->mutex);
+
+    /* Check SHUT_RD: return EOF immediately if read side is shut down */
+    mutex_lock_preemptible(&pcb->lock);
+    if ((pcb->flags & TCP_PCB_FLAG_SHUT_RD) != 0) {
+        mutex_unlock(&pcb->lock);
+        file_description_unref(fdesc);
+        return 0;
+    }
+    mutex_unlock(&pcb->lock);
 
     for (;;) {
         mutex_lock(&sock->mutex);
         if (!sock->active || sock->tcp != pcb) {
             mutex_unlock(&sock->mutex);
+            file_description_unref(fdesc);
             return -1;
         }
         mutex_unlock(&sock->mutex);
@@ -1599,6 +1669,12 @@ int sys_recv(int fd, void *buffer, size_t len, int flags)
          * to run while this task waits, keeping sock->mutex for PCB lifetime.
          */
         mutex_lock_preemptible(&pcb->lock);
+
+        if ((pcb->flags & TCP_PCB_FLAG_SHUT_RD) != 0) {
+            mutex_unlock(&pcb->lock);
+            file_description_unref(fdesc);
+            return 0;
+        }
 
         if (pcb->rx_buf.used > 0) {
             size_t read_bytes = tcp_rx_buffer_read_locked(pcb, (uint8_t *)buffer, len);
@@ -1624,30 +1700,34 @@ int sys_recv(int fd, void *buffer, size_t len, int flags)
                     tcp_drain_unsent(pcb);
                 }
             }
+            file_description_unref(fdesc);
             return (int)read_bytes;
         }
 
         if ((pcb->flags & TCP_PCB_FLAG_RESET) != 0) {
             mutex_unlock(&pcb->lock);
+            file_description_unref(fdesc);
             return -1;
         }
 
-        if ((pcb->flags & TCP_PCB_FLAG_EOF) != 0 ||
+        if ((pcb->flags & (TCP_PCB_FLAG_EOF | TCP_PCB_FLAG_SHUT_RD)) != 0 ||
             pcb->state == TCP_CLOSE_WAIT ||
             pcb->state == TCP_CLOSED) {
             mutex_unlock(&pcb->lock);
+            file_description_unref(fdesc);
             return 0;
         }
 
         if (pcb->state != TCP_ESTABLISHED && pcb->state != TCP_SYN_RECEIVED &&
             pcb->state != TCP_FIN_WAIT1 && pcb->state != TCP_FIN_WAIT2) {
             mutex_unlock(&pcb->lock);
+            file_description_unref(fdesc);
             return -1;
         }
 
         uint64_t rflags = save_and_disable_interrupts();
         if (pcb->rx_buf.used == 0 &&
-            (pcb->flags & (TCP_PCB_FLAG_RESET | TCP_PCB_FLAG_EOF)) == 0 &&
+            (pcb->flags & (TCP_PCB_FLAG_RESET | TCP_PCB_FLAG_EOF | TCP_PCB_FLAG_SHUT_RD)) == 0 &&
             (pcb->state == TCP_ESTABLISHED || pcb->state == TCP_FIN_WAIT1 || pcb->state == TCP_FIN_WAIT2)) {
             scheduler_sleep_current(TASK_WAIT_SOCKET_RECV, (uint64_t)sock);
             mutex_unlock(&pcb->lock);
@@ -1679,34 +1759,41 @@ int sys_send(int fd, const void *buffer, size_t len, int flags)
         return -1;
     }
 
-    file_description_t *fdesc = task->file_descriptors[fd];
-    vfs_node_t *node = (fdesc != 0) ? fdesc->node : 0;
+    file_description_t *fdesc = task_get_file_description(task, fd);
+    if (fdesc == 0) {
+        return -1;
+    }
+    vfs_node_t *node = fdesc->node;
     if (node == 0 || node->write != socket_vfs_write) {
+        file_description_unref(fdesc);
         return -1;
     }
 
     struct socket *sock = (struct socket *)node->data;
     if (sock == 0) {
+        file_description_unref(fdesc);
         return -1;
     }
     mutex_lock_preemptible(&sock->mutex);
     if (!sock->active || sock->type != SOCK_STREAM || sock->protocol != IP_PROTO_TCP) {
         mutex_unlock(&sock->mutex);
+        file_description_unref(fdesc);
         return -1;
     }
     struct tcp_pcb *pcb = sock->tcp;
     if (pcb == 0) {
         mutex_unlock(&sock->mutex);
+        file_description_unref(fdesc);
         return -1;
     }
     /*
      * Release sock->mutex before tcp_send() so that a concurrent sys_recv
-     * on the same socket (full-duplex via fork) is not starved.  tcp_send
-     * internally serialises on pcb->lock; sock->mutex was only needed to
-     * safely dereference sock->tcp.  This matches the sys_recv pattern
-     * which also releases sock->mutex before operating on pcb.
+     * on the same socket (full-duplex via fork) is not starved.  fdesc reference
+     * protects socket and pcb lifetime throughout this syscall.
      */
     mutex_unlock(&sock->mutex);
+
     int sent = tcp_send(pcb, (const uint8_t *)buffer, len);
+    file_description_unref(fdesc);
     return sent;
 }

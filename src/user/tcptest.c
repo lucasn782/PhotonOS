@@ -1522,6 +1522,291 @@ static int do_cc_server_test(uint16_t port, const char *mode)
     return ret;
 }
 
+static int do_shutdown_api_test(void)
+{
+    printf("[TCPTEST SHUTDOWN] Testando API e validacao de shutdown...\n");
+
+    /* 1. Invalid fd */
+    int res1 = shutdown(-1, SHUT_RD);
+    int res2 = shutdown(99, SHUT_RD);
+    if (res1 != -1 || res2 != -1) {
+        printf("[TCPTEST SHUTDOWN] FAIL: invalid fd returned %d, %d\n", res1, res2);
+        return -1;
+    }
+
+    /* 2. Non-socket fd (stdout = 1) */
+    int res3 = shutdown(1, SHUT_RD);
+    if (res3 != -1) {
+        printf("[TCPTEST SHUTDOWN] FAIL: non-socket fd returned %d\n", res3);
+        return -1;
+    }
+
+    /* 3. Invalid how */
+    int sock_fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (sock_fd < 0) {
+        printf("[TCPTEST SHUTDOWN] FAIL: socket()\n");
+        return -1;
+    }
+    int res4 = shutdown(sock_fd, -1);
+    int res5 = shutdown(sock_fd, 3);
+    if (res4 != -1 || res5 != -1) {
+        printf("[TCPTEST SHUTDOWN] FAIL: invalid how returned %d, %d\n", res4, res5);
+        close(sock_fd);
+        return -1;
+    }
+
+    /* 4. Unconnected socket */
+    int res6 = shutdown(sock_fd, SHUT_RD);
+    int res7 = shutdown(sock_fd, SHUT_WR);
+    int res8 = shutdown(sock_fd, SHUT_RDWR);
+    if (res6 != -1 || res7 != -1 || res8 != -1) {
+        printf("[TCPTEST SHUTDOWN] FAIL: unconnected socket returned %d, %d, %d\n", res6, res7, res8);
+        close(sock_fd);
+        return -1;
+    }
+    close(sock_fd);
+
+    /* 5. Listening socket */
+    int listen_fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (listen_fd >= 0) {
+        struct sockaddr_in baddr;
+        baddr.sin_family = AF_INET;
+        baddr.sin_port = htons(9999);
+        baddr.sin_addr.s_addr = 0;
+        for (int i = 0; i < 8; i++) baddr.sin_zero[i] = 0;
+        if (bind(listen_fd, (const struct sockaddr *)&baddr, sizeof(baddr)) == 0 &&
+            listen(listen_fd, 1) == 0) {
+            int res9 = shutdown(listen_fd, SHUT_RD);
+            int res10 = shutdown(listen_fd, SHUT_WR);
+            int res11 = shutdown(listen_fd, SHUT_RDWR);
+            if (res9 != -1 || res10 != -1 || res11 != -1) {
+                printf("[TCPTEST SHUTDOWN] FAIL: listening socket shutdown returned %d, %d, %d\n", res9, res10, res11);
+                close(listen_fd);
+                return -1;
+            }
+        }
+        close(listen_fd);
+    }
+
+    printf("[TCPTEST SHUTDOWN] >>> API VALIDATION CONCLUIDO COM SUCESSO! <<<\n");
+    return 0;
+}
+
+static int do_shutdown_server_test(uint16_t port, const char *mode)
+{
+    int listener_fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (listener_fd < 0) {
+        printf("[TCPTEST SHUTDOWN SERVER] FAIL: socket()\n");
+        return -1;
+    }
+
+    struct sockaddr_in bind_addr;
+    bind_addr.sin_family = AF_INET;
+    bind_addr.sin_port = htons(port);
+    bind_addr.sin_addr.s_addr = 0;
+    for (int i = 0; i < 8; i++) bind_addr.sin_zero[i] = 0;
+
+    if (bind(listener_fd, (const struct sockaddr *)&bind_addr, sizeof(bind_addr)) != 0 ||
+        listen(listener_fd, 1) != 0) {
+        printf("[TCPTEST SHUTDOWN SERVER] FAIL: bind/listen\n");
+        close(listener_fd);
+        return -1;
+    }
+
+    printf("[TCPTEST SHUTDOWN] Ouvindo na porta %u (mode=%s)...\n", (unsigned int)port, mode);
+
+    struct sockaddr_in peer;
+    uint32_t peer_len = sizeof(peer);
+    int client_fd = accept(listener_fd, (struct sockaddr *)&peer, &peer_len);
+    if (client_fd < 0) {
+        printf("[TCPTEST SHUTDOWN SERVER] FAIL: accept()\n");
+        close(listener_fd);
+        return -1;
+    }
+
+    printf("[TCPTEST SHUTDOWN] Conexao aceita!\n");
+
+    if (strcmp(mode, "shut_wr") == 0) {
+        const char *msg = "SHUT_WR_INITIAL_PAYLOAD\n";
+        send(client_fd, msg, 24, 0);
+
+        int s_res = shutdown(client_fd, SHUT_WR);
+        if (s_res != 0) {
+            printf("[TCPTEST SHUTDOWN] FAIL: shutdown(SHUT_WR) returned %d\n", s_res);
+            close(client_fd);
+            close(listener_fd);
+            return -1;
+        }
+
+        int post_send = send(client_fd, "FAIL_DATA", 9, 0);
+        if (post_send != -1) {
+            printf("[TCPTEST SHUTDOWN] FAIL: send() after SHUT_WR returned %d\n", post_send);
+            close(client_fd);
+            close(listener_fd);
+            return -1;
+        }
+
+        int rep_wr = shutdown(client_fd, SHUT_WR);
+        if (rep_wr != 0) {
+            printf("[TCPTEST SHUTDOWN] FAIL: repeated shutdown(SHUT_WR) returned %d\n", rep_wr);
+            close(client_fd);
+            close(listener_fd);
+            return -1;
+        }
+
+        char in_buf[128];
+        int r_bytes = 0;
+        for (int i = 0; i < 500; i++) {
+            int r = recv(client_fd, in_buf + r_bytes, sizeof(in_buf) - 1 - r_bytes, 0);
+            if (r > 0) {
+                r_bytes += r;
+                if (r_bytes >= 15) break;
+            } else if (r == 0) {
+                break;
+            } else {
+                delay_ticks(1);
+            }
+        }
+        in_buf[r_bytes] = '\0';
+        printf("[TCPTEST SHUTDOWN] Recebido do peer apos SHUT_WR: %s (bytes=%d)\n", in_buf, r_bytes);
+
+        close(client_fd);
+        close(listener_fd);
+        printf("[TCPTEST SHUTDOWN] >>> SHUT_WR CONCLUIDO COM SUCESSO! <<<\n");
+        return 0;
+    } else if (strcmp(mode, "shut_rd") == 0) {
+        delay_ticks(5);
+        int s_res = shutdown(client_fd, SHUT_RD);
+        if (s_res != 0) {
+            printf("[TCPTEST SHUTDOWN] FAIL: shutdown(SHUT_RD) returned %d\n", s_res);
+            close(client_fd);
+            close(listener_fd);
+            return -1;
+        }
+
+        char buf[64];
+        int r = recv(client_fd, buf, sizeof(buf), 0);
+        if (r != 0) {
+            printf("[TCPTEST SHUTDOWN] FAIL: recv() after SHUT_RD returned %d\n", r);
+            close(client_fd);
+            close(listener_fd);
+            return -1;
+        }
+
+        int rep_rd = shutdown(client_fd, SHUT_RD);
+        if (rep_rd != 0) {
+            printf("[TCPTEST SHUTDOWN] FAIL: repeated shutdown(SHUT_RD) returned %d\n", rep_rd);
+            close(client_fd);
+            close(listener_fd);
+            return -1;
+        }
+
+        const char *resp = "REPLY_AFTER_SHUT_RD\n";
+        int sent = send(client_fd, resp, 20, 0);
+        if (sent != 20) {
+            printf("[TCPTEST SHUTDOWN] FAIL: send() after SHUT_RD returned %d\n", sent);
+            close(client_fd);
+            close(listener_fd);
+            return -1;
+        }
+
+        delay_ticks(10);
+        close(client_fd);
+        close(listener_fd);
+        printf("[TCPTEST SHUTDOWN] >>> SHUT_RD CONCLUIDO COM SUCESSO! <<<\n");
+        return 0;
+    } else if (strcmp(mode, "shut_rdwr") == 0) {
+        int s_res = shutdown(client_fd, SHUT_RDWR);
+        if (s_res != 0) {
+            printf("[TCPTEST SHUTDOWN] FAIL: shutdown(SHUT_RDWR) returned %d\n", s_res);
+            close(client_fd);
+            close(listener_fd);
+            return -1;
+        }
+
+        char buf[32];
+        int r = recv(client_fd, buf, sizeof(buf), 0);
+        int s = send(client_fd, "FAIL", 4, 0);
+        if (r != 0 || s != -1) {
+            printf("[TCPTEST SHUTDOWN] FAIL: rdwr r=%d, s=%d\n", r, s);
+            close(client_fd);
+            close(listener_fd);
+            return -1;
+        }
+
+        int rep = shutdown(client_fd, SHUT_RDWR);
+        if (rep != 0) {
+            printf("[TCPTEST SHUTDOWN] FAIL: repeated SHUT_RDWR returned %d\n", rep);
+            close(client_fd);
+            close(listener_fd);
+            return -1;
+        }
+
+        delay_ticks(10);
+        close(client_fd);
+        close(listener_fd);
+        printf("[TCPTEST SHUTDOWN] >>> SHUT_RDWR CONCLUIDO COM SUCESSO! <<<\n");
+        return 0;
+    } else if (strcmp(mode, "order_drain") == 0) {
+        char bigbuf[1000];
+        for (int i = 0; i < 1000; i++) bigbuf[i] = (char)('0' + (i % 10));
+        send(client_fd, bigbuf, sizeof(bigbuf), 0);
+        shutdown(client_fd, SHUT_WR);
+        delay_ticks(20);
+        close(client_fd);
+        close(listener_fd);
+        printf("[TCPTEST SHUTDOWN] >>> ORDER_DRAIN CONCLUIDO COM SUCESSO! <<<\n");
+        return 0;
+    } else if (strcmp(mode, "fork_shutdown") == 0) {
+        int pid = fork();
+        if (pid == 0) {
+            close(listener_fd);
+            delay_ticks(5);
+            int s = send(client_fd, "CHILD_DATA", 10, 0);
+            int child_send_failed = (s == -1);
+
+            char in[32];
+            int r = recv(client_fd, in, sizeof(in), 0);
+            close(client_fd);
+            exit((child_send_failed && r >= 0) ? 0 : 1);
+            return 0;
+        } else if (pid > 0) {
+            shutdown(client_fd, SHUT_WR);
+            int status = 0;
+            waitpid(pid, &status, 0);
+            close(client_fd);
+            close(listener_fd);
+            if (status == 0) {
+                printf("[TCPTEST SHUTDOWN] >>> FORK_SHUTDOWN CONCLUIDO COM SUCESSO! <<<\n");
+                return 0;
+            } else {
+                printf("[TCPTEST SHUTDOWN] FAIL: child status=%d\n", status);
+                return -1;
+            }
+        }
+    } else if (strcmp(mode, "dup_shutdown") == 0) {
+        int dup_fd = dup(client_fd);
+        shutdown(client_fd, SHUT_WR);
+        int s = send(dup_fd, "DUP_FAIL", 8, 0);
+        close(client_fd);
+        close(dup_fd);
+        close(listener_fd);
+        if (s == -1) {
+            printf("[TCPTEST SHUTDOWN] >>> DUP_SHUTDOWN CONCLUIDO COM SUCESSO! <<<\n");
+            return 0;
+        } else {
+            printf("[TCPTEST SHUTDOWN] FAIL: dup_fd send returned %d\n", s);
+            return -1;
+        }
+    } else {
+        printf("[TCPTEST SHUTDOWN] Modo desconhecido: %s\n", mode);
+        close(client_fd);
+        close(listener_fd);
+        return -1;
+    }
+    return 0;
+}
+
 void _start(const char *arg)
 {
     if (arg == 0) {
@@ -1866,6 +2151,24 @@ void _start(const char *arg)
             mode = port_str;
         }
         int res = do_cc_server_test((uint16_t)lport, mode);
+        exit(res == 0 ? 0 : 1);
+    }
+    else if (strcmp(cmd, "shutdown_api") == 0) {
+        /* uso: tcptest shutdown_api */
+        int res = do_shutdown_api_test();
+        exit(res == 0 ? 0 : 1);
+    }
+    else if (strcmp(cmd, "shutdown_server") == 0) {
+        /* uso: tcptest shutdown_server <porta> [mode] */
+        unsigned int lport = 8088;
+        if (ip_str[0] != '\0') {
+            parse_uint(ip_str, &lport);
+        }
+        const char *mode = "shut_wr";
+        if (port_str[0] != '\0') {
+            mode = port_str;
+        }
+        int res = do_shutdown_server_test((uint16_t)lport, mode);
         exit(res == 0 ? 0 : 1);
     }
     else {

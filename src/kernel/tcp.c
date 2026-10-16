@@ -5,6 +5,7 @@
 #include "scheduler.h"
 #include "serial.h"
 #include "sys/socket.h"
+#include "vfs.h"
 
 /* Keep TCP control state out of the legacy VGA aperture crossed by .bss. */
 static struct tcp_pcb *tcp_pcbs __attribute__((section(".network_state")));
@@ -930,10 +931,28 @@ int tcp_close(struct tcp_pcb *pcb)
     }
 
     if (pcb->state == TCP_ESTABLISHED) {
+        if ((pcb->flags & TCP_PCB_FLAG_SHUT_WR) != 0) {
+            /* SHUT_WR was already performed. If FIN is still pending, keep it pending;
+             * otherwise FIN was already transmitted and state will advance on ACK. */
+            mutex_unlock(&pcb->lock);
+            return 0;
+        }
+        pcb->flags |= TCP_PCB_FLAG_SHUT_WR;
         if (pcb->tx_buf.unsent.head != 0) {
             mutex_unlock(&pcb->lock);
             tcp_drain_unsent(pcb);
             mutex_lock_preemptible(&pcb->lock);
+        }
+
+        if (pcb->state != TCP_ESTABLISHED) {
+            mutex_unlock(&pcb->lock);
+            return 0;
+        }
+
+        if (pcb->tx_buf.unsent.head != 0) {
+            pcb->flags |= TCP_PCB_FLAG_FIN_PENDING;
+            mutex_unlock(&pcb->lock);
+            return 0;
         }
 
         int res = tcp_build_output_locked(pcb,
@@ -958,10 +977,26 @@ int tcp_close(struct tcp_pcb *pcb)
     }
 
     if (pcb->state == TCP_CLOSE_WAIT) {
+        if ((pcb->flags & TCP_PCB_FLAG_SHUT_WR) != 0) {
+            mutex_unlock(&pcb->lock);
+            return 0;
+        }
+        pcb->flags |= TCP_PCB_FLAG_SHUT_WR;
         if (pcb->tx_buf.unsent.head != 0) {
             mutex_unlock(&pcb->lock);
             tcp_drain_unsent(pcb);
             mutex_lock_preemptible(&pcb->lock);
+        }
+
+        if (pcb->state != TCP_CLOSE_WAIT) {
+            mutex_unlock(&pcb->lock);
+            return 0;
+        }
+
+        if (pcb->tx_buf.unsent.head != 0) {
+            pcb->flags |= TCP_PCB_FLAG_FIN_PENDING;
+            mutex_unlock(&pcb->lock);
+            return 0;
         }
 
         int res = tcp_build_output_locked(pcb,
@@ -987,6 +1022,113 @@ int tcp_close(struct tcp_pcb *pcb)
 
     mutex_unlock(&pcb->lock);
     return 0;
+}
+
+int tcp_shutdown_locked(struct tcp_pcb *pcb, int how)
+{
+    if (pcb == 0) {
+        return -1;
+    }
+
+    if (how < 0 || how > 2) {
+        mutex_unlock(&pcb->lock);
+        return -1;
+    }
+
+    /* Reject sockets not connected: CLOSED, LISTEN, SYN_SENT, SYN_RECEIVED */
+    if (pcb->state == TCP_CLOSED || pcb->state == TCP_LISTEN ||
+        pcb->state == TCP_SYN_SENT || pcb->state == TCP_SYN_RECEIVED) {
+        mutex_unlock(&pcb->lock);
+        return -1;
+    }
+
+    uint8_t packet[TCP_HEADER_MIN_SIZE];
+    size_t packet_len = 0;
+    uint32_t remote_ip = 0;
+    int send_fin = 0;
+    int need_notify = 0;
+
+    /* SHUT_RD / SHUT_RDWR: disable reception */
+    if (how == 0 /* SHUT_RD */ || how == 2 /* SHUT_RDWR */) {
+        if ((pcb->flags & TCP_PCB_FLAG_SHUT_RD) == 0) {
+            pcb->flags |= TCP_PCB_FLAG_SHUT_RD;
+            /* Do NOT set TCP_PCB_FLAG_EOF (reserved for remote FIN) */
+            /* Discard any unread data in the receive buffer */
+            pcb->rx_buf.head = 0;
+            pcb->rx_buf.tail = 0;
+            pcb->rx_buf.used = 0;
+            need_notify = 1;
+            klog("[TCP] shutdown(SHUT_RD): recepcao desabilitada\n");
+        }
+    }
+
+    /* SHUT_WR / SHUT_RDWR: disable transmission, send FIN if appropriate */
+    if (how == 1 /* SHUT_WR */ || how == 2 /* SHUT_RDWR */) {
+        if ((pcb->flags & TCP_PCB_FLAG_SHUT_WR) == 0) {
+            pcb->flags |= TCP_PCB_FLAG_SHUT_WR;
+
+            if (pcb->state == TCP_ESTABLISHED || pcb->state == TCP_CLOSE_WAIT) {
+                /* Drain unsent data first */
+                if (pcb->tx_buf.unsent.head != 0) {
+                    mutex_unlock(&pcb->lock);
+                    tcp_drain_unsent(pcb);
+                    mutex_lock_preemptible(&pcb->lock);
+                }
+
+                if (pcb->tx_buf.unsent.head != 0) {
+                    /* Peer window or congestion prevented immediate complete draining.
+                     * Keep FIN pending until all earlier payload is drained. */
+                    pcb->flags |= TCP_PCB_FLAG_FIN_PENDING;
+                    klog("[TCP] shutdown(SHUT_WR): dados em unsent, FIN pendente marcado\n");
+                } else if ((pcb->flags & TCP_PCB_FLAG_FIN_PENDING) == 0) {
+                    int res = tcp_build_output_locked(pcb,
+                        (uint8_t)(TCP_FLAG_FIN | TCP_FLAG_ACK), 0, 0,
+                        packet, &packet_len, &remote_ip);
+                    if (res == 0) {
+                        if (pcb->state == TCP_ESTABLISHED) {
+                            pcb->state = TCP_FIN_WAIT1;
+                            klog("[TCP] shutdown(SHUT_WR): FIN -> FIN_WAIT1\n");
+                        } else {
+                            pcb->state = TCP_LAST_ACK;
+                            klog("[TCP] shutdown(SHUT_WR): FIN -> LAST_ACK\n");
+                        }
+                        pcb->timers.rto_ticks =
+                            (uint32_t)TCP_DATA_RTO_TICKS_DEFAULT;
+                        pcb->timers.retransmission =
+                            kernel_ticks + pcb->timers.rto_ticks;
+                        pcb->retransmission_timer =
+                            pcb->timers.retransmission;
+                        pcb->timers.retransmit_count = 0;
+                        pcb->flags |= TCP_PCB_FLAG_TIMER_RTO;
+                        send_fin = 1;
+                    }
+                }
+                need_notify = 1;
+            } else {
+                klog("[TCP] shutdown(SHUT_WR): escrita ja estava encerrando/encerrada\n");
+            }
+        }
+    }
+
+    void *sock = pcb->socket;
+    mutex_unlock(&pcb->lock);
+
+    if (send_fin) {
+        (void)net_send_ipv4(remote_ip, IP_PROTO_TCP, packet, packet_len);
+    }
+    if (need_notify && sock != 0) {
+        tcp_socket_notify(sock);
+    }
+    return 0;
+}
+
+int tcp_shutdown(struct tcp_pcb *pcb, int how)
+{
+    if (pcb == 0) {
+        return -1;
+    }
+    mutex_lock_preemptible(&pcb->lock);
+    return tcp_shutdown_locked(pcb, how);
 }
 
 int tcp_register(struct tcp_pcb *pcb)
@@ -1630,21 +1772,36 @@ int tcp_input(uint32_t src_ip, uint32_t dest_ip, const uint8_t *segment,
         if (payload_len != 0U) {
             if (TCP_SEQ_EQ(sequence, pcb->rcv_nxt)) {
                 /* In-order data */
-                size_t space = tcp_rx_buffer_free_space_locked(pcb);
-                size_t to_write = (payload_len < space) ? payload_len : space;
-                if (to_write > 0) {
-                    size_t written = tcp_rx_buffer_write_locked(pcb, payload, to_write);
-                    pcb->rcv_nxt += (uint32_t)written;
+                if ((pcb->flags & TCP_PCB_FLAG_SHUT_RD) != 0) {
+                    /* Read side is shut down locally: discard payload from application,
+                     * advance rcv_nxt and send ACK to maintain TCP protocol integrity. */
+                    pcb->rcv_nxt += (uint32_t)payload_len;
                     pcb->ack_number = pcb->rcv_nxt;
-                }
-                size_t free_sp = tcp_rx_buffer_free_space_locked(pcb);
-                pcb->window = (uint32_t)free_sp;
-                pcb->rcv_wnd = (uint16_t)(free_sp & 0xFFFFU);
+                    size_t free_sp = tcp_rx_buffer_free_space_locked(pcb);
+                    pcb->window = (uint32_t)free_sp;
+                    pcb->rcv_wnd = (uint16_t)(free_sp & 0xFFFFU);
 
-                send_out = 1;
-                (void)tcp_build_output_locked(pcb, TCP_FLAG_ACK, 0, 0, out_packet,
-                    &out_packet_len, &out_remote_ip);
-                klog("[TCP RX] In-order data armazenado no rx_buf, ACK transmitido\n");
+                    send_out = 1;
+                    (void)tcp_build_output_locked(pcb, TCP_FLAG_ACK, 0, 0, out_packet,
+                        &out_packet_len, &out_remote_ip);
+                    klog("[TCP RX] Data descartado apos SHUT_RD, ACK transmitido\n");
+                } else {
+                    size_t space = tcp_rx_buffer_free_space_locked(pcb);
+                    size_t to_write = (payload_len < space) ? payload_len : space;
+                    if (to_write > 0) {
+                        size_t written = tcp_rx_buffer_write_locked(pcb, payload, to_write);
+                        pcb->rcv_nxt += (uint32_t)written;
+                        pcb->ack_number = pcb->rcv_nxt;
+                    }
+                    size_t free_sp = tcp_rx_buffer_free_space_locked(pcb);
+                    pcb->window = (uint32_t)free_sp;
+                    pcb->rcv_wnd = (uint16_t)(free_sp & 0xFFFFU);
+
+                    send_out = 1;
+                    (void)tcp_build_output_locked(pcb, TCP_FLAG_ACK, 0, 0, out_packet,
+                        &out_packet_len, &out_remote_ip);
+                    klog("[TCP RX] In-order data armazenado no rx_buf, ACK transmitido\n");
+                }
             } else if (TCP_SEQ_LT(sequence, pcb->rcv_nxt)) {
                 /* Duplicate segment: drop payload, re-send ACK with current rcv_nxt */
                 size_t free_sp = tcp_rx_buffer_free_space_locked(pcb);
@@ -1699,13 +1856,21 @@ int tcp_input(uint32_t src_ip, uint32_t dest_ip, const uint8_t *segment,
         }
 
         if (payload_len != 0U && TCP_SEQ_EQ(sequence, pcb->rcv_nxt)) {
-            size_t space = tcp_rx_buffer_free_space_locked(pcb);
-            size_t to_write = (payload_len < space) ? payload_len : space;
-            if (to_write > 0) {
-                size_t written = tcp_rx_buffer_write_locked(pcb, payload, to_write);
-                pcb->rcv_nxt += (uint32_t)written;
+            if ((pcb->flags & TCP_PCB_FLAG_SHUT_RD) != 0) {
+                pcb->rcv_nxt += (uint32_t)payload_len;
                 pcb->ack_number = pcb->rcv_nxt;
+            } else {
+                size_t space = tcp_rx_buffer_free_space_locked(pcb);
+                size_t to_write = (payload_len < space) ? payload_len : space;
+                if (to_write > 0) {
+                    size_t written = tcp_rx_buffer_write_locked(pcb, payload, to_write);
+                    pcb->rcv_nxt += (uint32_t)written;
+                    pcb->ack_number = pcb->rcv_nxt;
+                }
             }
+            send_out = 1;
+            (void)tcp_build_output_locked(pcb, TCP_FLAG_ACK, 0, 0, out_packet,
+                &out_packet_len, &out_remote_ip);
         }
 
         if ((flags & TCP_FLAG_FIN) != 0U) {
@@ -1743,12 +1908,17 @@ int tcp_input(uint32_t src_ip, uint32_t dest_ip, const uint8_t *segment,
         }
     } else if (pcb->state == TCP_FIN_WAIT2) {
         if (payload_len != 0U && TCP_SEQ_EQ(sequence, pcb->rcv_nxt)) {
-            size_t space = tcp_rx_buffer_free_space_locked(pcb);
-            size_t to_write = (payload_len < space) ? payload_len : space;
-            if (to_write > 0) {
-                size_t written = tcp_rx_buffer_write_locked(pcb, payload, to_write);
-                pcb->rcv_nxt += (uint32_t)written;
+            if ((pcb->flags & TCP_PCB_FLAG_SHUT_RD) != 0) {
+                pcb->rcv_nxt += (uint32_t)payload_len;
                 pcb->ack_number = pcb->rcv_nxt;
+            } else {
+                size_t space = tcp_rx_buffer_free_space_locked(pcb);
+                size_t to_write = (payload_len < space) ? payload_len : space;
+                if (to_write > 0) {
+                    size_t written = tcp_rx_buffer_write_locked(pcb, payload, to_write);
+                    pcb->rcv_nxt += (uint32_t)written;
+                    pcb->ack_number = pcb->rcv_nxt;
+                }
             }
             send_out = 1;
             (void)tcp_build_output_locked(pcb, TCP_FLAG_ACK, 0, 0, out_packet,
@@ -1818,7 +1988,7 @@ int tcp_input(uint32_t src_ip, uint32_t dest_ip, const uint8_t *segment,
 
     int has_unsent = 0;
     if ((pcb->state == TCP_ESTABLISHED || pcb->state == TCP_CLOSE_WAIT) &&
-        pcb->tx_buf.unsent.head != 0) {
+        (pcb->tx_buf.unsent.head != 0 || (pcb->flags & TCP_PCB_FLAG_FIN_PENDING) != 0)) {
         has_unsent = 1;
     }
     socket = pcb->socket;
@@ -1919,6 +2089,10 @@ int tcp_receive_read(struct tcp_pcb *pcb, uint8_t *buffer, size_t length)
         return -1;
     }
     mutex_lock(&pcb->lock);
+    if ((pcb->flags & TCP_PCB_FLAG_SHUT_RD) != 0) {
+        mutex_unlock(&pcb->lock);
+        return 0;
+    }
     size_t read_bytes = tcp_rx_buffer_read_locked(pcb, buffer, length);
     size_t free_sp = tcp_rx_buffer_free_space_locked(pcb);
     pcb->window = (uint32_t)free_sp;
@@ -2094,9 +2268,39 @@ void tcp_drain_unsent(struct tcp_pcb *pcb)
     pcb->flags |= TCP_PCB_FLAG_DRAINING;
 
     for (;;) {
+        if (pcb->tx_buf.unsent.head == 0) {
+            if ((pcb->flags & TCP_PCB_FLAG_FIN_PENDING) != 0) {
+                pcb->flags &= ~TCP_PCB_FLAG_FIN_PENDING;
+                uint8_t fin_packet[TCP_HEADER_MIN_SIZE];
+                size_t fin_packet_len = 0;
+                uint32_t fin_remote_ip = 0;
+                int fin_res = tcp_build_output_locked(pcb,
+                    (uint8_t)(TCP_FLAG_FIN | TCP_FLAG_ACK), 0, 0,
+                    fin_packet, &fin_packet_len, &fin_remote_ip);
+                if (fin_res == 0) {
+                    if (pcb->state == TCP_ESTABLISHED) {
+                        pcb->state = TCP_FIN_WAIT1;
+                    } else if (pcb->state == TCP_CLOSE_WAIT) {
+                        pcb->state = TCP_LAST_ACK;
+                    }
+                    pcb->timers.rto_ticks = (uint32_t)TCP_DATA_RTO_TICKS_DEFAULT;
+                    pcb->timers.retransmission = kernel_ticks + pcb->timers.rto_ticks;
+                    pcb->retransmission_timer = pcb->timers.retransmission;
+                    pcb->timers.retransmit_count = 0;
+                    pcb->flags |= TCP_PCB_FLAG_TIMER_RTO;
+                    pcb->flags &= ~TCP_PCB_FLAG_DRAINING;
+                    mutex_unlock(&pcb->lock);
+                    (void)net_send_ipv4(fin_remote_ip, IP_PROTO_TCP, fin_packet, fin_packet_len);
+                    klog("[TCP TX] FIN pendente transmitido apos esvaziamento do unsent\n");
+                    break;
+                }
+            }
+            pcb->flags &= ~TCP_PCB_FLAG_DRAINING;
+            mutex_unlock(&pcb->lock);
+            break;
+        }
         if ((pcb->state != TCP_ESTABLISHED && pcb->state != TCP_CLOSE_WAIT) ||
-            (pcb->flags & TCP_PCB_FLAG_RESET) != 0 ||
-            pcb->tx_buf.unsent.head == 0) {
+            (pcb->flags & TCP_PCB_FLAG_RESET) != 0) {
             pcb->flags &= ~TCP_PCB_FLAG_DRAINING;
             mutex_unlock(&pcb->lock);
             break;
@@ -2298,8 +2502,8 @@ int tcp_send(struct tcp_pcb *pcb, const uint8_t *buffer, size_t len)
     size_t accepted = 0;
     while (accepted < len) {
         mutex_lock_preemptible(&pcb->lock);
-        if (pcb->state != TCP_ESTABLISHED ||
-            (pcb->flags & TCP_PCB_FLAG_RESET) != 0) {
+        if ((pcb->state != TCP_ESTABLISHED && pcb->state != TCP_CLOSE_WAIT) ||
+            (pcb->flags & (TCP_PCB_FLAG_RESET | TCP_PCB_FLAG_SHUT_WR)) != 0) {
             mutex_unlock(&pcb->lock);
             return accepted != 0 ? (int)accepted : -1;
         }
@@ -2331,8 +2535,8 @@ int tcp_send(struct tcp_pcb *pcb, const uint8_t *buffer, size_t len)
         tcp_copy(seg->data, buffer + accepted, requested);
 
         mutex_lock_preemptible(&pcb->lock);
-        if (pcb->state != TCP_ESTABLISHED ||
-            (pcb->flags & TCP_PCB_FLAG_RESET) != 0) {
+        if ((pcb->state != TCP_ESTABLISHED && pcb->state != TCP_CLOSE_WAIT) ||
+            (pcb->flags & (TCP_PCB_FLAG_RESET | TCP_PCB_FLAG_SHUT_WR)) != 0) {
             mutex_unlock(&pcb->lock);
             kfree(seg->data);
             kfree(seg);
@@ -3434,6 +3638,361 @@ void tcp_run_tests(void)
         }
 
         tcp_socket_destroy(cc_pcb);
+    }
+
+    /* Phase 2F Unit Tests: shutdown() and Half-Close Semantics */
+    {
+        /* Test 31: Shutdown Unconnected States */
+        tcp_pcb_t *shut_pcb = tcp_alloc();
+        int err_closed = tcp_shutdown(shut_pcb, 1);
+        shut_pcb->state = TCP_LISTEN;
+        int err_listen = tcp_shutdown(shut_pcb, 1);
+        shut_pcb->state = TCP_SYN_SENT;
+        int err_syn_sent = tcp_shutdown(shut_pcb, 1);
+        shut_pcb->state = TCP_SYN_RECEIVED;
+        int err_syn_rcvd = tcp_shutdown(shut_pcb, 1);
+        if (err_closed == -1 && err_listen == -1 && err_syn_sent == -1 && err_syn_rcvd == -1) {
+            klog("[TCP TEST] PASS: Shutdown Unconnected States (CLOSED, LISTEN, SYN_SENT, SYN_RECEIVED rejeitados com -1)\n");
+        } else {
+            klog("[TCP TEST] FAIL: Shutdown Unconnected States\n");
+        }
+
+        /* Test 32: Shutdown SHUT_RD Semantics */
+        shut_pcb->state = TCP_ESTABLISHED;
+        shut_pcb->local_ip = 0x0A00020F;
+        shut_pcb->remote_ip = 0x0A000202;
+        shut_pcb->local_port = 20001;
+        shut_pcb->remote_port = 80;
+        shut_pcb->iss = 1000;
+        shut_pcb->snd_nxt = 1001;
+        shut_pcb->snd_una = 1001;
+        shut_pcb->rcv_nxt = 5000;
+        uint8_t dummy_rx[11] = "ABCDEFGHIJ";
+        tcp_rx_buffer_write_locked(shut_pcb, dummy_rx, 10);
+        int had_data = (shut_pcb->rx_buf.used == 10);
+        int res_rd = tcp_shutdown(shut_pcb, 0 /* SHUT_RD */);
+        int rd_ok = (res_rd == 0 &&
+                     (shut_pcb->flags & TCP_PCB_FLAG_SHUT_RD) != 0 &&
+                     (shut_pcb->flags & TCP_PCB_FLAG_EOF) == 0 &&
+                     shut_pcb->rx_buf.used == 0 &&
+                     shut_pcb->state == TCP_ESTABLISHED);
+        if (had_data && rd_ok) {
+            klog("[TCP TEST] PASS: Shutdown SHUT_RD (dados RX descartados, EOF remoto preservado, estado ESTABLISHED mantido)\n");
+        } else {
+            klog("[TCP TEST] FAIL: Shutdown SHUT_RD\n");
+        }
+
+        /* Test 33: Shutdown SHUT_WR FIN Semantics */
+        uint32_t seq_before_fin = shut_pcb->snd_nxt;
+        int res_wr = tcp_shutdown(shut_pcb, 1 /* SHUT_WR */);
+        int wr_ok = (res_wr == 0 &&
+                     (shut_pcb->flags & TCP_PCB_FLAG_SHUT_WR) != 0 &&
+                     shut_pcb->state == TCP_FIN_WAIT1 &&
+                     shut_pcb->snd_nxt == seq_before_fin + 1U &&
+                     (shut_pcb->flags & TCP_PCB_FLAG_TIMER_RTO) != 0);
+        if (wr_ok) {
+            klog("[TCP TEST] PASS: Shutdown SHUT_WR (FIN transmitido, estado FIN_WAIT1, contabilidade +1 SEQ, RTO armado)\n");
+        } else {
+            klog("[TCP TEST] FAIL: Shutdown SHUT_WR\n");
+        }
+
+        /* Test 34: Shutdown Idempotence */
+        uint32_t seq_after_fin = shut_pcb->snd_nxt;
+        int res_wr_dup = tcp_shutdown(shut_pcb, 1 /* SHUT_WR */);
+        int res_rd_dup = tcp_shutdown(shut_pcb, 0 /* SHUT_RD */);
+        int idemp_ok = (res_wr_dup == 0 && res_rd_dup == 0 &&
+                        shut_pcb->snd_nxt == seq_after_fin &&
+                        shut_pcb->state == TCP_FIN_WAIT1);
+        if (idemp_ok) {
+            klog("[TCP TEST] PASS: Shutdown Idempotence (chamadas repetidas sem FIN duplicado indevido)\n");
+        } else {
+            klog("[TCP TEST] FAIL: Shutdown Idempotence\n");
+        }
+        tcp_socket_destroy(shut_pcb);
+
+        /* Test 35: Shutdown SHUT_WR Data Order Before FIN */
+        tcp_pcb_t *order_pcb = tcp_alloc();
+        order_pcb->state = TCP_ESTABLISHED;
+        order_pcb->local_ip = 0x0A00020F;
+        order_pcb->remote_ip = 0x0A000202;
+        order_pcb->local_port = 20002;
+        order_pcb->remote_port = 80;
+        order_pcb->iss = 2000;
+        order_pcb->snd_nxt = 2001;
+        order_pcb->snd_una = 2001;
+        order_pcb->rcv_nxt = 6000;
+        order_pcb->snd_wnd = 10000;
+        order_pcb->cwnd = 10000;
+        struct tcp_segment *data_seg = (struct tcp_segment *)kmalloc(sizeof(*data_seg));
+        if (data_seg != 0) {
+            data_seg->data = (uint8_t *)kmalloc(100);
+            data_seg->length = 100;
+            data_seg->offset = 0;
+            data_seg->sequence = 2001;
+            data_seg->sent_at = 0;
+            data_seg->retransmit_count = 0;
+            data_seg->next = 0;
+            tcp_queue_append_locked(&order_pcb->tx_buf.unsent, data_seg);
+        }
+        int unsent_before = (order_pcb->tx_buf.unsent.bytes == 100);
+        tcp_shutdown(order_pcb, 1 /* SHUT_WR */);
+        int order_ok = (order_pcb->tx_buf.unsent.bytes == 0 &&
+                        order_pcb->tx_buf.unacked.bytes == 100 &&
+                        order_pcb->snd_nxt == 2102 &&
+                        order_pcb->state == TCP_FIN_WAIT1);
+        if (unsent_before && order_ok) {
+            klog("[TCP TEST] PASS: Shutdown Data Precedes FIN (payload drenado ordenadamente antes do FIN)\n");
+        } else {
+            klog("[TCP TEST] FAIL: Shutdown Data Precedes FIN\n");
+        }
+        tcp_socket_destroy(order_pcb);
+
+        /* Test 36: Shutdown SHUT_RDWR Combined */
+        tcp_pcb_t *rdwr_pcb = tcp_alloc();
+        rdwr_pcb->state = TCP_ESTABLISHED;
+        rdwr_pcb->local_ip = 0x0A00020F;
+        rdwr_pcb->remote_ip = 0x0A000202;
+        rdwr_pcb->local_port = 20003;
+        rdwr_pcb->remote_port = 80;
+        rdwr_pcb->iss = 3000;
+        rdwr_pcb->snd_nxt = 3001;
+        rdwr_pcb->snd_una = 3001;
+        rdwr_pcb->rcv_nxt = 7000;
+        tcp_shutdown(rdwr_pcb, 2 /* SHUT_RDWR */);
+        int rdwr_ok = ((rdwr_pcb->flags & TCP_PCB_FLAG_SHUT_RD) != 0 &&
+                       (rdwr_pcb->flags & TCP_PCB_FLAG_SHUT_WR) != 0 &&
+                       rdwr_pcb->state == TCP_FIN_WAIT1 &&
+                       rdwr_pcb->snd_nxt == 3002);
+        if (rdwr_ok) {
+            klog("[TCP TEST] PASS: Shutdown SHUT_RDWR (ambas as direcoes encerradas, FIN transmitido)\n");
+        } else {
+            klog("[TCP TEST] FAIL: Shutdown SHUT_RDWR\n");
+        }
+        tcp_socket_destroy(rdwr_pcb);
+
+        /* Test 37: Shutdown and Close Coexistence */
+        tcp_pcb_t *close_pcb = tcp_alloc();
+        close_pcb->state = TCP_ESTABLISHED;
+        close_pcb->local_ip = 0x0A00020F;
+        close_pcb->remote_ip = 0x0A000202;
+        close_pcb->local_port = 20004;
+        close_pcb->remote_port = 80;
+        close_pcb->iss = 4000;
+        close_pcb->snd_nxt = 4001;
+        close_pcb->snd_una = 4001;
+        close_pcb->rcv_nxt = 8000;
+        tcp_shutdown(close_pcb, 1 /* SHUT_WR */);
+        uint32_t seq_after_shut = close_pcb->snd_nxt;
+        tcp_close(close_pcb);
+        int close_ok = (close_pcb->socket == 0 &&
+                        close_pcb->snd_nxt == seq_after_shut &&
+                        close_pcb->state == TCP_FIN_WAIT1);
+        if (close_ok) {
+            klog("[TCP TEST] PASS: Shutdown and Close Coexistence (close apos shutdown sem FIN espurio)\n");
+        } else {
+            klog("[TCP TEST] FAIL: Shutdown and Close Coexistence\n");
+        }
+        tcp_socket_destroy(close_pcb);
+
+        /* Test 38: Concurrent send() with shutdown(SHUT_WR) (Mandatory Scenario 1) */
+        tcp_pcb_t *c_pcb = tcp_alloc();
+        c_pcb->state = TCP_ESTABLISHED;
+        c_pcb->local_ip = 0x0A00020F;
+        c_pcb->remote_ip = 0x0A000202;
+        c_pcb->local_port = 20005;
+        c_pcb->remote_port = 80;
+        c_pcb->iss = 5000;
+        c_pcb->snd_nxt = 5001;
+        c_pcb->snd_una = 5001;
+        c_pcb->rcv_nxt = 9000;
+        c_pcb->snd_wnd = 10000;
+        c_pcb->cwnd = 10000;
+        int res_shut38 = tcp_shutdown(c_pcb, 1 /* SHUT_WR */);
+        uint32_t seq_after_shut38 = c_pcb->snd_nxt;
+        uint8_t payload38[64] = "CONCURRENT_DATA_AFTER_SHUT_WR";
+        int send_res38 = tcp_send(c_pcb, payload38, 30);
+        int test38_ok = (res_shut38 == 0 &&
+                         send_res38 == -1 &&
+                         c_pcb->snd_nxt == seq_after_shut38 &&
+                         c_pcb->tx_buf.unsent.head == 0 &&
+                         (c_pcb->flags & TCP_PCB_FLAG_SHUT_WR) != 0);
+        if (test38_ok) {
+            klog("[TCP TEST] PASS: Concurrent send() with shutdown(SHUT_WR) (rejeitado com -1, nenhum dado apos FIN)\n");
+        } else {
+            klog("[TCP TEST] FAIL: Concurrent send() with shutdown(SHUT_WR)\n");
+        }
+        tcp_socket_destroy(c_pcb);
+
+        /* Test 39: SHUT_WR with Pending Payload Exceeding Peer Window (Mandatory Scenario 2) */
+        tcp_pcb_t *wnd_pcb = tcp_alloc();
+        wnd_pcb->state = TCP_ESTABLISHED;
+        wnd_pcb->local_ip = 0x0A00020F;
+        wnd_pcb->remote_ip = 0x0A000202;
+        wnd_pcb->local_port = 20006;
+        wnd_pcb->remote_port = 80;
+        wnd_pcb->iss = 6000;
+        wnd_pcb->snd_nxt = 6001;
+        wnd_pcb->snd_una = 6001;
+        wnd_pcb->rcv_nxt = 9500;
+        wnd_pcb->snd_wnd = 100;
+        wnd_pcb->cwnd = 10000;
+        struct tcp_segment *wnd_seg = (struct tcp_segment *)kmalloc(sizeof(*wnd_seg));
+        if (wnd_seg != 0) {
+            wnd_seg->data = (uint8_t *)kmalloc(300);
+            wnd_seg->length = 300;
+            wnd_seg->offset = 0;
+            wnd_seg->sequence = 6001;
+            wnd_seg->sent_at = 0;
+            wnd_seg->retransmit_count = 0;
+            wnd_seg->next = 0;
+            tcp_queue_append_locked(&wnd_pcb->tx_buf.unsent, wnd_seg);
+        }
+        tcp_shutdown(wnd_pcb, 1 /* SHUT_WR */);
+        int test39_ok = (wnd_pcb->tx_buf.unacked.bytes == 100 &&
+                         wnd_pcb->tx_buf.unsent.bytes == 200 &&
+                         (wnd_pcb->flags & TCP_PCB_FLAG_FIN_PENDING) != 0 &&
+                         wnd_pcb->state == TCP_ESTABLISHED &&
+                         wnd_pcb->snd_nxt == 6101);
+        if (test39_ok) {
+            klog("[TCP TEST] PASS: SHUT_WR with Payload Exceeding Peer Window (FIN mantido pendente, unsent preservado)\n");
+        } else {
+            klog("[TCP TEST] FAIL: SHUT_WR with Payload Exceeding Peer Window\n");
+        }
+
+        /* Test 40: Peer Window Reopening Drains Payload Before FIN (Mandatory Scenario 3) */
+        tcp_tx_ack_received_locked(wnd_pcb, 6101);
+        wnd_pcb->snd_wnd = 500;
+        tcp_drain_unsent(wnd_pcb);
+        int test40_ok = (wnd_pcb->tx_buf.unsent.bytes == 0 &&
+                         wnd_pcb->tx_buf.unacked.bytes == 200 &&
+                         (wnd_pcb->flags & TCP_PCB_FLAG_FIN_PENDING) == 0 &&
+                         wnd_pcb->state == TCP_FIN_WAIT1 &&
+                         wnd_pcb->snd_nxt == 6302);
+        if (test40_ok) {
+            klog("[TCP TEST] PASS: Peer Window Reopening Drains Payload Before FIN (payload precede FIN com seq correta)\n");
+        } else {
+            klog("[TCP TEST] FAIL: Peer Window Reopening Drains Payload Before FIN\n");
+        }
+        tcp_socket_destroy(wnd_pcb);
+
+        /* Test 41: SHUT_RD Followed by In-Order Payload Then Remote FIN (Mandatory Scenario 5) */
+        tcp_pcb_t *rd_fin_pcb = tcp_alloc();
+        rd_fin_pcb->state = TCP_ESTABLISHED;
+        rd_fin_pcb->local_ip = htonl(0x0A00020FU);
+        rd_fin_pcb->remote_ip = htonl(0x0A000202U);
+        rd_fin_pcb->local_port = 7788;
+        rd_fin_pcb->remote_port = 55588;
+        rd_fin_pcb->iss = 7000;
+        rd_fin_pcb->snd_nxt = 7001;
+        rd_fin_pcb->snd_una = 7001;
+        rd_fin_pcb->rcv_nxt = 8000;
+        rd_fin_pcb->ack_number = 8000;
+        tcp_register(rd_fin_pcb);
+
+        tcp_shutdown(rd_fin_pcb, 0 /* SHUT_RD */);
+
+        /* In-order incoming DATA (seq=8000, len=5): discarded from rx_buf, rcv_nxt becomes 8005 */
+        uint8_t data41_pkt[TCP_HEADER_MIN_SIZE + 5];
+        struct tcp_header d41_hdr;
+        d41_hdr.src_port = 55588;
+        d41_hdr.dest_port = 7788;
+        d41_hdr.seq_num = 8000;
+        d41_hdr.ack_num = 7001;
+        d41_hdr.data_offset_flags = (5U << 12) | TCP_FLAG_ACK;
+        d41_hdr.window_size = 65535;
+        d41_hdr.checksum = 0;
+        d41_hdr.urgent_ptr = 0;
+        tcp_serialize_header(&d41_hdr, data41_pkt, sizeof(data41_pkt));
+        tcp_copy(data41_pkt + TCP_HEADER_MIN_SIZE, "HELLO", 5);
+        uint16_t d41_csum = tcp_checksum(htonl(0x0A000202U), htonl(0x0A00020FU), data41_pkt, sizeof(data41_pkt));
+        ((struct tcp_header *)data41_pkt)->checksum = htons(d41_csum);
+        int d41_res = tcp_input(htonl(0x0A000202U), htonl(0x0A00020FU), data41_pkt, sizeof(data41_pkt));
+
+        int data_discarded_ok = (d41_res == 0 &&
+                                 rd_fin_pcb->rcv_nxt == 8005 &&
+                                 rd_fin_pcb->rx_buf.used == 0 &&
+                                 rd_fin_pcb->state == TCP_ESTABLISHED &&
+                                 (rd_fin_pcb->flags & TCP_PCB_FLAG_EOF) == 0);
+
+        /* Out-of-order DATA (seq=8020 > rcv_nxt=8005): must NOT advance rcv_nxt */
+        d41_hdr.seq_num = 8020;
+        tcp_serialize_header(&d41_hdr, data41_pkt, sizeof(data41_pkt));
+        tcp_copy(data41_pkt + TCP_HEADER_MIN_SIZE, "WORLD", 5);
+        d41_csum = tcp_checksum(htonl(0x0A000202U), htonl(0x0A00020FU), data41_pkt, sizeof(data41_pkt));
+        ((struct tcp_header *)data41_pkt)->checksum = htons(d41_csum);
+        int ooo41_res = tcp_input(htonl(0x0A000202U), htonl(0x0A00020FU), data41_pkt, sizeof(data41_pkt));
+        int ooo_ok = (ooo41_res == 0 && rd_fin_pcb->rcv_nxt == 8005);
+
+        /* Remote FIN (seq=8005): advances rcv_nxt to 8006, sets EOF, enters CLOSE_WAIT */
+        uint8_t fin41_pkt[TCP_HEADER_MIN_SIZE];
+        struct tcp_header f41_hdr;
+        f41_hdr.src_port = 55588;
+        f41_hdr.dest_port = 7788;
+        f41_hdr.seq_num = 8005;
+        f41_hdr.ack_num = 7001;
+        f41_hdr.data_offset_flags = (5U << 12) | TCP_FLAG_ACK | TCP_FLAG_FIN;
+        f41_hdr.window_size = 65535;
+        f41_hdr.checksum = 0;
+        f41_hdr.urgent_ptr = 0;
+        tcp_serialize_header(&f41_hdr, fin41_pkt, sizeof(fin41_pkt));
+        uint16_t f41_csum = tcp_checksum(htonl(0x0A000202U), htonl(0x0A00020FU), fin41_pkt, sizeof(fin41_pkt));
+        ((struct tcp_header *)fin41_pkt)->checksum = htons(f41_csum);
+        int fin41_res = tcp_input(htonl(0x0A000202U), htonl(0x0A00020FU), fin41_pkt, sizeof(fin41_pkt));
+
+        int fin_ok = (fin41_res == 0 &&
+                      rd_fin_pcb->rcv_nxt == 8006 &&
+                      (rd_fin_pcb->flags & TCP_PCB_FLAG_EOF) != 0 &&
+                      rd_fin_pcb->state == TCP_CLOSE_WAIT);
+
+        if (data_discarded_ok && ooo_ok && fin_ok) {
+            klog("[TCP TEST] PASS: SHUT_RD Data Then Remote FIN (payload descartado, rcv_nxt consistente, FIN aceito -> CLOSE_WAIT)\n");
+        } else {
+            klog("[TCP TEST] FAIL: SHUT_RD Data Then Remote FIN\n");
+        }
+        tcp_socket_destroy(rd_fin_pcb);
+
+        /* Test 42: SHUT_RDWR Followed by Close with Shared Descriptors (Mandatory Scenario 7) */
+        tcp_pcb_t *shared_pcb = tcp_alloc();
+        shared_pcb->state = TCP_ESTABLISHED;
+        shared_pcb->local_ip = 0x0A00020F;
+        shared_pcb->remote_ip = 0x0A000202;
+        shared_pcb->local_port = 20008;
+        shared_pcb->remote_port = 80;
+        shared_pcb->iss = 8000;
+        shared_pcb->snd_nxt = 8001;
+        shared_pcb->snd_una = 8001;
+        shared_pcb->rcv_nxt = 9000;
+
+        vfs_node_t *dummy_node = kmalloc(sizeof(*dummy_node));
+        if (dummy_node != 0) {
+            tcp_zero(dummy_node, sizeof(*dummy_node));
+            dummy_node->type = VFS_NODE_SOCKET;
+            dummy_node->ref_count = 1;
+
+            file_description_t *shared_fdesc = file_description_alloc(dummy_node, 0);
+            if (shared_fdesc != 0) {
+                file_description_ref(shared_fdesc); /* simulate fork/dup: ref_count = 2 */
+
+                int res_shut42 = tcp_shutdown(shared_pcb, 2 /* SHUT_RDWR */);
+
+                /* First close (simulate parent close) */
+                file_description_unref(shared_fdesc); /* ref_count drops to 1 */
+                int first_close_ok = (shared_fdesc->ref_count == 1 &&
+                                      shared_pcb->state == TCP_FIN_WAIT1 &&
+                                      (shared_pcb->flags & TCP_PCB_FLAG_SHUT_RD) != 0 &&
+                                      (shared_pcb->flags & TCP_PCB_FLAG_SHUT_WR) != 0);
+
+                /* Second close (simulate child close) */
+                file_description_unref(shared_fdesc); /* ref_count drops to 0, frees fdesc */
+
+                if (res_shut42 == 0 && first_close_ok) {
+                    klog("[TCP TEST] PASS: SHUT_RDWR with Shared Descriptors fork/dup (refcount preserva ciclo de vida sem double-free)\n");
+                } else {
+                    klog("[TCP TEST] FAIL: SHUT_RDWR with Shared Descriptors fork/dup\n");
+                }
+            }
+        }
+        tcp_socket_destroy(shared_pcb);
     }
 
     klog("[TCP TEST] Finalizada Suite de Testes TCP.\n");
