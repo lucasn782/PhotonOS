@@ -39,8 +39,11 @@ O shell implementa nativamente as seguintes funcionalidades de conveniência:
 *   **`write [arquivo] [conteúdo]`**: Cria ou abre o arquivo e grava o texto fornecido.
 *   **`yield`**: Abre mão voluntariamente do timeslice da CPU via `SYS_YIELD` (`19`).
 *   **`fork`**: Testa a clonagem de processos executando um fork interno.
-*   **`exec [programa]`**: Substitui a imagem do shell pelo novo programa ELF de usuário (`SYS_EXECVE`).
 *   **`exit`**: Termina a execução do shell.
+
+### Execução de programas externos
+
+Uma linha iniciada por caminho absoluto (por exemplo, `/bin/argprobe`) é dividida em argumentos. Aspas simples/duplas preservam espaços e `""` produz um argumento vazio; barra invertida escapa o próximo caractere. O shell faz `fork()`, chama `execve(path, argv, environ)` no filho e aguarda o filho em primeiro plano. Com `&`, registra o filho em background. O parser não expande variáveis nem procura programas em `PATH`. Consulte [execve_argv_env.md](execve_argv_env.md).
 
 ---
 
@@ -55,26 +58,14 @@ O shell intercepta o caractere `>` para redirecionar a saída padrão (`stdout`)
 
 ---
 
-## 4. Pipeline de Processos (Pipe `|`)
+## 4. Pipeline de E/S (Pipe `|`)
 
 > [!IMPORTANT]
-> **Pipeline de Processos Multitarefa:**
-> O shell suporta a sintaxe `comando1 | comando2` para criar canais de comunicação IPC anônimos de fluxo unilateral entre dois processos Ring 3 independentes.
+> **Pipe sequencial:**
+> O shell conecta a saída do comando esquerdo à entrada do comando direito usando um pipe anônimo. O comando esquerdo é executado inline; filtros como `upper` e `rev` são iniciados pelo caminho de spawn existente.
 
 O fluxo de processamento de um pipe (`|`) envolve:
 1.  **Criação do Pipe**: O shell invoca `SYS_PIPE(pipefds)` (`8`), obtendo dois descritores: `pipefds[0]` (leitura) e `pipefds[1]` (escrita).
-2.  **Primeiro Fork (Comando Esquerdo)**:
-    *   Bifurca o processo chamando `SYS_FORK`.
-    *   No processo filho (esquerdo):
-        *   Redireciona `stdout` (descritor `1`) para o lado de escrita do pipe (`pipefds[1]`) usando `SYS_DUP2`.
-        *   Fecha as pontes não utilizadas do pipe.
-        *   Invoca o comando esquerdo via `SYS_EXECVE`.
-3.  **Segundo Fork (Comando Direito)**:
-    *   Bifurca novamente o shell.
-    *   No processo filho (direito):
-        *   Redireciona `stdin` (descritor `0`) para o lado de leitura do pipe (`pipefds[0]`) usando `SYS_DUP2`.
-        *   Fecha as pontes não utilizadas.
-        *   Invoca o comando direito via `SYS_EXECVE`.
-4.  **Sincronização no Pai**:
-    *   O shell original (pai) fecha ambos os lados do pipe (`pipefds[0]` e `pipefds[1]`) em seu próprio espaço de endereçamento.
-    *   Invoca `SYS_WAIT` sobre ambos os PIDs filhos para garantir que o prompt só retorne ao usuário após a conclusão de todo o pipeline.
+2.  **Saída do lado esquerdo**: duplica `stdout` para `pipefds[1]` e executa o comando esquerdo inline.
+3.  **Entrada do lado direito**: restaura `stdout`, conecta `stdin` a `pipefds[0]` e executa o filtro ou comando direito.
+4.  **Restauração**: fecha as pontas do pipe e restaura `stdin` e `stdout` originais.

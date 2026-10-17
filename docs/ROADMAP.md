@@ -161,10 +161,14 @@ Este documento descreve o estado atual do desenvolvimento do PhotonOS, dividindo
 ### Preparação do Espaço de Usuário e Aplicações de Rede
 - Transição dos marcos de transporte TCP para serviços de rede em Ring 3 e expansão do suporte a processos.
 
-## 🔵 Planejado
+## ✅ Concluído
 
 ### Espaço de Usuário Avançado (v4.5)
-- **Suporte a Execução de Scripts ELF Avançados e Variáveis de Ambiente:** Expansão da ulibc e suporte a argumentos e variáveis de ambiente no `sys_execve`.
+- **`argv`/`envp` e `execve()` transacional:** cópia e validação dos vetores, montagem da pilha ELF, substituição do espaço de endereço sem destruir o chamador em falhas, `environ`/`getenv()`, startup para `main(argc, argv, envp)` e lançamento de filhos pelo shell.
+- **Validação:** suíte dedicada QEMU aprovada; TCP Phase 2A–2H, 10 boots, VFS, sinais/pipes/SMP e Phase 7 aprovados.
+- **Tamanho:** `build/photon.bin` em 179.660 bytes (margem de 66.100 bytes até 245.760).
+
+## 🔵 Planejado
 
 ### Sincronização e IPC (v4.6)
 - **Semáforos e Variáveis de Condição:** Sincronização avançada no escalonador para bloqueio e desbloqueio eficiente de threads.

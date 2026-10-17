@@ -25,9 +25,14 @@ extern const uint8_t _binary_spin_elf_start[];
 extern const uint8_t _binary_spin_elf_end[];
 extern const uint8_t _binary_ping_elf_start[];
 extern const uint8_t _binary_ping_elf_end[];
+extern const uint8_t _binary_argprobe_elf_start[];
+extern const uint8_t _binary_argprobe_elf_end[];
+extern const uint8_t _binary_execvetest_elf_start[];
+extern const uint8_t _binary_execvetest_elf_end[];
 
 static const uint8_t readme_txt[] =
     "PhotonOS initrd: kmalloc, VFS e sys_read ativos.\n";
+static const uint8_t truncated_elf[] = { 0x7F, 'E', 'L', 'F', 2, 1, 1, 0 };
 
 static const struct initrd_file initrd_files[] = {
     { "readme.txt", readme_txt, sizeof(readme_txt) - 1 },
@@ -38,6 +43,9 @@ static const struct initrd_file initrd_files[] = {
     { "bin/hang", _binary_hang_elf_start, 0 },
     { "bin/spin", _binary_spin_elf_start, 0 },
     { "bin/ping", _binary_ping_elf_start, 0 },
+    { "bin/argprobe", _binary_argprobe_elf_start, 0 },
+    { "bin/execvetest", _binary_execvetest_elf_start, 0 },
+    { "bin/badelf", truncated_elf, sizeof(truncated_elf) },
 };
 
 static int initrd_read(vfs_node_t *node, uint64_t offset, uint32_t size,
@@ -110,6 +118,14 @@ void initrd_init(void)
             initrd_files[i].data == _binary_ping_elf_start) {
             node->size = (size_t)(_binary_ping_elf_end -
                 _binary_ping_elf_start);
+        } else if (node->size == 0 &&
+            initrd_files[i].data == _binary_argprobe_elf_start) {
+            node->size = (size_t)(_binary_argprobe_elf_end -
+                _binary_argprobe_elf_start);
+        } else if (node->size == 0 &&
+            initrd_files[i].data == _binary_execvetest_elf_start) {
+            node->size = (size_t)(_binary_execvetest_elf_end -
+                _binary_execvetest_elf_start);
         }
         node->read = initrd_read;
     }

@@ -816,9 +816,9 @@ static void scheduler_terminate_task_unlocked(task_t *task, int status)
     task->pending_signals = 0;
     task->active_signal = 0;
     task_close_all_fds(task);
-    release_user_pages(task);
     vmm_destroy_address_space((uint64_t *)exited_cr3);
     task->cr3 = (uint64_t)vmm_kernel_pml4();
+    task->user_page_count = 0;
 
     /* Reparent children to PID 1 (shell / init) */
     for (uint32_t i = 0; i < task_count; i++) {

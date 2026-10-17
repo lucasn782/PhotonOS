@@ -16,6 +16,8 @@ copy_with_mtools() {
     mcopy -i "$DISK_IMG" -o "$USER_DIR/spin.elf" ::spin || return 1
     mcopy -i "$DISK_IMG" -o "$USER_DIR/ping.elf" ::ping || return 1
     mcopy -i "$DISK_IMG" -o "$USER_DIR/tcptest.elf" ::tcptest || return 1
+    mcopy -i "$DISK_IMG" -o "$USER_DIR/argprobe.elf" ::argprobe || return 1
+    mcopy -i "$DISK_IMG" -o "$USER_DIR/execvetest.elf" ::execvetest || return 1
 }
 
 copy_with_mount() {
@@ -32,7 +34,9 @@ copy_with_mount() {
         ! sudo cp "$USER_DIR/hang.elf" "$MOUNT_DIR/hang" ||
         ! sudo cp "$USER_DIR/spin.elf" "$MOUNT_DIR/spin" ||
         ! sudo cp "$USER_DIR/ping.elf" "$MOUNT_DIR/ping" ||
-        ! sudo cp "$USER_DIR/tcptest.elf" "$MOUNT_DIR/tcptest"; then
+        ! sudo cp "$USER_DIR/tcptest.elf" "$MOUNT_DIR/tcptest" ||
+        ! sudo cp "$USER_DIR/argprobe.elf" "$MOUNT_DIR/argprobe" ||
+        ! sudo cp "$USER_DIR/execvetest.elf" "$MOUNT_DIR/execvetest"; then
         sudo umount "$MOUNT_DIR" >/dev/null 2>&1 || true
         trap - EXIT
         return 1
@@ -62,7 +66,9 @@ create_with_python() {
         "$USER_DIR/hang.elf":hang \
         "$USER_DIR/spin.elf":spin \
         "$USER_DIR/ping.elf":ping \
-        "$USER_DIR/tcptest.elf":tcptest <<'PY'
+        "$USER_DIR/tcptest.elf":tcptest \
+        "$USER_DIR/argprobe.elf":argprobe \
+        "$USER_DIR/execvetest.elf":execvetest <<'PY'
 import math
 import struct
 import sys

@@ -1406,64 +1406,6 @@ static int sys_spawn(const char *path)
     return pid;
 }
 
-static int sys_execve(const char *path, const char *const *argv,
-    const char *const *envp)
-{
-    (void)envp;
-    task_t *task = scheduler_current_task();
-    if (task == 0) {
-        return -1;
-    }
-
-    char exec_path[128];
-    if (copy_user_path(exec_path, path, sizeof(exec_path)) != 0) {
-        return -1;
-    }
-
-    char command[256];
-    size_t cmd_len = 0;
-
-    for (size_t i = 0; exec_path[i] != '\0' && cmd_len < sizeof(command) - 2U; i++) {
-        command[cmd_len++] = exec_path[i];
-    }
-
-    if (argv != 0) {
-        for (size_t argi = 1; cmd_len < sizeof(command) - 2U; argi++) {
-            if (!vmm_is_mapped((uint64_t *)task->cr3, (uintptr_t)&argv[argi])) {
-                break;
-            }
-
-            const char *arg = argv[argi];
-            if (arg == 0) {
-                break;
-            }
-
-            if (!vmm_is_mapped((uint64_t *)task->cr3, (uintptr_t)arg)) {
-                break;
-            }
-
-            command[cmd_len++] = ' ';
-
-            char arg_buf[64];
-            if (copy_user_path(arg_buf, arg, sizeof(arg_buf)) != 0) {
-                break;
-            }
-
-            for (size_t j = 0; arg_buf[j] != '\0' && cmd_len < sizeof(command) - 1U; j++) {
-                command[cmd_len++] = arg_buf[j];
-            }
-        }
-    }
-
-    command[cmd_len] = '\0';
-
-    vmm_switch_address_space(vmm_kernel_pml4());
-    int pid = elf_load_process(command, 0);
-    vmm_switch_address_space((uint64_t *)task->cr3);
-
-    return pid;
-}
-
 static int sys_exit(int status)
 {
     scheduler_exit_current(status);
@@ -2012,9 +1954,8 @@ uint64_t syscall_handler(uint64_t number, uint64_t arg1, uint64_t arg2,
         ret = (uint64_t)sys_readdir((int)arg1, (vfs_dir_entry_t *)arg2, (uint32_t)arg3);
     }
     else if (number == SYS_EXECVE) {
-        if (!vmm_validate_user_string((const char *)arg1, 256)) return (uint64_t)-1;
-        ret = (uint64_t)sys_execve((const char *)arg1, (const char *const *)arg2,
-            (const char *const *)arg3);
+        ret = (uint64_t)elf_exec_current((const char *)arg1,
+            (const char *const *)arg2, (const char *const *)arg3, arg6);
     }
     else if (number == SYS_FORK) {
         ret = (uint64_t)sys_fork(arg6);

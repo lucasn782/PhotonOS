@@ -342,9 +342,15 @@ Este documento serve como o mapa central da documentação técnica do PhotonOS 
 *   **Dependências**: VMM, PMM, VFS.
 *   **Público-Alvo**: Engenheiros de kernel e compiladores.
 
-### 6.4. [programs.md](userspace/programs.md)
+### 6.4. [execve_argv_env.md](userspace/execve_argv_env.md)
+*   **Descrição**: ABI de argumentos e ambiente na execução ELF.
+*   **Objetivo**: Documentar a substituição transacional de imagem, limites, pilha inicial, wrappers `execve()`/`getenv()` e testes QEMU.
+*   **Dependências**: ELF loader, VMM, scheduler e ulibc.
+*   **Público-Alvo**: Desenvolvedores do kernel e de aplicações C.
+
+### 6.5. [programs.md](userspace/programs.md)
 *   **Descrição**: Catálogo de programas Ring 3 em disco.
-*   **Objetivo**: Catalogar os binários `shell`, `ping`, `hello`, `hang`, `upper`, `rev`, `spin` e `tcptest`, detalhando seu código de teste e casos de validação.
+*   **Objetivo**: Catalogar os binários `shell`, `ping`, `hello`, `hang`, `upper`, `rev`, `spin`, `tcptest`, `argprobe` e `execvetest`, detalhando seu código de teste e casos de validação.
 *   **Dependências**: ulibc.
 *   **Público-Alvo**: Desenvolvedores e usuários finais.
 

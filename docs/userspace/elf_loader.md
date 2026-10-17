@@ -1,5 +1,7 @@
 # ELF Loader (Executable and Linkable Format)
 
+Para a ABI de `execve(path, argv, envp)`, incluindo limites de entrada, pilha, ulibc e transição atômica, consulte [execve_argv_env.md](execve_argv_env.md).
+
 Este documento especifica a implementação do carregador de binários ELF64 no kernel do PhotonOS (`src/kernel/elf.c`), abrangendo a validação de cabeçalhos, mapeamento de segmentos em memória, o trampolim de retorno de sinal e a otimização de compactação do linker.
 
 ---
@@ -38,16 +40,16 @@ Uma vez validado o cabeçalho, o carregador lê a tabela de cabeçalhos de progr
 Após carregar todos os segmentos:
 *   **Pilha de Usuário**: O carregador aloca 4 páginas de pilha de usuário em alta memória terminando em:
     ```
-    #define ELF_USER_STACK_TOP 0x0000008000010000ULL
+    #define ELF_USER_STACK_TOP 0x0000008000800000ULL
     ```
     As páginas são mapeadas como presentes, graváveis e acessíveis pelo usuário.
-*   **Trampolim de Sinais**: Uma página especial é mapeada em `0x0000008000008000` contendo o código de trampolim de retorno de sinal:
+*   **Trampolim de Sinais**: Uma página especial é mapeada em `0x0000008000700000` contendo o código de trampolim de retorno de sinal:
     ```nasm
     mov rax, 12   ; SYS_SIGRETURN
     syscall
     ```
     Este código é executado em Ring 3 para restaurar o contexto de registradores após o término de um handler de sinal.
-*   **Ponto de Entrada**: O kernel carrega o valor `e_entry` do cabeçalho ELF no registrador RIP e o topo da pilha em RSP no contexto da tarefa antes de ceder o controle à CPU para iniciar a execução em Ring 3.
+*   **Ponto de Entrada**: Em `execve`, o kernel configura RIP=`e_entry`, RDI=`argc`, RSI=`argv`, RDX=`envp` e RSP para o bloco inicial alinhado da pilha. `SYS_SPAWN` ainda suporta a convenção histórica de string única para compatibilidade com binários legados.
 
 ---
 

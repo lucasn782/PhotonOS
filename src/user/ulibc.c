@@ -68,6 +68,8 @@
 
 #define PRINTF_BUF_SIZE 2048
 
+char **environ;
+
 static inline long _syscall(long num, long a1, long a2, long a3, long a4, long a5, long a6)
 {
     long ret;
@@ -439,6 +441,23 @@ int close(int fd)
 int fork(void)
 {
     return (int)_syscall(SYS_FORK, 0, 0, 0, 0, 0, 0);
+}
+
+int execve(const char *path, char *const argv[], char *const envp[])
+{
+    return (int)syscall3(SYS_EXECVE, (long)path, (long)argv, (long)envp);
+}
+
+char *getenv(const char *name)
+{
+    if (name == 0 || name[0] == '\0' || environ == 0) return 0;
+    size_t name_len = strlen(name);
+    for (size_t i = 0; environ[i] != 0; i++) {
+        size_t j = 0;
+        while (j < name_len && environ[i][j] == name[j]) j++;
+        if (j == name_len && environ[i][j] == '=') return &environ[i][j + 1U];
+    }
+    return 0;
 }
 
 void exit(int status)

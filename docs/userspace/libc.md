@@ -95,10 +95,14 @@ A ulibc fornece aos programas as seguintes APIs de sistema portáveis:
 
 ### Processos e Controle
 *   `int fork(void)`
+*   `int execve(const char *path, char *const argv[], char *const envp[])` — substitui a imagem atual; retorna `-1` em falha e não retorna em sucesso.
+*   `extern char **environ` e `char *getenv(const char *name)` — inicializados por `src/user/crt0.c` para programas com `main(argc, argv, envp)`.
 *   `void exit(int status)`
 *   `void yield(void)`
 *   `uint64_t get_ticks(void)`
 *   `int getprocs(proc_info_t *buffer, size_t max_size)`
+
+O kernel usa exatamente o ambiente passado em `envp`; passe `environ` para herdar as variáveis do processo atual. Consulte [execve_argv_env.md](execve_argv_env.md) para limites e ABI da pilha.
 
 ### Sinais
 *   `sighandler_t signal(int signum, sighandler_t handler)`

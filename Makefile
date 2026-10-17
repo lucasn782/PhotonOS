@@ -23,6 +23,10 @@ USER_PING_ELF := build/user/ping.elf
 USER_PING_OBJ := build/user/ping_blob.o
 USER_TCPTEST_ELF := build/user/tcptest.elf
 USER_TCPTEST_OBJ := build/user/tcptest_blob.o
+USER_ARGPROBE_ELF := build/user/argprobe.elf
+USER_ARGPROBE_OBJ := build/user/argprobe_blob.o
+USER_EXECVETEST_ELF := build/user/execvetest.elf
+USER_EXECVETEST_OBJ := build/user/execvetest_blob.o
 IMG := build/photon.img
 DISK_IMG := build/disk.img
 FLOPPY_BYTES := 1474560
@@ -35,7 +39,7 @@ KERNEL_OBJS := build/boot/kernel_asm.o build/user/shell_blob.o build/user/hello_
                build/kernel/vfs.o build/kernel/initrd.o build/kernel/elf.o build/kernel/net.o build/kernel/tcp.o build/drivers/fat16.o \
                build/drivers/ata.o build/drivers/pci.o build/drivers/e1000.o \
                build/kernel/apic.o build/kernel/smp.o build/kernel/trampoline_blob.o \
-               build/kernel/bcache.o build/fs/ext2.o
+               build/kernel/bcache.o build/fs/ext2.o build/user/argprobe_blob.o build/user/execvetest_blob.o
 
 CFLAGS := -Os -ffreestanding -m64 -nostdlib -mno-red-zone -mno-sse -mno-mmx -fno-pic -fno-pie \
           -fstack-protector-strong -Wall -Wextra -Iinclude
@@ -205,6 +209,30 @@ $(USER_TCPTEST_ELF): build/user/tcptest.o build/user/ulibc.o
 $(USER_TCPTEST_OBJ): $(USER_TCPTEST_ELF)
 	cd build/user && $(LD) -r -b binary $(notdir $(USER_TCPTEST_ELF)) -o $(notdir $(USER_TCPTEST_OBJ))
 
+build/user/crt0.o: src/user/crt0.c include/ulibc.h
+	@mkdir -p $(dir $@) && $(CC) $(USER_CFLAGS) -c $< -o $@
+
+build/user/crt0_entry.o: src/user/crt0.S
+	@mkdir -p $(dir $@) && $(CC) -c $< -o $@
+
+build/user/argprobe.o: src/user/argprobe.c include/ulibc.h
+	@mkdir -p $(dir $@) && $(CC) $(USER_CFLAGS) -c $< -o $@
+
+$(USER_ARGPROBE_ELF): build/user/argprobe.o build/user/crt0_entry.o build/user/crt0.o build/user/ulibc.o
+	@mkdir -p $(dir $@) && $(LD) $(USER_LDFLAGS) $^ -o $@
+
+$(USER_ARGPROBE_OBJ): $(USER_ARGPROBE_ELF)
+	cd build/user && $(LD) -r -b binary $(notdir $(USER_ARGPROBE_ELF)) -o $(notdir $(USER_ARGPROBE_OBJ))
+
+build/user/execvetest.o: src/user/execvetest.c include/ulibc.h
+	@mkdir -p $(dir $@) && $(CC) $(USER_CFLAGS) -c $< -o $@
+
+$(USER_EXECVETEST_ELF): build/user/execvetest.o build/user/crt0_entry.o build/user/crt0.o build/user/ulibc.o
+	@mkdir -p $(dir $@) && $(LD) $(USER_LDFLAGS) $^ -o $@
+
+$(USER_EXECVETEST_OBJ): $(USER_EXECVETEST_ELF)
+	cd build/user && $(LD) -r -b binary $(notdir $(USER_EXECVETEST_ELF)) -o $(notdir $(USER_EXECVETEST_OBJ))
+
 $(KERNEL_ELF): $(KERNEL_OBJS) linker.ld
 	$(LD) $(LDFLAGS) $(KERNEL_OBJS) -o $@
 
@@ -219,7 +247,7 @@ $(IMG): $(BOOT_BIN) $(KERNEL_BIN)
 run: $(IMG)
 	qemu-system-x86_64 -smp 4 -serial stdio -drive format=raw,file=$(IMG)
 
-fat16-disk: $(USER_SHELL_ELF) $(USER_HELLO_ELF) $(USER_UPPER_ELF) $(USER_REV_ELF) $(USER_HANG_ELF) $(USER_SPIN_ELF) $(USER_PING_ELF) $(USER_TCPTEST_ELF)
+fat16-disk: $(USER_SHELL_ELF) $(USER_HELLO_ELF) $(USER_UPPER_ELF) $(USER_REV_ELF) $(USER_HANG_ELF) $(USER_SPIN_ELF) $(USER_PING_ELF) $(USER_TCPTEST_ELF) $(USER_ARGPROBE_ELF) $(USER_EXECVETEST_ELF)
 	DISK_IMG=$(DISK_IMG) USER_DIR=build/user bash scripts/create_fat16_disk.sh
 
 run-fat16: $(IMG) fat16-disk

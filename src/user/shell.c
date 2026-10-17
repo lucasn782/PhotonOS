@@ -21,7 +21,6 @@
 #define SYS_DUP2 14
 #define SYS_CLOSE 15
 #define SYS_LIST 16
-#define SYS_EXECVE 22
 #define SYS_FORK   23
 #define SIGINT 2
 
@@ -74,23 +73,6 @@ static long syscall3(long number, long arg1, long arg2, long arg3)
         "syscall"
         : "=a"(ret)
         : "a"(number), "D"(arg1), "S"(arg2), "d"(arg3)
-        : "rcx", "r11", "memory");
-    return ret;
-}
-
-/*
- * syscall_execve - Chama sys_execve(path, argv, envp) via syscall de 3 args.
- * argv deve ser um vetor de ponteiros terminado em NULL (Ring 3).
- */
-static long syscall_execve(const char *path, const char *const *argv,
-    const char *const *envp)
-{
-    long ret;
-    __asm__ volatile (
-        "syscall"
-        : "=a"(ret)
-        : "a"((long)SYS_EXECVE), "D"((long)path), "S"((long)argv),
-          "d"((long)envp)
         : "rcx", "r11", "memory");
     return ret;
 }
@@ -617,45 +599,55 @@ static void command_program(const char *path, int is_background)
  */
 static void command_execve(char *line, int is_background)
 {
-    /*
-     * O kernel em sys_execve concatena argv ao path internamente.
-     * Para manter a interface simples, passamos apenas path + argv[1]
-     * usando o mecanismo ja existente de spawn com espaco.
-     * argv[0] = path, argv[1] = resto da linha apos o espaco.
-     */
-    char *path = line;
-    char *args = 0;
-
-    /* Separa path e argumentos pelo primeiro espaco. */
-    for (size_t i = 0; line[i] != '\0'; i++) {
-        if (line[i] == ' ') {
-            line[i] = '\0';
-            args = line + i + 1;
-            break;
+    char *argv[17];
+    size_t argc = 0;
+    char *read = line;
+    char *write = line;
+    while (*read != '\0') {
+        while (*read == ' ' || *read == '\t') read++;
+        if (*read == '\0') break;
+        if (argc == 16) {
+            write_str("execve: limite de argumentos excedido\n");
+            return;
         }
+        argv[argc++] = write;
+        char quote = 0;
+        while (*read != '\0') {
+            char ch = *read++;
+            if (quote != 0) {
+                if (ch == quote) { quote = 0; continue; }
+            } else if (ch == '\'' || ch == '"') {
+                quote = ch;
+                continue;
+            } else if (ch == ' ' || ch == '\t') {
+                break;
+            }
+            if (ch == '\\' && *read != '\0') ch = *read++;
+            *write++ = ch;
+        }
+        if (quote != 0) {
+            write_str("execve: aspas sem fechamento\n");
+            return;
+        }
+        *write++ = '\0';
     }
-
-    /* Monta argv[] no stack: argv[0]=path, argv[1]=args (opcional), NULL. */
-    const char *argv[3];
-    int argc = 0;
-    argv[argc++] = path;
-    if (args != 0 && args[0] != '\0') {
-        argv[argc++] = args;
-    }
-    argv[argc] = 0; /* Sentinela NULL. */
-
-    long pid = syscall_execve(path, argv, 0);
-
+    if (argc == 0) return;
+    argv[argc] = 0;
+    long pid = fork();
     if (pid < 0) {
-        write_str("execve: falha ao executar binario\n");
+        write_str("execve: fork falhou\n");
         return;
     }
-
-    if (is_background) {
-        announce_background(pid);
-    } else {
-        wait_pid(pid);
+    if (pid == 0) {
+        if (execve(argv[0], argv, environ) < 0) {
+            write_str("execve: falha ao substituir a imagem do processo\n");
+            syscall1(SYS_EXIT, 127);
+        }
+        for (;;) {}
     }
+    if (is_background) announce_background(pid);
+    else wait_pid(pid);
+    return;
 }
 
 static void command_ping(char *arg, int is_background)
@@ -1930,9 +1922,12 @@ static void sigint_handler(int signum)
     write_str("\n[SIGINT recebido no Shell!]\n");
 }
 
-void _start(void)
+void _start(uint64_t argc, char **argv, char **envp)
 {
     char line[80];
+    (void)argc;
+    (void)argv;
+    environ = envp;
 
     syscall2(SYS_SIGNAL, SIGINT, (long)sigint_handler);
 

@@ -6,7 +6,9 @@ Este documento cataloga os programas de espaço de usuário distribuídos com o 
 
 ## 1. Visão Geral
 
-Todos os programas de usuário residem em `src/user/` e são compilados como binários ELF64 estáticos linkados com a flag `-N` (OMAGIC) para compactação. Cada programa define seu ponto de entrada em `_start()` e comunica-se com o kernel exclusivamente via instruções `syscall`. Programas que usam funcionalidades avançadas (como `malloc`, `printf`, `signal`) linkam contra a `ulibc` (`src/user/ulibc.c`).
+Todos os programas de usuário residem em `src/user/` e são compilados como binários ELF64 estáticos linkados com a flag `-N` (OMAGIC) para compactação. Programas legados definem seu ponto de entrada em `_start()`; aplicações com `main(argc, argv, envp)` ligam `src/user/crt0.c`. Programas que usam funcionalidades avançadas (como `malloc`, `printf`, `signal`) linkam contra a `ulibc` (`src/user/ulibc.c`).
+
+`argprobe` e `execvetest` exercitam a ABI de argumentos, ambiente e `execve()`; detalhes estão em [execve_argv_env.md](execve_argv_env.md).
 
 ---
 

@@ -48,5 +48,7 @@ typedef struct Elf64_Phdr {
 } Elf64_Phdr;
 
 int elf_load_process(const char *path, task_t *out_task);
+int elf_exec_current(const char *path, const char *const *argv,
+    const char *const *envp, uint64_t syscall_frame_addr);
 
 #endif

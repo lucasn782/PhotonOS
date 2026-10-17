@@ -3,6 +3,27 @@
 Histórico completo de mudanças do sistema operacional, organizado por versão.
 Convenções: cada entrada lista data, commit (quando aplicável), resumo, arquivos alterados, bugs corrigidos, novas funcionalidades, breaking changes e impacto arquitetural.
 
+## `v4.5` — ELF `argv`/`envp` e substituição com `execve()`
+**Data:** 2026-10-16
+**Status:** Implementado e validado em WSL/QEMU.
+
+### Resumo
+`SYS_EXECVE` agora prepara um ELF e sua pilha num espaço de endereçamento separado, copia e valida `argv`/`envp` do chamador e troca a imagem do mesmo processo somente depois da preparação. O wrapper ulibc oferece `execve()`, `environ` e `getenv()`; `crt0.c` inicia aplicações com `main(argc, argv, envp)`. O shell interpreta argumentos externos com aspas simples/duplas e executa filhos com `fork()`/`execve()`.
+
+### Limites e validação
+- Máximo de 32 strings por vetor, 255 bytes por string e 4096 bytes somados entre `argv` e `envp`.
+- Vetores, ponteiros, terminação, entradas `NOME=VALOR`, cabeçalhos ELF, offsets e limites de segmentos são validados.
+- Falhas antes do commit retornam `-1` e preservam o chamador; páginas ELF sem permissão de execução recebem NX.
+- Binários legados continuam disponíveis pelo caminho `SYS_SPAWN`.
+
+### Testes
+- A suíte QEMU `scripts/test_execve_argv_env.py` passou para argumentos sem extras, único/múltiplos, espaços, string vazia, tamanho e contagem máximos, ambiente vazio/múltiplo/máximo, `getenv()` com nomes prefixados, entrada inválida, ELF inválido, `fork()`/`execve()`/`waitpid()`, descriptor preservado, alinhamento, execuções repetidas e integridade após substituição.
+- Regressões aprovadas: TCP Phase 2A–2H; 10/10 boots; `test_vfs_qemu.py`; `test_signals_suite.py` (sinais, fork, pipes, SMP); `test_phase7.py`.
+- Build `make clean && make -j4 && make fat16-disk` aprovado. Kernel: **179.660 bytes**, +17.208 bytes sobre o baseline de 162.452 bytes e 66.100 bytes abaixo do teto de 245.760 bytes.
+
+### Arquivos
+`src/kernel/elf.c`, `src/kernel/kernel.c`, `src/kernel/scheduler.c`, ulibc/shell, `crt0.S`, `crt0.c`, `argprobe.c`, `execvetest.c`, Makefile, imagens FAT16 e documentação de userspace.
+
 ## `v4.4-tcp2h` — Milestone TCP Phase 2H: Throughput Optimization & Hardening 🌐
 **Data:** 2026-10-16
 **Status:** Consolidado e validado em WSL/Ubuntu/QEMU com benchmark reprodutivo e suíte de hardening (16/16 testes aprovados).
