@@ -1524,9 +1524,22 @@ static int do_cc_server_test(uint16_t port, const char *mode)
         /* Envia 12000 bytes em blocos para inflacao e recuperacao */
         static uint8_t buf[12000];
         for (int i = 0; i < 12000; i++) buf[i] = (uint8_t)('B' + (i % 26));
-        int s = send(client_fd, buf, 12000, 0);
-        printf("[TCPTEST CC FAST RECOVERY] send retornou: %d\n", s);
-        if (s != 12000) ret = -1;
+        int total = 0;
+        int stalled = 0;
+        while (total < 12000 && stalled < 500) {
+            int chunk = 12000 - total;
+            if (chunk > 2048) chunk = 2048;
+            int s = send(client_fd, buf + total, (size_t)chunk, 0);
+            if (s > 0) {
+                total += s;
+                stalled = 0;
+            } else {
+                stalled++;
+                yield();
+            }
+        }
+        printf("[TCPTEST CC FAST RECOVERY] send retornou: %d\n", total);
+        if (total != 12000) ret = -1;
     }
 
     delay_ticks(30);

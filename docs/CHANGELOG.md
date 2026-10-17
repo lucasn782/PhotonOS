@@ -3,6 +3,35 @@
 Histórico completo de mudanças do sistema operacional, organizado por versão.
 Convenções: cada entrada lista data, commit (quando aplicável), resumo, arquivos alterados, bugs corrigidos, novas funcionalidades, breaking changes e impacto arquitetural.
 
+## `v4.4-tcp2h` — Milestone TCP Phase 2H: Throughput Optimization & Hardening 🌐
+**Data:** 2026-10-16
+**Status:** Consolidado e validado em WSL/Ubuntu/QEMU com benchmark reprodutivo e suíte de hardening (16/16 testes aprovados).
+
+### Resumo do Milestone
+Otimização de desempenho e robustez do subsistema de rede TCP/IP e driver e1000. Foco na redução de cópias redundantes de memória por transferências vetorizadas em 64 bits (`uint64_t`), cálculo de checksum RFC 1071 em palavras de 16 bits, polling adaptativo com early exit em lote de 16 descritores no driver e1000, rejeição estrita de Future ACKs (RFC 793 §3.9), clamping de janela de recepção anunciada e suporte no espaço de usuário a envios multi-buffer que excedem a capacidade de 8 KiB do buffer TX do kernel.
+
+### Funcionalidades e Otimizações Consolidadas
+- **Transferências de Memória Vetorizadas em 64 bits:** Otimização de `tcp_copy()` e `tcp_zero()` em `src/kernel/tcp.c`, `net_memcpy()` em `src/kernel/net.c`, `e1000_memcpy()` e `e1000_memset()` em `src/drivers/e1000.c` com loops principais operando em blocos de 8 bytes e cauda para os bytes restantes.
+- **Acumulação Otimizada de Checksum (RFC 1071):** Reescrita de `tcp_checksum_add()` para acumular pares de bytes em inteiros de 16 bits diretamente, reduzindo operações por segmento.
+- **Burst Polling com Early Exit no Driver de Rede:** `net_poll_packets()` ampliado para até 16 pacotes em rajada com retorno de status, permitindo que `net_kernel_thread` libere imediatamente a CPU via `sys_yield()` quando os anéis do e1000 estiverem ociosos.
+- **Hardening RFC 793 §3.9 (Rejeição de Future ACKs):** Descarte e resposta de ACK de sincronização com estado atual quando um segmento recebido contém campo ACK além do maior número de sequência transmitido (`ack > snd_nxt`).
+- **Clamping de Janela Máxima Anunciada:** Proteção contra truncamento ou overflow do campo de 16 bits de advertised window em `tcp_input()`.
+- **Suporte a Envios Multi-Buffer em Ring 3 (`tcptest.c`):** Loop de envio cooperativo em espaço de usuário para transferências extensas (> 8 KiB), tratando o retorno de escrita parcial não bloqueante quando o anel TX enche temporariamente.
+- **Testes Kernel Integrados:** Adicionados testes 53 (rejeição de Future ACK), 54 (precisão de checksum 16 bits) e 55 (clamping de janela saturada).
+
+### Benchmark e Resultados Mensurados
+- **TX Stream 8 KB:** Aumento de vazão de 65,92 KB/s (baseline) para **70,10 KB/s (+6,3%)**.
+- **TX Multi-Buffer 12 KB:** Vazão sustentada de **93,16 KB/s** para transferências superiores ao limite de 8 KiB do buffer do kernel.
+- **RX Saturation 8 KB:** Desempenho estável em **196,20 KB/s**, correspondente ao limite de despacho do emulador QEMU SLIRP.
+- **Full-Duplex 32 KB:** Vazão bidirecional estável em **63,69 KB/s** com 100% de integridade de dados.
+
+### Validação de Integração e Regressões
+- **Suíte Phase 2H (16/16 PASS):** Cobertura completa de transferências pequenas, médias e grandes, concorrência, pacotes malformados e integridade wire PCAP.
+- **Regressão Global (100% PASS):** Suítes Phase 2A a 2G, 10/10 boots consecutivos, VFS, sinais POSIX, pipes, disco FAT16 e Phase 7 aprovadas sem regressões.
+- **Tamanho do Kernel:** `build/photon.bin` rigorosamente inalterado em **162.452 bytes** contra o teto de 245.760 bytes (margem livre de 83.308 bytes).
+
+---
+
 ## `v4.4-tcp2g` — Milestone TCP Phase 2G: Fast Retransmit & Fast Recovery (RFC 5681) 🌐
 **Data:** 2026-10-16
 **Status:** Consolidado e validado em WSL/Ubuntu/QEMU com inspeção PCAP (32/32 testes aprovados).

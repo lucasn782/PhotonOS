@@ -58,20 +58,35 @@ static struct e1000_state e1000 __attribute__((section(".network_state")));
 
 static void e1000_memset(void *dest, uint8_t value, size_t count)
 {
-    uint8_t *bytes = dest;
-
-    for (size_t i = 0; i < count; i++) {
-        bytes[i] = value;
+    uint64_t val64 = 0;
+    for (int i = 0; i < 8; i++) {
+        val64 = (val64 << 8) | (uint64_t)value;
+    }
+    size_t words = count / 8U;
+    size_t rem = count % 8U;
+    uint64_t *d64 = (uint64_t *)dest;
+    while (words--) {
+        *d64++ = val64;
+    }
+    uint8_t *bytes = (uint8_t *)d64;
+    while (rem--) {
+        *bytes++ = value;
     }
 }
 
 static void e1000_memcpy(void *dest, const void *src, size_t count)
 {
-    uint8_t *out = dest;
-    const uint8_t *in = src;
-
-    for (size_t i = 0; i < count; i++) {
-        out[i] = in[i];
+    size_t words = count / 8U;
+    size_t rem = count % 8U;
+    uint64_t *d64 = (uint64_t *)dest;
+    const uint64_t *s64 = (const uint64_t *)src;
+    while (words--) {
+        *d64++ = *s64++;
+    }
+    uint8_t *out = (uint8_t *)d64;
+    const uint8_t *in = (const uint8_t *)s64;
+    while (rem--) {
+        *out++ = *in++;
     }
 }
 

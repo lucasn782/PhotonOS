@@ -35,7 +35,7 @@ static size_t arp_cache_count = 0;
 #define NET_IPV4_PAYLOAD_MAX 1480U
 #define NET_USER_BASE 0x0000008000000000ULL
 #define NET_PAGE_SIZE 4096ULL
-#define NET_THREAD_POLL_BURST 8
+#define NET_THREAD_POLL_BURST 16
 
 
 struct udp_header {
@@ -121,11 +121,17 @@ void tcp_socket_notify(void *socket)
 
 static void net_memcpy(void *dest, const void *src, size_t count)
 {
-    uint8_t *out = dest;
-    const uint8_t *in = src;
-
-    for (size_t i = 0; i < count; i++) {
-        out[i] = in[i];
+    size_t words = count / 8U;
+    size_t rem = count % 8U;
+    uint64_t *d64 = (uint64_t *)dest;
+    const uint64_t *s64 = (const uint64_t *)src;
+    while (words--) {
+        *d64++ = *s64++;
+    }
+    uint8_t *out = (uint8_t *)d64;
+    const uint8_t *in = (const uint8_t *)s64;
+    while (rem--) {
+        *out++ = *in++;
     }
 }
 
@@ -408,9 +414,7 @@ int net_send_ipv4(uint32_t dest_ip, uint8_t protocol, const void *payload, size_
     struct ip_header *ip = (struct ip_header *)(stack_frame + sizeof(struct eth_header));
     uint8_t *ip_payload = stack_frame + sizeof(struct eth_header) + sizeof(struct ip_header);
 
-    for (size_t i = 0; i < len; i++) {
-        ip_payload[i] = ((const uint8_t *)payload)[i];
-    }
+    net_memcpy(ip_payload, payload, len);
 
     net_copy_mac(eth->dest_mac, dest_mac);
     net_copy_mac(eth->src_mac, net_local_mac);
@@ -749,13 +753,13 @@ void net_handle_icmp(uint8_t *frame, size_t frame_length)
     }
 }
 
-void net_poll_packets(void)
+int net_poll_packets(void)
 {
     static uint8_t frame[NET_MTU_FRAME_SIZE] __attribute__((section(".network_state")));
     int length = e1000_receive_packet(frame, sizeof(frame));
 
     if (length <= 0 || (size_t)length < sizeof(struct eth_header)) {
-        return;
+        return 0;
     }
 
     struct eth_header *eth = (struct eth_header *)frame;
@@ -777,7 +781,7 @@ void net_poll_packets(void)
 
                 if (net_checksum(ip, ip_header_length) != 0) {
                     klog("NET: Checksum IP invalido.\n");
-                    return;
+                    return 1;
                 }
 
                 uint8_t *payload = (uint8_t *)ip + ip_header_length;
@@ -785,31 +789,31 @@ void net_poll_packets(void)
 
                 if (ip->protocol == IP_PROTO_ICMP) {
                     if (payload_len < sizeof(struct icmp_packet)) {
-                        return;
+                        return 1;
                     }
                     struct icmp_packet *icmp = (struct icmp_packet *)payload;
                     if (net_checksum(icmp, payload_len) != 0) {
                         klog("NET: Checksum ICMP invalido.\n");
-                        return;
+                        return 1;
                     }
                     
                     net_handle_icmp(frame, (size_t)length);
                 }
                 else if (ip->protocol == IP_PROTO_UDP) {
                     if (payload_len < sizeof(struct udp_header)) {
-                        return;
+                        return 1;
                     }
                     struct udp_header *udp = (struct udp_header *)payload;
                     if (!net_validate_udp_checksum(ip, udp)) {
                         klog("NET: Checksum UDP invalido.\n");
-                        return;
+                        return 1;
                     }
 
                     uint16_t src_port = ntohs(udp->src_port);
                     uint16_t dest_port = ntohs(udp->dest_port);
                     uint16_t udp_len = ntohs(udp->length);
                     if (udp_len < sizeof(struct udp_header) || payload_len < udp_len) {
-                        return;
+                        return 1;
                     }
                     size_t udp_payload_len = (size_t)udp_len - sizeof(struct udp_header);
                     uint8_t *udp_payload = payload + sizeof(struct udp_header);
@@ -859,14 +863,14 @@ void net_poll_packets(void)
                         mutex_unlock(&sockets_mutex);
                         restore_interrupts(rflags_udp);
                     }
-                    return;
+                    return 1;
                 }
                 else if (ip->protocol == IP_PROTO_TCP) {
                     if (tcp_input(ip->src_ip, ip->dest_ip, payload,
                             payload_len) != 0) {
                         klog("TCP: Segmento descartado (checksum, formato ou PCB).\n");
                     }
-                    return;
+                    return 1;
                 }
 
                 uint64_t rflags = save_and_disable_interrupts();
@@ -930,6 +934,7 @@ void net_poll_packets(void)
             }
         }
     }
+    return 1;
 }
 
 void net_kernel_thread(void)
@@ -938,7 +943,9 @@ void net_kernel_thread(void)
 
     for (;;) {
         for (int i = 0; i < NET_THREAD_POLL_BURST; i++) {
-            net_poll_packets();
+            if (net_poll_packets() == 0) {
+                break;
+            }
         }
         tcp_timer_tick(kernel_ticks);
         scheduler_yield();

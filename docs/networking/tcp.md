@@ -11,6 +11,7 @@ O suporte TCP do PhotonOS está dividido em fases progressivas:
 * **Fase 2E (Controle de Congestionamento RFC 5681):** Implementação de Slow Start (crescimento exponencial inicial com janela inicial $IW = 3 \times SMSS$), Congestion Avoidance (crescimento linear acumulado de 1 MSS por RTT via acumulador de bytes), reação a perdas por timeout de retransmissão RTO (reajuste de `ssthresh` e colapso de `cwnd = 1 \times SMSS` na primeira expiração sem rebaixamentos espúrios em backoff), e modulação do envio pelo menor valor entre `snd_wnd` e `cwnd`.
 * **Fase 2F (Syscall shutdown() & Half-Close POSIX/RFC 793):** Implementação da syscall `shutdown(fd, how)` (`SHUT_RD`, `SHUT_WR`, `SHUT_RDWR`), semântica formal de half-close, garantia de ordenação atômica entre dados pendentes e FIN (`FIN_PENDING`), separação estrita entre remote EOF e local `SHUT_RD`, proteção contra Use-After-Free via contagem de referências do descritor VFS (`file_description_t`), e idempotência completa de chamadas repetidas ou concorrentes.
 * **Fase 2G (Fast Retransmit & Fast Recovery RFC 5681):** Detecção de perdas por classificação estrita de 5 pontos de duplicate ACKs, disparo imediato de retransmissão no 3º dupACK sem aguardar RTO, inicialização de `cwnd = ssthresh + 3 \times SMSS`, inflação de `cwnd += SMSS` por dupACK adicional, desinflação de `cwnd = ssthresh` no modelo clássico da RFC 5681 ao receber ACK de novos dados, interação segura com RTO e controle de congestionamento, e validação determinística de 32 cenários com inspeção PCAP.
+* **Fase 2H (Throughput Optimization & Hardening):** Otimizações de caminho de dados com cópias de memória vetorizadas em 64 bits (`uint64_t`), cálculo de checksum RFC 1071 em palavras de 16 bits, polling em rajada com saída antecipada no driver e1000, rejeição estrita de Future ACKs (RFC 793 §3.9), clamping de janela anunciada máxima e benchmark reprodutivo com ganho mensurável sob saturação de buffers.
 
 Para as especificações técnicas detalhadas e evidências experimentais:
 * [TCP Phase 2A — Arquitetura e Validação](tcp_phase2a.md)
@@ -22,6 +23,7 @@ Para as especificações técnicas detalhadas e evidências experimentais:
 * [TCP Phase 2E — Congestion Control (RFC 5681)](tcp_phase2e_congestion_control.md)
 * [TCP Phase 2F — Syscall shutdown() & Half-Close](tcp_phase2f_shutdown.md)
 * [TCP Phase 2G — Fast Retransmit & Fast Recovery](tcp_phase2g_fast_retransmit.md)
+* [TCP Phase 2H — Throughput Optimization & Hardening](tcp_phase2h_hardening.md)
 
 Documentação técnica de referência:
 * [Arquitetura TCP](../tcp_architecture.md)

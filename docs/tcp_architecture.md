@@ -268,11 +268,29 @@ Para detalhes completos, consulte [TCP Phase 2E](networking/tcp_phase2e_congesti
 6. Idempotência garantida para chamadas repetidas ou concorrentes, sem emissão de FINs duplicados ou desalocações prematuras.
 Para detalhes completos, consulte [TCP Phase 2F](networking/tcp_phase2f_shutdown.md).
 
-### 8.9. Métricas de Build & Otimização do Kernel
+### 8.9. Fase 2G (Fast Retransmit & Fast Recovery — RFC 5681) — Concluída
+1. Classificação estrita de 5 pontos para duplicate ACKs normativos (RFC 5681 Seção 2).
+2. Fast Retransmit imediato no 3º dupACK consecutivo sem aguardar o temporizador RTO.
+3. Fast Recovery clássico com ajuste de `ssthresh = max(FlightSize/2, 2*SMSS)` e `cwnd = ssthresh + 3*SMSS`.
+4. Inflação de `cwnd += SMSS` por dupACK subsequente e desinflação direta para `ssthresh` ao confirmar novos dados.
+5. Integração segura com RTO (colapso de `cwnd` em timeout) e supressão de crescimento duplo no ACK de saída.
+Para detalhes completos, consulte [TCP Phase 2G](networking/tcp_phase2g_fast_retransmit.md).
+
+### 8.10. Fase 2H (Throughput Optimization & Hardening) — Concluída
+1. Cópias de memória vetorizadas em blocos de 64 bits (`uint64_t`) em `tcp_copy()`, `tcp_zero()`, `net_memcpy()`, `e1000_memcpy()` e `e1000_memset()`.
+2. Acumulação otimizada de checksum RFC 1071 em palavras de 16 bits (`uint16_t`) em `tcp_checksum_add()`.
+3. Polling em rajada (até 16 pacotes) com retorno booleano de ocupação de fila e yield imediato sob ociosidade em `net_kernel_thread`.
+4. Hardening RFC 793 §3.9 com descarte de Future ACKs (`ack > snd_nxt`) e resposta de sincronização.
+5. Clamping uniforme de janela anunciada em `0xFFFF` e testes in-kernel dedicados 53, 54 e 55.
+Para detalhes completos, consulte [TCP Phase 2H](networking/tcp_phase2h_hardening.md).
+
+### 8.11. Métricas de Build & Otimização do Kernel
 - **Otimização de Compilação:** Flag `-Os` ativada em CFLAGS no `Makefile`.
 - **Limite Máximo do Kernel (`KERNEL_MAX_BYTES`):** 245.760 bytes (480 setores LBA × 512 bytes).
+- **Tamanho Atual do Kernel:** 162.452 bytes (83.308 bytes de margem livre).
 - **Gate de Build Ativo:** `test $(stat -c%s build/photon.bin) -le 245760` no Makefile.
 
-### 8.10. Próximas Etapas:
-1. **TCP Phase 2G:** Fast Retransmit e Fast Recovery (RFC 5681) com reação a 3 ACKs duplicados.
-2. **Fases Posteriores:** SACK (RFC 2018), Window Scaling (RFC 7323) e Servidor HTTP Ring 3.
+### 8.12. Próximas Etapas:
+1. **Espaço de Usuário Avançado:** Execução de scripts e programas ELF complexos com suporte a argumentos e variáveis de ambiente.
+2. **Serviços de Rede Ring 3:** Servidor HTTP estático em espaço de usuário na porta 80.
+3. **Fases Posteriores:** SACK (RFC 2018) e Window Scaling (RFC 7323).

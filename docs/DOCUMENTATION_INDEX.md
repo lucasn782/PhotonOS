@@ -405,3 +405,15 @@ Este documento serve como o mapa central da documentação técnica do PhotonOS 
 *   **Objetivo**: Documentar a chamada de sistema `shutdown(fd, how)`, semântica dos modos `SHUT_RD`, `SHUT_WR` e `SHUT_RDWR`, ordenação atômica e linearização de dados pendentes antes do FIN (`FIN_PENDING`), separação estrita de EOF remoto e leitura local, salvaguardas de lifetime do Socket e PCB com `task_get_file_description()` e validação por wire/PCAP.
 *   **Dependências**: Drivers e1000, IPv4, Sockets, VFS, Escalonador e Mutex preemptível.
 *   **Público-Alvo**: Engenheiros de rede, arquitetos de kernel e revisores de concorrência.
+
+### 7.10. [tcp_phase2g_fast_retransmit.md](networking/tcp_phase2g_fast_retransmit.md)
+*   **Descrição**: Especificação técnica da TCP Phase 2G (Fast Retransmit & Fast Recovery — RFC 5681).
+*   **Objetivo**: Documentar detecção de perdas por 3 ACKs duplicados, retransmissão imediata sem aguardar RTO, controle de janela em Fast Recovery e interação com controle de congestionamento.
+*   **Dependências**: Drivers e1000, IPv4, Sockets e Escalonador.
+*   **Público-Alvo**: Engenheiros de rede, arquitetos de kernel e desenvolvedores.
+
+### 7.11. [tcp_phase2h_hardening.md](networking/tcp_phase2h_hardening.md)
+*   **Descrição**: Especificação técnica da TCP Phase 2H (Throughput Optimization & Hardening).
+*   **Objetivo**: Documentar cópias de memória vetorizadas em 64 bits, cálculo de checksum de 16 bits, burst polling no driver e1000, rejeição de Future ACKs (RFC 793 §3.9), clamping de janela anunciada e benchmark reprodutivo.
+*   **Dependências**: Drivers e1000, IPv4, Sockets e Escalonador.
+*   **Público-Alvo**: Engenheiros de rede, desenvolvedores de performance e mantenedores do kernel.

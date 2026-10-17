@@ -52,7 +52,7 @@ struct __attribute__((packed)) ip_header {
     uint32_t dest_ip;
 };
 
-void net_poll_packets(void);
+int net_poll_packets(void);
 void net_handle_arp(uint8_t *frame, size_t frame_length);
 void net_handle_icmp(uint8_t *frame, size_t frame_length);
 void net_kernel_thread(void);

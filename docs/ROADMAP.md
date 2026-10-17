@@ -147,10 +147,19 @@ Este documento descreve o estado atual do desenvolvimento do PhotonOS, dividindo
 
 ---
 
+### Trilha 25 — TCP Phase 2H: Throughput Optimization & Hardening (v4.4-tcp2h)
+- **Cópias Vetorizadas em 64 bits:** Substituição de transferências byte a byte por loops alinhados em palavras de 64 bits (`uint64_t`) em `tcp_copy`, `tcp_zero`, `net_memcpy`, `e1000_memcpy` e `e1000_memset`.
+- **Acumulação Otimizada de Checksum RFC 1071:** Acumulação direta em palavras de 16 bits (`uint16_t`) em `tcp_checksum_add`.
+- **Burst Polling com Early Exit no Driver e1000:** Polling em rajada ampliado para 16 pacotes com liberação imediata de CPU via `sys_yield()` sob fila vazia.
+- **Hardening RFC 793 e Integridade:** Rejeição de Future ACKs (`ack > snd_nxt`) com resposta de ACK de sincronização (RFC 793 §3.9), clamping uniforme de janela anunciada em `0xFFFF` e testes in-kernel dedicados (53, 54, 55).
+- **Benchmark e Validação Global:** Suite de benchmark reprodutivo demonstrando ganho de até +6,3% em TX de 8 KB e vazão sustentada de 93,16 KB/s em 12 KB multi-buffer, aprovação de 16/16 testes de hardening e 100% de aprovação em todas as suítes de regressão.
+
+---
+
 ## 🟡 Em Desenvolvimento (v4.4-dev)
 
-### Trilha 25 — TCP Phase 2H: Otimizações de Rede e Hardening
-- **Melhorias de Throughput e Buffering:** Otimizações de cópia e métricas de desempenho sob carga contínua.
+### Preparação do Espaço de Usuário e Aplicações de Rede
+- Transição dos marcos de transporte TCP para serviços de rede em Ring 3 e expansão do suporte a processos.
 
 ## 🔵 Planejado
 

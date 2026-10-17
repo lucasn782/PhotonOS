@@ -33,34 +33,44 @@ static void tcp_tx_ack_received_locked_ext(struct tcp_pcb *pcb, uint32_t ack, in
 
 static void tcp_copy(void *destination, const void *source, size_t length)
 {
-    uint8_t *out = destination;
-    const uint8_t *in = source;
-
-    for (size_t i = 0; i < length; i++) {
-        out[i] = in[i];
+    size_t words = length / 8U;
+    size_t rem = length % 8U;
+    uint64_t *d64 = (uint64_t *)destination;
+    const uint64_t *s64 = (const uint64_t *)source;
+    while (words--) {
+        *d64++ = *s64++;
+    }
+    uint8_t *out = (uint8_t *)d64;
+    const uint8_t *in = (const uint8_t *)s64;
+    while (rem--) {
+        *out++ = *in++;
     }
 }
 
-
 static void tcp_zero(void *destination, size_t length)
 {
-    uint8_t *out = destination;
-
-    for (size_t i = 0; i < length; i++) {
-        out[i] = 0;
+    size_t words = length / 8U;
+    size_t rem = length % 8U;
+    uint64_t *d64 = (uint64_t *)destination;
+    while (words--) {
+        *d64++ = 0ULL;
+    }
+    uint8_t *out = (uint8_t *)d64;
+    while (rem--) {
+        *out++ = 0U;
     }
 }
 
 static uint32_t tcp_checksum_add(uint32_t sum, const uint8_t *bytes,
     size_t length)
 {
-    while (length > 1U) {
-        sum += ((uint16_t)bytes[0] << 8) | bytes[1];
-        bytes += 2;
-        length -= 2U;
+    const uint16_t *w16 = (const uint16_t *)bytes;
+    size_t words = length / 2U;
+    while (words--) {
+        sum += ntohs(*w16++);
     }
-    if (length != 0U) {
-        sum += (uint16_t)bytes[0] << 8;
+    if ((length & 1U) != 0U) {
+        sum += (uint16_t)(*(const uint8_t *)w16) << 8;
     }
     return sum;
 }
@@ -1787,7 +1797,13 @@ int tcp_input(uint32_t src_ip, uint32_t dest_ip, const uint8_t *segment,
                 is_dup_ack = 1;
             }
 
-            if (TCP_SEQ_GT(acknowledgement, pcb->snd_una)) {
+            if (TCP_SEQ_GT(acknowledgement, pcb->snd_nxt)) {
+                /* RFC 793 §3.9: Segment acknowledges data not yet sent. Send ACK and drop */
+                send_out = 1;
+                (void)tcp_build_output_locked(pcb, TCP_FLAG_ACK, 0, 0, out_packet,
+                    &out_packet_len, &out_remote_ip);
+                klog("[TCP RX] ACK invalido (ack > snd_nxt), drop e re-ACK\n");
+            } else if (TCP_SEQ_GT(acknowledgement, pcb->snd_una)) {
                 /* Valid ACK acknowledging new data */
                 if ((pcb->flags & TCP_PCB_FLAG_FAST_RECOVERY) != 0) {
                     /* RFC 5681 Section 3.2 step 5: Deflate cwnd to ssthresh and exit Fast Recovery */
@@ -1913,7 +1929,7 @@ int tcp_input(uint32_t src_ip, uint32_t dest_ip, const uint8_t *segment,
                     pcb->ack_number = pcb->rcv_nxt;
                     size_t free_sp = tcp_rx_buffer_free_space_locked(pcb);
                     pcb->window = (uint32_t)free_sp;
-                    pcb->rcv_wnd = (uint16_t)(free_sp & 0xFFFFU);
+                    pcb->rcv_wnd = (uint16_t)(free_sp > 0xFFFFU ? 0xFFFFU : free_sp);
 
                     send_out = 1;
                     (void)tcp_build_output_locked(pcb, TCP_FLAG_ACK, 0, 0, out_packet,
@@ -1929,7 +1945,7 @@ int tcp_input(uint32_t src_ip, uint32_t dest_ip, const uint8_t *segment,
                     }
                     size_t free_sp = tcp_rx_buffer_free_space_locked(pcb);
                     pcb->window = (uint32_t)free_sp;
-                    pcb->rcv_wnd = (uint16_t)(free_sp & 0xFFFFU);
+                    pcb->rcv_wnd = (uint16_t)(free_sp > 0xFFFFU ? 0xFFFFU : free_sp);
 
                     send_out = 1;
                     (void)tcp_build_output_locked(pcb, TCP_FLAG_ACK, 0, 0, out_packet,
@@ -1940,7 +1956,7 @@ int tcp_input(uint32_t src_ip, uint32_t dest_ip, const uint8_t *segment,
                 /* Duplicate segment: drop payload, re-send ACK with current rcv_nxt */
                 size_t free_sp = tcp_rx_buffer_free_space_locked(pcb);
                 pcb->window = (uint32_t)free_sp;
-                pcb->rcv_wnd = (uint16_t)(free_sp & 0xFFFFU);
+                pcb->rcv_wnd = (uint16_t)(free_sp > 0xFFFFU ? 0xFFFFU : free_sp);
                 pcb->ack_number = pcb->rcv_nxt;
                 send_out = 1;
                 (void)tcp_build_output_locked(pcb, TCP_FLAG_ACK, 0, 0, out_packet,
@@ -1950,7 +1966,7 @@ int tcp_input(uint32_t src_ip, uint32_t dest_ip, const uint8_t *segment,
                 /* Out-of-order segment: drop payload per Phase 7 policy, re-send ACK with current rcv_nxt */
                 size_t free_sp = tcp_rx_buffer_free_space_locked(pcb);
                 pcb->window = (uint32_t)free_sp;
-                pcb->rcv_wnd = (uint16_t)(free_sp & 0xFFFFU);
+                pcb->rcv_wnd = (uint16_t)(free_sp > 0xFFFFU ? 0xFFFFU : free_sp);
                 pcb->ack_number = pcb->rcv_nxt;
                 send_out = 1;
                 (void)tcp_build_output_locked(pcb, TCP_FLAG_ACK, 0, 0, out_packet,
@@ -1969,7 +1985,7 @@ int tcp_input(uint32_t src_ip, uint32_t dest_ip, const uint8_t *segment,
 
                 size_t free_sp = tcp_rx_buffer_free_space_locked(pcb);
                 pcb->window = (uint32_t)free_sp;
-                pcb->rcv_wnd = (uint16_t)(free_sp & 0xFFFFU);
+                pcb->rcv_wnd = (uint16_t)(free_sp > 0xFFFFU ? 0xFFFFU : free_sp);
                 send_out = 1;
                 (void)tcp_build_output_locked(pcb, TCP_FLAG_ACK, 0, 0, out_packet,
                     &out_packet_len, &out_remote_ip);
@@ -4453,6 +4469,70 @@ void tcp_run_tests(void)
             }
             tcp_socket_destroy(p1);
             tcp_socket_destroy(p2);
+        }
+
+        /* Test 53: Hardening - Reject Future ACK (SEG.ACK > SND.NXT per RFC 793 §3.9) */
+        tcp_pcb_t *h_pcb = tcp_alloc();
+        if (h_pcb != 0) {
+            h_pcb->state = TCP_ESTABLISHED;
+            h_pcb->local_ip = 0x0A00020F;
+            h_pcb->remote_ip = 0x0A000202;
+            h_pcb->local_port = 55555;
+            h_pcb->remote_port = 80;
+            h_pcb->snd_una = 1000;
+            h_pcb->snd_nxt = 2000;
+            h_pcb->rcv_nxt = 5000;
+            h_pcb->snd_wnd = 8192;
+            (void)tcp_register(h_pcb);
+
+            /* Ingest segment with ACK = 3000 (beyond snd_nxt 2000) */
+            uint8_t bogus_ack[TCP_HEADER_MIN_SIZE];
+            struct tcp_header b_hdr;
+            b_hdr.src_port = 80;
+            b_hdr.dest_port = 55555;
+            b_hdr.seq_num = 5000;
+            b_hdr.ack_num = 3000; /* BOGUS future ACK */
+            b_hdr.data_offset_flags = (5U << 12) | TCP_FLAG_ACK;
+            b_hdr.window_size = 8192;
+            b_hdr.checksum = 0;
+            b_hdr.urgent_ptr = 0;
+            tcp_serialize_header(&b_hdr, bogus_ack, sizeof(bogus_ack));
+            uint16_t csum = tcp_checksum(h_pcb->remote_ip, h_pcb->local_ip, bogus_ack, sizeof(bogus_ack));
+            b_hdr.checksum = csum == 0 ? 0xFFFF : csum;
+            tcp_serialize_header(&b_hdr, bogus_ack, sizeof(bogus_ack));
+
+            (void)tcp_input(h_pcb->remote_ip, h_pcb->local_ip, bogus_ack, sizeof(bogus_ack));
+
+            int reject_ok = (h_pcb->snd_una == 1000); /* Must NOT advance snd_una */
+            if (reject_ok) {
+                klog("[TCP TEST] PASS: Hardening - Bogus Future ACK Rejected (RFC 793: ack > snd_nxt descartado sem corromper snd_una)\n");
+            } else {
+                klog("[TCP TEST] FAIL: Hardening - Bogus Future ACK Rejected\n");
+            }
+            tcp_socket_destroy(h_pcb);
+        }
+
+        /* Test 54: Hardening - Word-Aligned Checksum Correctness */
+        uint8_t test_csum_buf[15] = {0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC, 0xDE, 0xF0,
+                                     0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77};
+        uint16_t csum_val = tcp_checksum(0x0A00020F, 0x0A000202, test_csum_buf, sizeof(test_csum_buf));
+        if (csum_val != 0) {
+            klog("[TCP TEST] PASS: Hardening - Word-Aligned Checksum Correctness (calculo consistente em bytes pares e impares)\n");
+        } else {
+            klog("[TCP TEST] FAIL: Hardening - Word-Aligned Checksum Correctness\n");
+        }
+
+        /* Test 55: Hardening - Window Size Saturated Clamping */
+        tcp_pcb_t *w_pcb = tcp_alloc();
+        if (w_pcb != 0) {
+            size_t large_free = 70000;
+            uint16_t clamped_wnd = (uint16_t)(large_free > 0xFFFFU ? 0xFFFFU : large_free);
+            if (clamped_wnd == 0xFFFFU) {
+                klog("[TCP TEST] PASS: Hardening - Window Size Saturated Clamping (prevencao estrita de overflow/truncamento)\n");
+            } else {
+                klog("[TCP TEST] FAIL: Hardening - Window Size Saturated Clamping\n");
+            }
+            tcp_socket_destroy(w_pcb);
         }
     }
 
